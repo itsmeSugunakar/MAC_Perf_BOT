@@ -292,7 +292,7 @@ HTML = r"""<!DOCTYPE html>
   .card-val{font-size:28px;font-weight:700;line-height:1}
 
   /* ── main grid ── */
-  .main{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:0 14px 14px}
+  .main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;padding:0 14px 14px}
 
   /* ── chart panel ── */
   .chart-panel{
@@ -308,15 +308,16 @@ HTML = r"""<!DOCTYPE html>
     background:var(--panel);border:1px solid var(--border);
     border-radius:10px;padding:14px;display:flex;flex-direction:column;
     grid-row:span 2;
+    min-width:0;overflow:hidden;        /* prevent grid blowout */
   }
-  .feed-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .feed-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;min-width:0}
   .feed-title{font-size:12px;font-weight:700;color:var(--muted);letter-spacing:.5px;text-transform:uppercase}
-  .event-count{font-size:11px;color:var(--muted)}
-  .feed-body{flex:1;overflow-y:auto;font-family:'SF Mono',monospace;font-size:11px}
-  .ev{display:flex;gap:6px;padding:3px 0;border-bottom:1px solid var(--border)}
+  .event-count{font-size:11px;color:var(--muted);white-space:nowrap}
+  .feed-body{flex:1;overflow-y:auto;overflow-x:hidden;font-family:'SF Mono',monospace;font-size:11px;min-width:0}
+  .ev{display:flex;gap:6px;padding:3px 0;border-bottom:1px solid var(--border);min-width:0;width:100%}
   .ev-ts{color:var(--muted);white-space:nowrap;flex-shrink:0}
   .ev-badge{font-weight:700;white-space:nowrap;flex-shrink:0;font-size:10px}
-  .ev-msg{color:var(--text);word-break:break-word}
+  .ev-msg{color:var(--text);word-break:break-all;overflow-wrap:anywhere;min-width:0;overflow:hidden}
   .fix   .ev-badge{color:var(--green)}
   .warn  .ev-badge{color:var(--yellow)}
   .issue .ev-badge{color:var(--red)}
