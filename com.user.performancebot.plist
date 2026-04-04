@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Label must match the filename (without .plist) -->
+    <key>Label</key>
+    <string>com.user.performancebot</string>
+
+    <!-- Full path to python3 and the script -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/sivaranjani/performance-bot/performance_bot.py</string>
+    </array>
+
+    <!-- Start automatically at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it crashes -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Redirect stdout/stderr to the log folder -->
+    <key>StandardOutPath</key>
+    <string>/Users/sivaranjani/Library/Logs/performance-bot/stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/sivaranjani/Library/Logs/performance-bot/stderr.log</string>
+
+    <!-- Run at lowest OS scheduling class so it never competes for CPU -->
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <!-- Throttle restart attempts to avoid spin-loops -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>
