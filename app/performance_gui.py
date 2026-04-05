@@ -424,7 +424,7 @@ HTML = r"""<!DOCTYPE html>
   body{
     background:var(--bg);color:var(--text);
     font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;
-    font-size:13px;min-height:100vh;display:flex;flex-direction:column;
+    font-size:13px;height:100vh;overflow:hidden;display:flex;flex-direction:column;
   }
 
   /* ── title bar ── */
@@ -463,7 +463,7 @@ HTML = r"""<!DOCTYPE html>
   .btn:hover{background:var(--accent)}
 
   /* ── cards ── */
-  .cards-section{padding:10px 12px 0;display:flex;flex-direction:column;gap:8px}
+  .cards-section{padding:10px 12px 0;display:flex;flex-direction:column;gap:8px;flex-shrink:0}
   .cards-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
   .card{
     background:var(--panel);border:1px solid var(--border);
@@ -488,7 +488,9 @@ HTML = r"""<!DOCTYPE html>
   .main{
     display:grid;
     grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,320px);
+    grid-template-rows:auto auto 1fr;
     gap:10px;padding:10px 12px 12px;
+    flex:1;min-height:0;overflow:hidden;
   }
 
   /* ── chart panels ── */
@@ -529,8 +531,8 @@ HTML = r"""<!DOCTYPE html>
     background:var(--panel);border:1px solid var(--border);
     border-radius:10px;padding:13px;
     display:flex;flex-direction:column;
-    grid-column:3;grid-row:1/5;
-    min-width:0;overflow:hidden;
+    grid-column:3;grid-row:1/4;
+    min-width:0;min-height:0;overflow:hidden;
   }
   .feed-hdr{
     display:flex;justify-content:space-between;align-items:center;
@@ -559,6 +561,7 @@ HTML = r"""<!DOCTYPE html>
     background:var(--panel);border:1px solid var(--border);
     border-radius:10px;padding:13px;
     grid-column:1/3;
+    min-height:0;overflow-y:auto;
   }
   table{width:100%;border-collapse:collapse}
   th{
@@ -587,7 +590,7 @@ HTML = r"""<!DOCTYPE html>
 
   /* ── footer ── */
   .footer{
-    margin-top:auto;padding:7px 16px;
+    flex-shrink:0;padding:7px 16px;
     background:var(--panel);border-top:1px solid var(--border);
     font-size:10px;color:var(--muted);
     display:flex;justify-content:space-between;align-items:center;gap:16px;
