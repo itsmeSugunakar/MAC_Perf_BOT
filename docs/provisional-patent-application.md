@@ -34,9 +34,11 @@ The present invention relates to computer system resource management and,
 more specifically, to a lightweight, automated software engine that
 monitors operating-system-level memory pressure indicators, constructs a
 hierarchical attribution model of process memory consumption, applies a
-linear-regression-based exhaustion forecast, and executes a reversible,
-four-tier remediation cascade to prevent system memory exhaustion without
-requiring user intervention or elevated (superuser) privileges.
+linear-regression-based exhaustion forecast, drives a predictive tier-
+escalation mechanism, executes a reversible four-tier remediation cascade
+with genealogy-guided process scoring, and prevents futile remediation
+loops via an XPC respawn guard — all without requiring user intervention
+or elevated (superuser) privileges.
 
 ---
 
@@ -131,12 +133,36 @@ Intelligence Engine (MMIE)**, is a software method and system comprising:
    threshold (95 %) — enabling *predictive* rather than purely *reactive*
    intervention.
 
-5. **A Four-Tier Adaptive Remediation Cascade** that selects and executes
-   an appropriate automated intervention from a graduated set of actions,
-   each chosen to be the minimum necessary intervention for the observed
-   pressure level, and each designed to be fully reversible where possible.
+5. **A Predictive Remediation Engine** that compares the TTE estimate
+   against tier-specific time thresholds (TTE ≤ 10 min → Tier 2 early,
+   TTE ≤ 5 min → Tier 3 early, TTE ≤ 2 min → Tier 4 early) to escalate
+   the effective remediation tier *before* static RAM-percentage thresholds
+   are breached, enabling pre-emptive intervention under a rising memory
+   trend.
 
-6. **An Autonomous Restoration Loop** (Auto-Thaw) that monitors pressure
+6. **A CPU-RAM Conflict Resolution Gate** that prevents the CPU-throttling
+   subsystem from restoring normal process priority (`nice(0)`) to processes
+   that have calmed in CPU usage but belong to application families
+   identified as top RAM owners during active Tier 3 or higher memory
+   pressure — preventing those processes from re-expanding their memory
+   footprint immediately after the CPU intervention.
+
+7. **A Genealogy-Guided Freeze Scoring System** that ranks background
+   daemon candidates for SIGSTOP suspension by combining a genealogy signal
+   (process belongs to a heavy-RSS application family identified by the
+   ppid-tree walk, weight = 2) with a pattern signal (process name matches
+   the known-safe allowlist, weight = 1), sorting by composite score and
+   RSS descending so that the daemons most responsible for memory pressure
+   are targeted first.
+
+8. **An XPC Respawn Guard** that records the timestamp of every SIGTERM
+   termination and monitors running processes for services that reappear
+   within a short observation window (default 10 seconds). Services
+   relaunched within this window are identified as `launchd`-managed and
+   are added to a persistent blocklist (`_no_kill`) to prevent futile
+   kill-loops that consume CPU without yielding lasting memory relief.
+
+9. **An Autonomous Restoration Loop** (Auto-Thaw) that monitors pressure
    recovery and automatically reverses suspension-based interventions when
    system pressure normalises, without user interaction.
 
@@ -162,19 +188,24 @@ process itself (the "observer effect").
 │  BotEngine (background thread, 1 Hz)                       │
 │                                                            │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. _collect()          — psutil CPU/RAM/Swap/procs  │   │
-│  │ 2. _check_cpu()        — renice CPU hogs            │   │
-│  │ 3. _check_memory()     — tier 1 + MMIE cascade      │   │
+│  │ 1. _collect()              — psutil CPU/RAM/Swap    │   │
+│  │ 2. _check_cpu()            — renice + CPU-RAM lock  │   │
+│  │ 3. _check_memory()         — tier 1 + MMIE cascade  │   │
+│  │    ├─ _compute_effective_tier() — TTE escalation    │   │
+│  │    └─ _tiered_memory_remediation(effective_tier)    │   │
 │  │ 4. _update_pressure_and_forecast()  (every 5 s)     │   │
 │  │    ├─ _get_macos_pressure_level()  — sysctl oracle  │   │
 │  │    ├─ _parse_vm_stat()             — memory anatomy │   │
 │  │    ├─ _compute_mem_forecast()      — OLS regression │   │
 │  │    └─ _build_memory_ancestry()    (every 120 s)     │   │
-│  │ 5. _tiered_memory_remediation()   (at Tier 2+)      │   │
+│  │ 5. _tiered_memory_remediation(mem_pct, eff_tier)    │   │
 │  │    ├─ Tier 2: advisory + genealogy report           │   │
-│  │    ├─ Tier 3: _freeze_background_daemons() SIGSTOP  │   │
+│  │    ├─ Tier 3: _freeze_background_daemons()          │   │
+│  │    │          (genealogy-guided scoring + SIGSTOP)  │   │
 │  │    └─ Tier 4: _sweep_idle_services() SIGTERM        │   │
+│  │               (respects _no_kill blocklist)         │   │
 │  │ 6. _thaw_frozen_daemons()         (on recovery)     │   │
+│  │ 7. _detect_xpc_respawn()          (every 10 s)      │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                          │ snapshot()                       │
 │                  ┌───────▼────────┐                        │
@@ -326,9 +357,85 @@ produce a human-readable "Time to Exhaustion" countdown for consumer RAM
 management — and surfacing this in real time in a dashboard — constitutes
 a novel combination not found in prior consumer-facing tools.
 
-### 5.6 Component 5 — Four-Tier Adaptive Remediation Cascade
+### 5.6 Component 5 — Predictive Remediation Engine
 
-**Method:** `_tiered_memory_remediation(mem_pct: float)`
+**Method:** `_compute_effective_tier(mem_pct: float) → (int, int)`
+
+The Predictive Remediation Engine translates the TTE forecast into an
+**effective remediation tier** that may exceed what the raw RAM percentage
+would trigger, enabling pre-emptive intervention before static thresholds
+are breached.
+
+**Algorithm:**
+
+```
+threshold_tier ← static tier from mem_pct alone (0–4)
+
+if TTE < 0 or history_samples < TTE_MIN_SAMPLES (20):
+    return (threshold_tier, threshold_tier)   # insufficient data — no escalation
+
+predictive_tier = threshold_tier
+if TTE ≤ TTE_TIER4_MIN (2 min):  predictive_tier = max(predictive_tier, 4)
+elif TTE ≤ TTE_TIER3_MIN (5 min): predictive_tier = max(predictive_tier, 3)
+elif TTE ≤ TTE_TIER2_MIN (10 min): predictive_tier = max(predictive_tier, 2)
+
+return (predictive_tier, threshold_tier)
+```
+
+**Example:** RAM at 79 % (below all static thresholds, threshold_tier = 0),
+but OLS slope yields TTE = 4.2 minutes → predictive_tier = 3. The engine
+executes Tier 3 (SIGSTOP daemons) **before** RAM reaches 87 %, providing
+a 4-minute head start on pressure relief.
+
+When escalation occurs, the engine:
+- Sets `effective_tier` in the snapshot (dashboard "Active Tier" row)
+- Sets `_ram_pressure_lock = True` (activates CPU-RAM conflict gate)
+- Emits a `PREDICTIVE ESCALATION: TTE=N.N min → acting at Tier X` event
+- Displays an amber "PREDICTIVE ESCALATION ACTIVE" banner in the PWA
+
+**Novelty:** This constitutes a *Predictive Remediation Engine* — the use
+of a linear-regression time-to-exhaustion forecast to escalate a graduated
+remediation cascade earlier than static percentage thresholds would permit,
+enabling predictive rather than purely reactive memory management. This
+specific combination — OLS TTE → dynamic tier selection → graduated signal-
+based interventions — is not present in any prior consumer monitoring tool.
+
+### 5.7 Component 6 — CPU-RAM Conflict Resolution Gate
+
+**Method:** `_check_cpu()` — restoration branch
+
+When the CPU-throttling subsystem detects that a previously throttled
+process has calmed (CPU usage dropped below `CPU_WARN / 2 = 35 %`), it
+normally restores the process to normal scheduling priority via `nice(0)`.
+
+However, restoring priority to a CPU-calmed process that is also a *top
+RAM owner* would allow it to immediately resume full CPU execution and
+potentially re-expand its memory footprint — negating the Tier 3 freeze
+applied to its daemon siblings.
+
+**Conflict detection logic:**
+
+```python
+if _ram_pressure_lock:   # set by effective_tier ≥ 3
+    ancestry_top3 = {entry["app"].lower() for entry in mem_ancestry[:3]}
+    if any(family in process_name or process_name in family
+           for family in ancestry_top3):
+        emit "CPU-RAM LOCK: deferring priority restore"
+        continue   # skip nice(0)
+```
+
+**Gate release:** The lock is released automatically when RAM drops below
+`MEM_WARN − 5 %` and effective_tier resets to 0.
+
+**Novelty:** The coordination between the CPU-throttling subsystem and the
+RAM pressure cascade — specifically, using a RAM-pressure lock to veto CPU
+priority restoration for processes identified by genealogy as dominant RAM
+holders — constitutes a novel cross-dimensional resource management decision
+not implemented in any known consumer tool.
+
+### 5.8 Component 7 — Four-Tier Adaptive Remediation Cascade
+
+**Method:** `_tiered_memory_remediation(mem_pct: float, effective_tier: int)`
 
 The cascade applies the *minimum necessary intervention* for the observed
 pressure level, in ascending order of severity. Each tier is strictly
@@ -368,73 +475,127 @@ c. **Memory Genealogy Report:** If more than `MEM_ANCESTRY_COOL_S` seconds
 
 **Reversibility:** Fully reversible (advisory only; no process signals).
 
-#### Tier 3 — Reversible Process Suspension (≥ 87 % RAM)
+#### Tier 3 — Reversible Process Suspension (≥ 87 % RAM or TTE ≤ 5 min)
 
-**Trigger:** `mem_pct ≥ MEM_TIER3_PCT` (default 87 %) AND
+**Trigger:** `effective_tier ≥ 3` AND
 `time.time() − _last_freeze ≥ FREEZE_COOL_S` (default 120 s cooldown)
 
 **Actions:**
 
-Invoke `_freeze_background_daemons()`:
+Invoke `_freeze_background_daemons()` with **Genealogy-Guided Scoring:**
 
-1. Enumerate all running processes via `psutil.process_iter()`.
-2. Filter to processes matching the `FREEZE_PATTERNS` allowlist — a
-   curated set of background daemon name patterns known to be safe for
-   temporary suspension (e.g., photo analysis daemons, cloud sync agents,
-   telemetry reporters, weather and news services).
-3. Further filter to processes with `status ∈ {sleeping, idle}` (not
-   actively handling a user request).
-4. Exclude root-owned processes, system-critical processes (`PROTECTED`
-   set), and processes already suspended.
-5. Send `SIGSTOP` (signal 19) to each qualifying process. `SIGSTOP`
-   unconditionally suspends execution without terminating the process or
-   losing its memory state or open file descriptors.
-6. Record each suspended process in `_frozen_pids: dict[int, tuple]`
-   with its name, suspension timestamp, and RSS at time of suspension.
+1. Snapshot the current Memory Genealogy ancestry list (top application
+   families by aggregated RSS).
 
-**Auto-Thaw (Restoration Loop — Component 6):** When RAM utilisation
-subsequently drops below `MEM_WARN − 5 %` (default 75 %), the engine
-automatically sends `SIGCONT` (signal 18) to all entries in `_frozen_pids`,
-resuming their execution transparently, and clears the frozen set.
+2. Build a `heavy_families` set from the top 5 families:
+   ```
+   heavy_families = {entry["app"].lower() for entry in ancestry[:5]}
+   ```
+
+3. For each candidate process, compute a composite score:
+   ```
+   family_match = 1  if process.name.lower() ∈ heavy_families (or substring match)
+                  0  otherwise
+   pattern_match = 1 if process.name matches any FREEZE_PATTERNS entry
+                   0  otherwise
+   score = family_match × 2 + pattern_match × 1
+   ```
+
+4. Retain only candidates with `score ≥ 1` (at least one signal present).
+
+5. Sort candidates by `(score DESC, rss DESC)` — daemons belonging to the
+   highest-RAM application families, with the most RSS, are processed first.
+
+6. Apply safety filters: user-owned only; not in `PROTECTED` or
+   `NEVER_TERMINATE`; `status ∈ {sleeping, idle}`; not already frozen.
+
+7. Send `SIGSTOP` (signal 19) to each qualifying process in sorted order.
+   Record in `_frozen_pids` with name, timestamp, and RSS.
+
+8. Emit a `GENEALOGY FREEZE` event (for family-matched processes) or
+   `PATTERN FREEZE` event (for pattern-only matches), with family name and
+   MB attribution included in the event message.
+
+**Auto-Thaw (Component 9):** When RAM drops below `MEM_WARN − 5 %`,
+`SIGCONT` is sent to all frozen PIDs automatically.
 
 **Safety guarantees:**
-- Only user-owned processes can be suspended without elevated privileges.
-  The engine makes no attempt to suspend root-owned processes.
-- The `FREEZE_PATTERNS` allowlist is the primary safety mechanism;
-  processes not matching any pattern are never targeted.
-- The 120-second cooldown prevents repeated freeze cycles from disrupting
-  system usability.
+- Root-owned processes are excluded unconditionally.
+- Processes not reaching score ≥ 1 are never targeted.
+- 120-second cooldown between freeze cycles.
 
-**Reversibility:** Fully reversible via `SIGCONT`. Process state, memory,
-and file descriptors are fully preserved during suspension.
+**Reversibility:** Fully reversible via `SIGCONT`. No process state, memory,
+or file descriptors are lost during suspension.
 
-#### Tier 4 — Emergency Termination (≥ 92 % RAM)
+**Novelty of genealogy-guided scoring:** Prior art freezes daemons by name
+pattern alone. The combination of (a) ppid-tree RSS aggregation to identify
+which application family is causing pressure, and (b) preferential targeting
+of daemons belonging to that family via a weighted composite score,
+constitutes a novel genealogy-guided suspension mechanism not present in
+prior consumer or server-side tools.
 
-**Trigger:** `mem_pct ≥ MEM_TIER4_PCT` (default 92 %)
+#### Tier 4 — Emergency Termination (≥ 92 % RAM or TTE ≤ 2 min)
+
+**Trigger:** `effective_tier ≥ 4`
 
 **Actions:**
 
-Invoke `_sweep_idle_services()`:
+Invoke `_sweep_idle_services()` with **XPC Respawn Guard** enforcement:
 
 1. Enumerate processes matching `IDLE_SERVICE_PATTERNS` — XPC helpers,
    widget extensions, wallpaper video services, Siri inference services,
    etc.
-2. Further filter to: user-owned, not in `PROTECTED` or `NEVER_TERMINATE`
+2. Exclude any process whose name is in `_no_kill` (the XPC Respawn Guard
+   blocklist populated by `_detect_xpc_respawn()`).
+3. Further filter to: user-owned, not in `PROTECTED` or `NEVER_TERMINATE`
    sets, CPU usage = 0, status = sleeping/idle, RSS ≥ 15 MB.
-3. Send `SIGTERM` to qualifying processes. These are XPC services that
-   `launchd` will re-spawn on demand when next needed.
-4. Accumulate freed RSS into the session `freed_mb` counter.
+4. Send `SIGTERM` to qualifying processes. Record `{name: timestamp}` in
+   `_terminated_ts` for respawn detection.
+5. Accumulate freed RSS into the session `freed_mb` counter.
 
 **Reversibility:** Services terminated at Tier 4 are re-launched on demand
-by the OS service manager (`launchd`). This is a standard macOS service
-lifecycle pattern; it does not result in data loss.
+by `launchd`. No user data loss occurs.
 
-**Irreversibility caveat:** Unlike Tier 3, Tier 4 terminates processes.
-Any in-flight work within the terminated service is lost. The `PROTECTED`
-and `NEVER_TERMINATE` sets, combined with the `IDLE_SERVICE_PATTERNS`
-allowlist, ensure only services with no active user-facing work are targeted.
+**Irreversibility caveat:** Any in-flight work within the terminated service
+is lost. The allowlists and `_no_kill` guard ensure only genuinely idle,
+automatically-restartable services are targeted.
 
-### 5.7 Component 6 — Autonomous Restoration Loop (Auto-Thaw)
+### 5.9 Component 8 — XPC Respawn Guard
+
+**Method:** `_detect_xpc_respawn()` — called every 10 seconds
+
+macOS `launchd` automatically relaunches XPC services and system daemons
+within milliseconds of termination. Repeatedly sending SIGTERM to such
+services consumes CPU cycles, generates system log noise, and yields no
+lasting RAM relief — a futile kill-loop.
+
+**Detection algorithm:**
+
+```
+every 10 s:
+  for name, ts in _terminated_ts:
+    if name in running_process_names and (now - ts) ≤ XPC_RESPAWN_S (10 s):
+        _no_kill.add(name)
+        emit "XPC RESPAWN GUARD: {name} relaunched within 10s — blocklisted"
+  
+  # prune stale entries (> 60 s old)
+  remove entries from _terminated_ts where (now - ts) > XPC_RESPAWN_S × 6
+```
+
+**Integration with Tier 4:** `_sweep_idle_services()` checks `_no_kill`
+before sending SIGTERM. Blocklisted services are skipped permanently for
+the session, preventing the engine from wasting resources on unwinnable
+terminations.
+
+**Dashboard:** The `xpc_blocked` field in the `/stats` JSON reports the
+current blocklist count; the dashboard displays it as "XPC Blocked: N".
+
+**Novelty:** Automated detection of launchd-managed process respawning
+at the userspace level — and dynamic blocklisting to avoid futile kill
+loops — is a novel safety mechanism not present in any known consumer or
+enterprise monitoring tool.
+
+### 5.10 Component 9 — Autonomous Restoration Loop (Auto-Thaw)
 
 **Method:** Called from `_check_memory()` on every memory check cycle.
 
@@ -442,34 +603,42 @@ allowlist, ensure only services with no active user-facing work are targeted.
 ```python
 if vm.percent < MEM_WARN - 5 and self._frozen_pids:
     self._thaw_frozen_daemons()
+    _ram_pressure_lock = False
+    effective_tier = 0
+    predictive_escalation = False
 ```
 
 When the condition is met:
 1. Iterate `_frozen_pids`.
 2. Send `SIGCONT` to each suspended PID.
 3. Clear `_frozen_pids`.
-4. Emit a "pressure normalised — thawed N daemons" FIX event to the log.
+4. Release `_ram_pressure_lock` (re-enables CPU priority restoration).
+5. Emit a "pressure normalised — thawed N daemons" FIX event to the log.
 
 This loop ensures that Tier 3 suspensions are temporary and self-healing,
-making the overall system behaviour non-destructive across its entire
-operating range.
+and that the CPU-RAM conflict gate is lifted as soon as pressure abates.
 
-### 5.8 Threshold Configuration
+### 5.11 Threshold Configuration
 
 All thresholds are defined as named constants at the top of the engine
 module and can be modified by the operator without source code changes to
 business logic:
 
-| Constant              | Default | Description                              |
-|-----------------------|---------|------------------------------------------|
-| `MEM_WARN`            | 80 %    | Tier 1 activation threshold              |
-| `MEM_TIER2_PCT`       | 82 %    | Tier 2 activation threshold              |
-| `MEM_TIER3_PCT`       | 87 %    | Tier 3 activation threshold              |
-| `MEM_TIER4_PCT`       | 92 %    | Tier 4 activation threshold              |
-| `WIRED_WARN_PCT`      | 40 %    | Wired structural pressure threshold      |
-| `FREEZE_COOL_S`       | 120 s   | Minimum interval between Tier 3 cycles   |
-| `MEM_ANCESTRY_COOL_S` | 120 s   | Minimum interval between genealogy scans |
-| `LEAK_RATE_MB_MIN`    | 50 MB/m | RSS growth rate to flag potential leak   |
+| Constant              | Default  | Description                                        |
+|-----------------------|----------|----------------------------------------------------|
+| `MEM_WARN`            | 80 %     | Tier 1 activation threshold                        |
+| `MEM_TIER2_PCT`       | 82 %     | Tier 2 static threshold                            |
+| `MEM_TIER3_PCT`       | 87 %     | Tier 3 static threshold                            |
+| `MEM_TIER4_PCT`       | 92 %     | Tier 4 static threshold                            |
+| `TTE_TIER2_MIN`       | 10 min   | TTE value that predictively escalates to Tier 2    |
+| `TTE_TIER3_MIN`       | 5 min    | TTE value that predictively escalates to Tier 3    |
+| `TTE_TIER4_MIN`       | 2 min    | TTE value that predictively escalates to Tier 4    |
+| `TTE_MIN_SAMPLES`     | 20       | Min history samples before TTE drives escalation   |
+| `XPC_RESPAWN_S`       | 10 s     | Respawn detection window for XPC guard             |
+| `WIRED_WARN_PCT`      | 40 %     | Wired structural pressure threshold                |
+| `FREEZE_COOL_S`       | 120 s    | Minimum interval between Tier 3 freeze cycles      |
+| `MEM_ANCESTRY_COOL_S` | 120 s    | Minimum interval between genealogy scans           |
+| `LEAK_RATE_MB_MIN`    | 50 MB/m  | RSS growth rate to flag potential leak             |
 
 ---
 
@@ -511,17 +680,61 @@ historical RAM utilisation samples, yielding an estimated number of minutes
 until utilisation reaches a critical threshold, and wherein said estimate is
 displayed in real time to a user via a Progressive Web Application dashboard.
 
-**Claim 5 (System):**
+**Claim 5 (Method — Predictive Remediation Engine):**
+The method of Claim 4, further comprising: comparing the time-to-exhaustion
+estimate against one or more tier-specific time thresholds; and, when the
+estimate falls below a tier-specific threshold, escalating the active
+remediation tier to a higher severity level than the current RAM utilisation
+percentage alone would trigger, thereby executing a more aggressive
+intervention in advance of the static percentage threshold being breached,
+and emitting a predictive escalation notification to a user-facing dashboard.
+
+**Claim 6 (Method — CPU-RAM Conflict Resolution):**
+The method of Claim 5, further comprising: maintaining a RAM pressure lock
+flag that is set to active when the effective remediation tier reaches or
+exceeds a third severity level; and, within a CPU-priority-management
+subsystem, deferring the restoration of normal scheduling priority for any
+process whose parent application family is identified as a top resident-set-
+size holder by the recursive ppid-tree genealogy engine while said RAM
+pressure lock remains active, thereby preventing CPU-calmed processes from
+re-expanding their memory footprint during active memory pressure.
+
+**Claim 7 (Method — Genealogy-Guided Suspension Scoring):**
+The method of Claim 2, wherein the reversible process-suspension tier further
+comprises: computing, for each candidate process, a composite suspension score
+as a weighted sum of a genealogy signal — wherein the process belongs to an
+application family identified as a heavy RSS holder by the recursive ppid-tree
+walk, assigned weight 2 — and a pattern signal — wherein the process name
+matches a curated background-daemon allowlist, assigned weight 1; sorting
+candidate processes by composite score descending and then by resident set
+size descending; and applying SIGSTOP to candidates in sorted order, such
+that daemons most responsible for application-family memory pressure are
+suspended preferentially.
+
+**Claim 8 (Method — XPC Respawn Guard):**
+A computer-implemented method for preventing futile process-termination loops
+in a managed-service operating environment, comprising: recording a timestamp
+at the moment of each process termination signal; subsequently scanning
+running processes at a periodic interval; detecting when a previously
+terminated process reappears within a defined observation window; adding said
+process name to a persistent blocklist; and excluding blocklisted processes
+from all subsequent termination decisions within the monitoring session,
+thereby preventing repeated futile terminations of automatically-restarting
+system services.
+
+**Claim 9 (System):**
 A system for automated memory resource management comprising: a monitoring
 thread executing at a polling interval of approximately 1 Hz; a kernel
 pressure oracle; a virtual memory anatomy parser; a process genealogy engine
 performing recursive ppid-chain traversal; a linear-regression forecasting
-module; a four-tier remediation cascade module; an autonomous restoration
-loop; and a co-located HTTP server serving telemetry as JSON to a browser-
-based Progressive Web Application.
+module; a predictive remediation tier escalation engine; a CPU-RAM conflict
+resolution gate; a genealogy-guided freeze scoring module; an XPC respawn
+guard and blocklist; a four-tier remediation cascade module; an autonomous
+restoration loop; and a co-located HTTP server serving telemetry as JSON to
+a browser-based Progressive Web Application.
 
-**Claim 6 (Unprivileged Operation):**
-The system of Claim 5, wherein all monitoring and remediation operations are
+**Claim 10 (Unprivileged Operation):**
+The system of Claim 9, wherein all monitoring and remediation operations are
 performed without superuser (root) privileges, relying exclusively on signals
 (SIGSTOP, SIGCONT, SIGTERM) directed at user-owned processes and read-only
 system call interfaces.
@@ -531,18 +744,28 @@ system call interfaces.
 ## 7. Abstract
 
 A Multi-Dimensional Memory Intelligence Engine (MMIE) monitors a consumer
-multitasking operating system using a kernel pressure oracle, virtual memory
-anatomy parsing, recursive process-tree genealogy attribution, and linear-
-regression exhaustion forecasting. Upon detecting elevated memory pressure,
-the engine executes a four-tier adaptive remediation cascade: observation,
-advisory analysis, reversible process suspension via SIGSTOP, and emergency
-termination of idle services. Suspended processes are automatically restored
-via SIGCONT when pressure normalises. The entire system operates without
-superuser privileges and is implemented as an always-on background process
-with telemetry delivered to an installable Progressive Web Application
-dashboard. The invention provides predictive, graduated, reversible memory
-management for consumer operating systems, addressing deficiencies in
-existing reactive, flat, and binary approaches.
+multitasking operating system using a kernel pressure oracle (`sysctl
+kern.memorystatus_vm_pressure_level`), virtual memory anatomy parsing
+(`vm_stat`), recursive process-tree genealogy attribution, and ordinary
+least squares linear-regression exhaustion forecasting. A Predictive
+Remediation Engine translates the Time-to-Exhaustion forecast into a
+dynamic effective remediation tier that may escalate above static RAM-
+percentage thresholds, enabling pre-emptive intervention before memory
+exhaustion is imminent. A CPU-RAM Conflict Resolution Gate prevents CPU-
+priority restoration for processes identified by genealogy as dominant RAM
+owners during active memory pressure. Upon reaching elevated pressure, the
+engine executes a four-tier adaptive remediation cascade: observation,
+advisory structural analysis, reversible genealogy-guided SIGSTOP
+suspension of background daemons (scored by ppid-tree family membership
+and name-pattern allowlist), and emergency SIGTERM termination of idle XPC
+services. An XPC Respawn Guard detects launchd-managed services that
+immediately respawn after termination and blocklists them to prevent futile
+kill-loops. Suspended processes are automatically restored via SIGCONT when
+pressure normalises. The entire system operates without superuser privileges
+and delivers real-time telemetry to an installable Progressive Web
+Application dashboard. The invention addresses deficiencies in existing
+reactive, flat, binary, and respawn-unaware consumer memory management
+approaches.
 
 ---
 
@@ -555,25 +778,41 @@ Block diagram showing the BotEngine thread, MMIE sub-components, HTTP
 server, and PWA dashboard, with data-flow arrows indicating the 1 Hz
 polling cycle and JSON telemetry path.
 
-**FIG. 2 — Four-Tier Cascade Flowchart**
-Decision flowchart beginning at "RAM utilisation check," branching at each
-tier threshold (80 %, 82 %, 87 %, 92 %), showing the specific actions at
-each tier and the Auto-Thaw recovery path.
+**FIG. 2 — Predictive Remediation Engine Decision Diagram**
+Flowchart showing: (1) OLS regression over 30-sample window → TTE value;
+(2) TTE compared to TTE_TIER4/3/2_MIN thresholds; (3) effective_tier
+selection as max(threshold_tier, predictive_tier); (4) `_ram_pressure_lock`
+gate set/released; (5) CPU-RAM conflict resolution branch in `_check_cpu()`.
 
-**FIG. 3 — Memory Genealogy Tree**
+**FIG. 3 — Four-Tier Cascade Flowchart**
+Decision flowchart beginning at "effective_tier check," branching at each
+tier level (1–4), showing static % triggers, TTE escalation override,
+genealogy-guided scoring at Tier 3, XPC guard at Tier 4, and the Auto-Thaw
+recovery path when pressure drops below MEM_WARN − 5 %.
+
+**FIG. 4 — Memory Genealogy Tree + Freeze Scoring**
 Illustrative process tree showing a root application (e.g., "Microsoft Edge")
 with child renderer processes, GPU helper, XPC services, and network service,
-all attributed to the root with aggregated RSS.
+all attributed to the root with aggregated RSS. A scoring table alongside
+shows how each candidate daemon receives a `family_match` and `pattern_match`
+score, with final sort order determining SIGSTOP priority.
 
-**FIG. 4 — Linear Regression Forecast Diagram**
+**FIG. 5 — XPC Respawn Guard Timeline**
+Sequence diagram showing: SIGTERM sent → `_terminated_ts[name]` recorded →
+`_detect_xpc_respawn()` fires 10 s later → process still running → name added
+to `_no_kill` → subsequent Tier 4 sweep skips the blocklisted service.
+
+**FIG. 6 — Linear Regression Forecast Diagram**
 Time-series graph of RAM utilisation samples with the OLS regression line
-overlaid, showing the projected intersection with the 95 % threshold and
-the resulting TTE value.
+overlaid, showing the projected intersection with the 95 % threshold, the
+resulting TTE value, and the TTE_TIER3_MIN threshold that triggers predictive
+Tier 3 escalation before the static 87 % threshold is reached.
 
-**FIG. 5 — PWA Dashboard Screenshot**
-Annotated screenshot of the Memory Intelligence panel showing the arc gauge,
-memory composition bar, vm_stat detail rows, and memory families list with
-proportional bars.
+**FIG. 7 — PWA Dashboard Screenshot**
+Annotated screenshot of the Memory Intelligence panel showing: arc gauge,
+predictive escalation banner (amber), Active Tier row (colour-coded),
+CPU-RAM Lock indicator, XPC Blocked count, memory composition bar,
+vm_stat detail rows, and memory families list with proportional bars.
 
 ---
 
@@ -593,15 +832,18 @@ The invention is fully enabled by the reference implementation:
 The complete source code constitutes the enablement disclosure. Key methods
 and their locations in the reference implementation:
 
-| Claim Element              | Method                          | Module                  |
-|----------------------------|---------------------------------|-------------------------|
-| Kernel pressure oracle     | `_get_macos_pressure_level()`   | `app/performance_gui.py`|
-| Memory anatomy parser      | `_parse_vm_stat()`              | `app/performance_gui.py`|
-| Genealogy engine           | `_build_memory_ancestry()`      | `app/performance_gui.py`|
-| Exhaustion forecaster      | `_compute_mem_forecast()`       | `app/performance_gui.py`|
-| Remediation cascade        | `_tiered_memory_remediation()`  | `app/performance_gui.py`|
-| Tier 3 suspension          | `_freeze_background_daemons()`  | `app/performance_gui.py`|
-| Auto-Thaw restoration loop | `_thaw_frozen_daemons()`        | `app/performance_gui.py`|
+| Claim Element                     | Method                          | Module                  |
+|-----------------------------------|---------------------------------|-------------------------|
+| Kernel pressure oracle            | `_get_macos_pressure_level()`   | `app/performance_gui.py`|
+| Memory anatomy parser             | `_parse_vm_stat()`              | `app/performance_gui.py`|
+| Genealogy engine                  | `_build_memory_ancestry()`      | `app/performance_gui.py`|
+| Exhaustion forecaster             | `_compute_mem_forecast()`       | `app/performance_gui.py`|
+| Predictive Remediation Engine     | `_compute_effective_tier()`     | `app/performance_gui.py`|
+| CPU-RAM Conflict Resolution Gate  | `_check_cpu()` (restore branch) | `app/performance_gui.py`|
+| Remediation cascade               | `_tiered_memory_remediation()`  | `app/performance_gui.py`|
+| Genealogy-guided freeze scoring   | `_freeze_background_daemons()`  | `app/performance_gui.py`|
+| XPC Respawn Guard + blocklist     | `_detect_xpc_respawn()`         | `app/performance_gui.py`|
+| Auto-Thaw restoration loop        | `_thaw_frozen_daemons()`        | `app/performance_gui.py`|
 
 ---
 
