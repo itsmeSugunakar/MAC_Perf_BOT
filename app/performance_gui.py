@@ -5,7 +5,7 @@ Opens a live dashboard in your browser. No GUI dependencies needed.
 Backend: Python http.server  |  Frontend: Chart.js (CDN)
 """
 
-import os, sys, time, json, queue, threading, subprocess, webbrowser
+import os, sys, time, json, threading, subprocess, webbrowser
 from datetime import datetime
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -19,59 +19,75 @@ except ImportError as exc:
         "for example with: python3 -m pip install psutil"
     ) from exc
 
-PORT         = 8765
-HOST         = "127.0.0.1"
-LOG_DIR      = Path.home() / "Library" / "Logs" / "performance-bot"
+PORT    = 8765
+HOST    = "127.0.0.1"
+LOG_DIR = Path.home() / "Library" / "Logs" / "performance-bot"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ─── Bot Engine ───────────────────────────────────────────────────────────────
+# ─── Thresholds & Patterns ────────────────────────────────────────────────────
 PROTECTED = {
     "kernel_task", "launchd", "WindowServer", "loginwindow", "Finder",
     "Dock", "SystemUIServer", "coreaudiod", "cfprefsd", "mds",
     "mds_stores", "mdworker", "performance_bot", "performance_gui",
     "Python", "python3", "python",
 }
-# Never terminate even if they match idle patterns
 NEVER_TERMINATE = {
     "com.apple.AuthenticationServices.Helper",
     "CredentialProviderExtensionHelper",
     "Keychain Circle Notification",
     "com.apple.iCloud.Keychain",
 }
-# Patterns that identify safe-to-terminate idle XPC helpers / widget services
 IDLE_SERVICE_PATTERNS = (
     "Widget", "Extension", "XPCService", "HelperService",
     "BookkeepingService", "PredictionIntents", "MTLCompilerService",
     "VTEncoderXPCService", "VTDecoderXPCService", "WallpaperVideo",
     "CloudTelemetryService", "IntelligencePlatformComputeService",
     "SAExtensionOrchestrator", "SiriNCService", "SiriSuggestions",
-    "SiriInference", "ServiceExtension", "NewsTag",
-    "AppPredictionIntents",
+    "SiriInference", "ServiceExtension", "NewsTag", "AppPredictionIntents",
 )
-CPU_WARN      = 70.0
-CPU_THROTTLE  = 85.0
-MEM_WARN      = 80.0
-RENICE_VAL    = 10
-HISTORY_LEN   = 90
-IDLE_MB_FLOOR = 15      # only target idle services eating more than this
-IDLE_SWEEP_S  = 30      # run idle-service sweep every N seconds
+
+CPU_WARN         = 70.0
+CPU_THROTTLE     = 85.0
+MEM_WARN         = 80.0
+SWAP_WARN        = 50.0
+RENICE_VAL       = 10
+HISTORY_LEN      = 90
+IDLE_MB_FLOOR    = 15
+IDLE_SWEEP_S     = 30
+CACHE_WARN_GB    = 5.0
+LEAK_RATE_MB_MIN = 50    # MB/min growth rate to flag as potential leak
+LEAK_MIN_RSS_MB  = 200   # minimum RSS before flagging a leak
+CONSUMER_COOL_S  = 300   # min seconds between top-consumer reports
 
 
+# ─── Bot Engine ───────────────────────────────────────────────────────────────
 class BotEngine(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="bot-engine")
-        self._lock        = threading.Lock()
-        self.running      = True
-        self.cpu_hist     = []
-        self.mem_hist     = []
-        self.top_procs    = []
-        self.throttled    = {}      # pid → name
-        self.events       = []      # ring-buffer of last 200 events
-        self.actions      = 0
-        self.issues       = 0
-        self.freed_mb     = 0.0     # cumulative RAM freed by terminating idle services
-        self._swap_warned = False
-        self._terminated  = set()   # PIDs we already terminated this session
+        self._lock            = threading.Lock()
+        self.running          = True
+        self.cpu_hist         = []
+        self.mem_hist         = []
+        self.swap_hist        = []
+        self.top_procs        = []
+        self.throttled        = {}      # pid → name
+        self.events           = []      # ring-buffer of last 200 events
+        self.actions          = 0
+        self.issues           = 0
+        self.freed_mb         = 0.0
+        self.thermal_pct      = 100    # 100 = no throttle; <100 = thermally limited
+        self.on_battery       = False
+        self._start_time      = time.time()
+        self._swap_warned     = False
+        self._terminated      = set()
+        self._rss_history     = {}     # pid → [(ts, rss_mb), ...]
+        self._warned_leaks    = set()  # pids already flagged this session
+        self._cache_warned    = False
+        self._last_consumer   = 0.0    # timestamp of last consumer report
+        vm = psutil.virtual_memory()
+        sw = psutil.swap_memory()
+        self._mem_total_gb   = vm.total / 1e9
+        self._swap_total_gb  = sw.total / 1e9
         psutil.cpu_percent(interval=None)
 
     # ── public ────────────────────────────────────────────────────────────────
@@ -81,14 +97,20 @@ class BotEngine(threading.Thread):
     def snapshot(self):
         with self._lock:
             return {
-                "cpu_hist":  list(self.cpu_hist),
-                "mem_hist":  list(self.mem_hist),
-                "top_procs": list(self.top_procs),
-                "throttled": dict(self.throttled),
-                "events":    list(self.events[-60:]),
-                "actions":   self.actions,
-                "issues":    self.issues,
-                "freed_mb":  round(self.freed_mb, 0),
+                "cpu_hist":      list(self.cpu_hist),
+                "mem_hist":      list(self.mem_hist),
+                "swap_hist":     list(self.swap_hist),
+                "top_procs":     list(self.top_procs),
+                "throttled":     dict(self.throttled),
+                "events":        list(self.events[-60:]),
+                "actions":       self.actions,
+                "issues":        self.issues,
+                "freed_mb":      round(self.freed_mb, 0),
+                "thermal_pct":   self.thermal_pct,
+                "on_battery":    self.on_battery,
+                "uptime_s":      int(time.time() - self._start_time),
+                "mem_total_gb":  round(self._mem_total_gb, 1),
+                "swap_total_gb": round(self._swap_total_gb, 1),
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
@@ -110,6 +132,11 @@ class BotEngine(threading.Thread):
                 if tick % 3  == 0: self._check_memory()
                 if tick % 10 == 0: self._check_disk()
                 if tick % IDLE_SWEEP_S == 0: self._sweep_idle_services()
+                if tick % 30  == 0: self._check_power_mode()
+                if tick % 60  == 0: self._check_thermal()
+                if tick % 60  == 0: self._check_zombies()
+                if tick % 60  == 0: self._track_memory_leaks()
+                if tick % 300 == 0 and tick > 0: self._check_caches()
             except Exception as exc:
                 self._emit("warn", f"Engine error: {exc}")
             tick += 1
@@ -118,10 +145,11 @@ class BotEngine(threading.Thread):
 
     def _collect(self):
         cpu  = psutil.cpu_percent(interval=None)
-        mem  = psutil.virtual_memory().percent
+        vm   = psutil.virtual_memory()
+        swap = psutil.swap_memory()
         rows = []
-        for p in psutil.process_iter(["pid","name","cpu_percent",
-                                       "memory_percent","status"]):
+        for p in psutil.process_iter(["pid", "name", "cpu_percent",
+                                       "memory_percent", "status"]):
             try:
                 c = p.cpu_percent(interval=None) / (psutil.cpu_count(logical=True) or 1)
                 rows.append((c, p.memory_percent(), p.pid,
@@ -131,9 +159,11 @@ class BotEngine(threading.Thread):
         rows.sort(reverse=True)
         with self._lock:
             self.cpu_hist.append(cpu)
-            self.mem_hist.append(mem)
-            if len(self.cpu_hist) > HISTORY_LEN: self.cpu_hist.pop(0)
-            if len(self.mem_hist) > HISTORY_LEN: self.mem_hist.pop(0)
+            self.mem_hist.append(vm.percent)
+            self.swap_hist.append(swap.percent if swap.total > 0 else 0)
+            if len(self.cpu_hist)  > HISTORY_LEN: self.cpu_hist.pop(0)
+            if len(self.mem_hist)  > HISTORY_LEN: self.mem_hist.pop(0)
+            if len(self.swap_hist) > HISTORY_LEN: self.swap_hist.pop(0)
             self.top_procs = rows[:12]
 
     def _check_cpu(self):
@@ -149,12 +179,13 @@ class BotEngine(threading.Thread):
                     p.nice(0)
                     name = self.throttled.pop(pid)
                     self.actions += 1
-                    self._emit("fix", f"Priority restored: {name} (PID {pid}) — CPU back to {c:.0f}%")
+                    self._emit("fix",
+                        f"Priority restored: {name} (PID {pid}) — CPU back to {c:.0f}%")
             except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
                 self.throttled.pop(pid, None)
         if hist[-1] < CPU_WARN: return
         # throttle hogs
-        for p in psutil.process_iter(["pid","name","cpu_percent","nice"]):
+        for p in psutil.process_iter(["pid", "name", "cpu_percent", "nice"]):
             try:
                 if p.name() in PROTECTED: continue
                 c = p.cpu_percent(interval=None) / (psutil.cpu_count(logical=True) or 1)
@@ -177,17 +208,143 @@ class BotEngine(threading.Thread):
         vm = psutil.virtual_memory()
         if vm.percent >= MEM_WARN:
             self.issues += 1
+            used_gb = (vm.total - vm.available) / 1e9
             self._emit("issue",
                 f"RAM pressure: {vm.percent:.0f}% used "
-                f"({(vm.total-vm.available)/1e9:.1f}/{vm.total/1e9:.1f} GB)")
+                f"({used_gb:.1f} / {vm.total/1e9:.1f} GB)")
+            # report top consumers with cooldown
+            now = time.time()
+            if now - self._last_consumer >= CONSUMER_COOL_S:
+                self._last_consumer = now
+                self._report_memory_consumers()
+
         swap = psutil.swap_memory()
         if swap.total > 0:
-            if swap.percent >= 50 and not self._swap_warned:
+            if swap.percent >= SWAP_WARN and not self._swap_warned:
                 self._swap_warned = True
                 self._emit("warn",
-                    f"Swap active: {swap.percent:.0f}% ({swap.used/1e9:.1f} GB used)")
+                    f"Swap in use: {swap.percent:.0f}% "
+                    f"({swap.used/1e9:.1f} GB) — system is memory-constrained")
             elif swap.percent < 30:
                 self._swap_warned = False
+
+    def _report_memory_consumers(self):
+        """List top RSS hogs when RAM is critically high."""
+        procs = []
+        for p in psutil.process_iter(["pid", "name", "memory_info"]):
+            try:
+                if p.name() in PROTECTED: continue
+                rss = p.memory_info().rss / 1e6
+                if rss >= 150:
+                    procs.append((rss, p.name(), p.pid))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        procs.sort(reverse=True)
+        for rss, name, pid in procs[:3]:
+            self._emit("issue",
+                f"RAM hog: {name} (PID {pid}) holding {rss:.0f} MB "
+                f"— restart if unnecessary")
+
+    def _check_zombies(self):
+        """Detect zombie processes that indicate a hung parent."""
+        zombies = []
+        for p in psutil.process_iter(["pid", "name", "status"]):
+            try:
+                if p.status() == psutil.STATUS_ZOMBIE:
+                    zombies.append((p.pid, p.name()))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if zombies:
+            self.issues += len(zombies)
+            for pid, name in zombies[:5]:
+                self._emit("warn",
+                    f"Zombie process: {name} (PID {pid}) — parent process may be hung")
+
+    def _track_memory_leaks(self):
+        """Flag processes whose RSS is growing rapidly (potential leaks)."""
+        now = time.time()
+        for p in psutil.process_iter(["pid", "name", "memory_info"]):
+            try:
+                if p.name() in PROTECTED: continue
+                rss = p.memory_info().rss / 1e6
+                pid = p.pid
+                hist = self._rss_history.setdefault(pid, [])
+                hist.append((now, rss))
+                if len(hist) > 5:
+                    hist.pop(0)
+                if len(hist) >= 3 and pid not in self._warned_leaks:
+                    elapsed = hist[-1][0] - hist[0][0]
+                    growth  = hist[-1][1] - hist[0][1]
+                    if elapsed > 0:
+                        rate = growth / elapsed * 60  # MB/min
+                        if rate >= LEAK_RATE_MB_MIN and rss >= LEAK_MIN_RSS_MB:
+                            self._warned_leaks.add(pid)
+                            self.issues += 1
+                            self._emit("warn",
+                                f"Memory growth: {p.name()} (PID {pid}) "
+                                f"+{rate:.0f} MB/min, now {rss:.0f} MB — possible leak")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                self._rss_history.pop(p.pid, None)
+                self._warned_leaks.discard(p.pid)
+
+    def _check_thermal(self):
+        """Detect CPU thermal throttling via pmset -g therm."""
+        try:
+            r = subprocess.run(
+                ["pmset", "-g", "therm"],
+                capture_output=True, text=True, timeout=3
+            )
+            for line in r.stdout.splitlines():
+                if "CPU_Speed_Limit" in line:
+                    pct = int(line.split()[-1])
+                    with self._lock:
+                        self.thermal_pct = pct
+                    if pct < 100:
+                        self.issues += 1
+                        self._emit("issue",
+                            f"Thermal throttle active: CPU limited to {pct}% speed "
+                            f"— system is overheating, consider improving airflow")
+                    return
+            with self._lock:
+                self.thermal_pct = 100
+        except Exception:
+            pass
+
+    def _check_power_mode(self):
+        """Detect battery vs AC and emit an event when source changes."""
+        try:
+            r = subprocess.run(
+                ["pmset", "-g", "ps"],
+                capture_output=True, text=True, timeout=2
+            )
+            on_battery = "Battery Power" in r.stdout
+            with self._lock:
+                changed        = on_battery != self.on_battery
+                self.on_battery = on_battery
+            if changed:
+                src = "battery" if on_battery else "AC power"
+                self._emit("info", f"Power source changed: now on {src}")
+        except Exception:
+            pass
+
+    def _check_caches(self):
+        """Warn once when ~/Library/Caches grows excessively large."""
+        if self._cache_warned:
+            return
+        cache_dir = Path.home() / "Library" / "Caches"
+        try:
+            total = sum(
+                f.stat().st_size for f in cache_dir.rglob("*") if f.is_file()
+            )
+            gb = total / 1e9
+            if gb >= CACHE_WARN_GB:
+                self._cache_warned = True
+                self.issues += 1
+                self._emit("issue",
+                    f"Cache bloat: ~/Library/Caches is {gb:.1f} GB "
+                    f"— clear with CleanMyMac or 'rm -rf ~/Library/Caches/*'")
+        except Exception:
+            pass
 
     def _sweep_idle_services(self):
         """Auto-terminate sleeping XPC helpers / widget extensions eating RAM."""
@@ -228,8 +385,8 @@ class BotEngine(threading.Thread):
         if swept:
             total = sum(r for _, _, r in swept)
             self._emit("fix",
-                f"Idle sweep done: {len(swept)} services cleared, "
-                f"~{total:.0f} MB freed (total freed this session: {self.freed_mb:.0f} MB)")
+                f"Idle sweep: {len(swept)} services cleared, "
+                f"~{total:.0f} MB freed (session total: {self.freed_mb:.0f} MB)")
 
     def _check_disk(self):
         try:
@@ -237,7 +394,12 @@ class BotEngine(threading.Thread):
             if d.percent >= 90:
                 self.issues += 1
                 self._emit("issue",
-                    f"Low disk: {d.percent:.0f}% full ({d.free/1e9:.1f} GB free)")
+                    f"Low disk: {d.percent:.0f}% full "
+                    f"({d.free/1e9:.1f} GB free) — clear space soon")
+            elif d.percent >= 80:
+                self._emit("warn",
+                    f"Disk filling up: {d.percent:.0f}% used "
+                    f"({d.free/1e9:.1f} GB free)")
         except Exception:
             pass
 
@@ -254,108 +416,187 @@ HTML = r"""<!DOCTYPE html>
   *{box-sizing:border-box;margin:0;padding:0}
   :root{
     --bg:#0d1117;--panel:#161b22;--border:#21262d;
-    --text:#e6edf3;--muted:#656d76;
+    --text:#e6edf3;--muted:#656d76;--muted2:#484f58;
     --green:#3fb950;--yellow:#d29922;--red:#f85149;
-    --blue:#58a6ff;--orange:#e3b341;--accent:#1f6feb;
-    --cpu:#ff7b54;--mem:#7ee787;
+    --blue:#58a6ff;--orange:#e3b341;--accent:#1f6feb;--purple:#bc8cff;
+    --cpu:#ff7b54;--mem:#7ee787;--swap:#58a6ff;
   }
-  body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;font-size:13px}
+  body{
+    background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;
+    font-size:13px;min-height:100vh;display:flex;flex-direction:column;
+  }
 
   /* ── title bar ── */
   .titlebar{
     display:flex;align-items:center;gap:10px;
-    background:var(--panel);padding:14px 18px;
-    border-bottom:1px solid var(--border);position:sticky;top:0;z-index:99;
+    background:var(--panel);padding:11px 16px;
+    border-bottom:1px solid var(--border);
+    position:sticky;top:0;z-index:99;
   }
   .dots{display:flex;gap:6px}
   .dot{width:12px;height:12px;border-radius:50%}
-  .titlebar h1{font-size:14px;font-weight:700;letter-spacing:.3px}
-  .status{display:flex;align-items:center;gap:5px;margin-left:6px}
-  .status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);
-               box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+  .titlebar h1{font-size:13px;font-weight:700;letter-spacing:.3px}
+  .status{display:flex;align-items:center;gap:5px;margin-left:4px}
+  .status-dot{
+    width:7px;height:7px;border-radius:50%;
+    background:var(--green);box-shadow:0 0 6px var(--green);
+    animation:pulse 2s infinite;
+  }
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
   .status-text{font-size:11px;font-weight:700;color:var(--green)}
   .spacer{flex:1}
+  .meta-pills{display:flex;align-items:center;gap:8px}
+  .pill{
+    display:inline-flex;align-items:center;gap:4px;
+    background:var(--bg);border:1px solid var(--border);
+    border-radius:20px;padding:3px 10px;font-size:11px;color:var(--muted);
+    transition:border-color .2s,color .2s;
+  }
+  .pill.battery{color:var(--green);border-color:rgba(63,185,80,.3)}
+  .pill.thermal-hot{color:var(--red);border-color:rgba(248,81,73,.4)}
   .btn{
     background:var(--border);color:var(--text);border:none;
-    padding:5px 14px;border-radius:6px;cursor:pointer;font-size:12px;
+    padding:5px 13px;border-radius:6px;cursor:pointer;font-size:11px;
     transition:background .15s;
   }
   .btn:hover{background:var(--accent)}
 
   /* ── cards ── */
-  .cards{display:flex;gap:10px;padding:12px 14px}
+  .cards-section{padding:10px 12px 0;display:flex;flex-direction:column;gap:8px}
+  .cards-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
   .card{
-    flex:1;background:var(--panel);border:1px solid var(--border);
-    border-radius:10px;padding:14px 16px;
+    background:var(--panel);border:1px solid var(--border);
+    border-radius:10px;padding:13px 15px;
+    transition:border-color .2s;
   }
-  .card-label{font-size:10px;font-weight:700;color:var(--muted);
-               letter-spacing:.6px;text-transform:uppercase;margin-bottom:6px}
-  .card-val{font-size:28px;font-weight:700;line-height:1}
+  .card:hover{border-color:#30363d}
+  .card-label{
+    font-size:10px;font-weight:700;color:var(--muted);
+    letter-spacing:.6px;text-transform:uppercase;margin-bottom:5px;
+  }
+  .card-val{
+    font-size:26px;font-weight:700;line-height:1;
+    margin-bottom:5px;transition:color .3s;
+  }
+  .card-sub{
+    font-size:10px;color:var(--muted);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
 
-  /* ── main grid ── */
-  .main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;padding:0 14px 14px}
+  /* ── main grid (3 columns) ── */
+  .main{
+    display:grid;
+    grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,320px);
+    gap:10px;padding:10px 12px 12px;
+  }
 
-  /* ── chart panel ── */
+  /* ── chart panels ── */
   .chart-panel{
     background:var(--panel);border:1px solid var(--border);
-    border-radius:10px;padding:14px;
+    border-radius:10px;padding:13px;
   }
-  .panel-title{font-size:12px;font-weight:700;color:var(--muted);
-                letter-spacing:.5px;text-transform:uppercase;margin-bottom:10px}
-  .chart-wrap{position:relative;height:160px}
+  .panel-hdr{
+    display:flex;justify-content:space-between;align-items:baseline;
+    margin-bottom:10px;
+  }
+  .panel-title{
+    font-size:10px;font-weight:700;color:var(--muted);
+    letter-spacing:.5px;text-transform:uppercase;
+  }
+  .panel-live{font-size:18px;font-weight:700;transition:color .3s}
+  .chart-wrap{position:relative;height:120px}
+
+  /* ── system info panel ── */
+  .sysinfo-panel{
+    background:var(--panel);border:1px solid var(--border);
+    border-radius:10px;padding:13px;
+  }
+  .sysinfo-row{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;
+  }
+  .sysinfo-row:last-child{border:none}
+  .sysinfo-key{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.4px;font-weight:700}
+  .sysinfo-val{font-family:'SF Mono',monospace;font-size:11px}
+  .throttled-list{
+    margin-top:6px;font-size:10px;font-family:'SF Mono',monospace;
+    color:var(--orange);line-height:1.6;
+  }
 
   /* ── activity feed ── */
   .feed{
     background:var(--panel);border:1px solid var(--border);
-    border-radius:10px;padding:14px;display:flex;flex-direction:column;
-    grid-row:span 2;
-    min-width:0;overflow:hidden;        /* prevent grid blowout */
+    border-radius:10px;padding:13px;
+    display:flex;flex-direction:column;
+    grid-column:3;grid-row:1/5;
+    min-width:0;overflow:hidden;
   }
-  .feed-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;min-width:0}
-  .feed-title{font-size:12px;font-weight:700;color:var(--muted);letter-spacing:.5px;text-transform:uppercase}
-  .event-count{font-size:11px;color:var(--muted);white-space:nowrap}
-  .feed-body{flex:1;overflow-y:auto;overflow-x:hidden;font-family:'SF Mono',monospace;font-size:11px;min-width:0}
-  .ev{display:flex;gap:6px;padding:3px 0;border-bottom:1px solid var(--border);min-width:0;width:100%}
-  .ev-ts{color:var(--muted);white-space:nowrap;flex-shrink:0}
-  .ev-badge{font-weight:700;white-space:nowrap;flex-shrink:0;font-size:10px}
-  .ev-msg{color:var(--text);word-break:break-all;overflow-wrap:anywhere;min-width:0;overflow:hidden}
-  .fix   .ev-badge{color:var(--green)}
-  .warn  .ev-badge{color:var(--yellow)}
-  .issue .ev-badge{color:var(--red)}
-  .info  .ev-badge{color:var(--blue)}
+  .feed-hdr{
+    display:flex;justify-content:space-between;align-items:center;
+    margin-bottom:10px;flex-shrink:0;
+  }
+  .feed-title{font-size:10px;font-weight:700;color:var(--muted);letter-spacing:.5px;text-transform:uppercase}
+  .ev-count{font-size:11px;color:var(--muted)}
+  .feed-body{flex:1;overflow-y:auto;overflow-x:hidden;min-width:0;min-height:0}
+  .ev{
+    display:flex;gap:7px;padding:5px 7px;margin-bottom:2px;
+    border-radius:5px;min-width:0;
+    border-left:2px solid transparent;
+    background:rgba(255,255,255,.015);
+  }
+  .ev:hover{background:rgba(255,255,255,.04)}
+  .ev-ts{color:var(--muted);white-space:nowrap;flex-shrink:0;font-size:10px;font-family:'SF Mono',monospace;padding-top:1px}
+  .ev-badge{font-weight:700;white-space:nowrap;flex-shrink:0;font-size:10px;padding-top:1px;min-width:42px}
+  .ev-msg{color:var(--text);word-break:break-word;min-width:0;font-size:11px;font-family:'SF Mono',monospace;line-height:1.5}
+  .fix   {border-left-color:var(--green)} .fix   .ev-badge{color:var(--green)}
+  .warn  {border-left-color:var(--yellow)}.warn  .ev-badge{color:var(--yellow)}
+  .issue {border-left-color:var(--red)}   .issue .ev-badge{color:var(--red)}
+  .info  {border-left-color:var(--blue)}  .info  .ev-badge{color:var(--blue)}
 
   /* ── process table ── */
   .proc-panel{
     background:var(--panel);border:1px solid var(--border);
-    border-radius:10px;padding:14px;
-    grid-column:1/-1;
+    border-radius:10px;padding:13px;
+    grid-column:1/3;
   }
   table{width:100%;border-collapse:collapse}
-  th{text-align:left;font-size:10px;font-weight:700;color:var(--muted);
-     letter-spacing:.5px;text-transform:uppercase;padding:4px 10px;
-     border-bottom:1px solid var(--border)}
-  td{padding:4px 10px;font-family:'SF Mono',monospace;font-size:11px;
-     border-bottom:1px solid var(--border)}
+  th{
+    text-align:left;font-size:10px;font-weight:700;color:var(--muted);
+    letter-spacing:.5px;text-transform:uppercase;padding:4px 8px;
+    border-bottom:1px solid var(--border);
+  }
+  td{
+    padding:5px 8px;font-family:'SF Mono',monospace;font-size:11px;
+    border-bottom:1px solid var(--border);
+  }
   tr:last-child td{border:none}
+  tr:hover td{background:rgba(255,255,255,.02)}
   .hi  td:nth-child(3){color:var(--yellow)}
   .thr td:nth-child(3){color:var(--orange);font-weight:700}
-  .bar-cell{width:80px}
-  .bar{height:6px;border-radius:3px;background:var(--border)}
-  .bar-fill{height:100%;border-radius:3px}
+  .bar-cell{width:60px}
+  .bar{height:4px;border-radius:2px;background:var(--border)}
+  .bar-fill{height:100%;border-radius:2px;transition:width .4s}
+  .thr-badge{
+    display:inline-block;
+    background:rgba(227,179,65,.12);color:var(--orange);
+    border:1px solid rgba(227,179,65,.3);
+    border-radius:3px;font-size:9px;font-weight:700;
+    padding:0 4px;margin-left:5px;letter-spacing:.3px;
+  }
 
   /* ── footer ── */
   .footer{
-    padding:8px 18px;background:var(--panel);
-    border-top:1px solid var(--border);
+    margin-top:auto;padding:7px 16px;
+    background:var(--panel);border-top:1px solid var(--border);
     font-size:10px;color:var(--muted);
-    display:flex;justify-content:space-between;
+    display:flex;justify-content:space-between;align-items:center;gap:16px;
   }
 
   /* scrollbar */
-  ::-webkit-scrollbar{width:5px;height:5px}
-  ::-webkit-scrollbar-track{background:var(--bg)}
-  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+  ::-webkit-scrollbar{width:4px;height:4px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 </style>
 </head>
 <body>
@@ -373,60 +614,135 @@ HTML = r"""<!DOCTYPE html>
     <span class="status-text" id="statusText">RUNNING</span>
   </div>
   <span class="spacer"></span>
+  <div class="meta-pills">
+    <span id="uptimePill" class="pill">⏱ 0s</span>
+    <span id="powerPill"  class="pill">⚡ AC</span>
+    <span id="thermalPill" class="pill">🌡 Normal</span>
+  </div>
   <button class="btn" id="pauseBtn" onclick="togglePause()">Pause Bot</button>
   <button class="btn" onclick="clearFeed()">Clear Log</button>
 </div>
 
-<!-- Stat cards -->
-<div class="cards">
-  <div class="card"><div class="card-label">CPU</div>
-    <div class="card-val" id="cCpu" style="color:var(--cpu)">—</div></div>
-  <div class="card"><div class="card-label">Memory</div>
-    <div class="card-val" id="cMem" style="color:var(--mem)">—</div></div>
-  <div class="card"><div class="card-label">Disk</div>
-    <div class="card-val" id="cDisk" style="color:var(--blue)">—</div></div>
-  <div class="card"><div class="card-label">Throttled Now</div>
-    <div class="card-val" id="cThr" style="color:var(--orange)">0</div></div>
-  <div class="card"><div class="card-label">Actions Taken</div>
-    <div class="card-val" id="cAct" style="color:var(--green)">0</div></div>
-  <div class="card"><div class="card-label">Issues Found</div>
-    <div class="card-val" id="cIss" style="color:var(--red)">0</div></div>
-  <div class="card"><div class="card-label">RAM Freed</div>
-    <div class="card-val" id="cFreed" style="color:var(--blue)">0 MB</div></div>
+<!-- Cards row 1: resources -->
+<div class="cards-section">
+  <div class="cards-row">
+    <div class="card">
+      <div class="card-label">CPU</div>
+      <div class="card-val" id="cCpu" style="color:var(--cpu)">—</div>
+      <div class="card-sub" id="cCpuSub">system-wide</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Memory</div>
+      <div class="card-val" id="cMem" style="color:var(--mem)">—</div>
+      <div class="card-sub" id="cMemSub">— / — GB</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Swap</div>
+      <div class="card-val" id="cSwap" style="color:var(--swap)">—</div>
+      <div class="card-sub" id="cSwapSub">— GB used</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Disk</div>
+      <div class="card-val" id="cDisk" style="color:var(--blue)">—</div>
+      <div class="card-sub" id="cDiskSub">— GB free</div>
+    </div>
+  </div>
+  <!-- Cards row 2: bot stats -->
+  <div class="cards-row">
+    <div class="card">
+      <div class="card-label">Throttled Now</div>
+      <div class="card-val" id="cThr" style="color:var(--muted)">0</div>
+      <div class="card-sub" id="cThrSub">no active throttles</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Actions Taken</div>
+      <div class="card-val" id="cAct" style="color:var(--muted)">0</div>
+      <div class="card-sub">auto-remediations</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Issues Found</div>
+      <div class="card-val" id="cIss" style="color:var(--muted)">0</div>
+      <div class="card-sub">warnings + issues</div>
+    </div>
+    <div class="card">
+      <div class="card-label">RAM Freed</div>
+      <div class="card-val" id="cFreed" style="color:var(--muted)">0 MB</div>
+      <div class="card-sub">idle service sweep</div>
+    </div>
+  </div>
 </div>
 
 <!-- Main grid -->
 <div class="main">
 
-  <!-- CPU chart -->
+  <!-- CPU chart (col 1, row 1) -->
   <div class="chart-panel">
-    <div class="panel-title">CPU Usage — 90 s</div>
+    <div class="panel-hdr">
+      <span class="panel-title">CPU — 90 s</span>
+      <span class="panel-live" id="cpuLive" style="color:var(--cpu)">—</span>
+    </div>
     <div class="chart-wrap"><canvas id="cpuChart"></canvas></div>
   </div>
 
-  <!-- Activity feed (spans 2 rows) -->
-  <div class="feed" style="grid-row:span 2">
-    <div class="feed-header">
+  <!-- Memory chart (col 2, row 1) -->
+  <div class="chart-panel">
+    <div class="panel-hdr">
+      <span class="panel-title">Memory — 90 s</span>
+      <span class="panel-live" id="memLive" style="color:var(--mem)">—</span>
+    </div>
+    <div class="chart-wrap"><canvas id="memChart"></canvas></div>
+  </div>
+
+  <!-- Activity feed (col 3, rows 1-4) -->
+  <div class="feed">
+    <div class="feed-hdr">
       <span class="feed-title">Activity Log</span>
-      <span class="event-count" id="evCount">0 events</span>
+      <span class="ev-count" id="evCount">0 events</span>
     </div>
     <div class="feed-body" id="feedBody"></div>
   </div>
 
-  <!-- MEM chart -->
+  <!-- Swap chart (col 1, row 2) -->
   <div class="chart-panel">
-    <div class="panel-title">Memory Usage — 90 s</div>
-    <div class="chart-wrap"><canvas id="memChart"></canvas></div>
+    <div class="panel-hdr">
+      <span class="panel-title">Swap — 90 s</span>
+      <span class="panel-live" id="swapLive" style="color:var(--swap)">—</span>
+    </div>
+    <div class="chart-wrap"><canvas id="swapChart"></canvas></div>
   </div>
 
-  <!-- Process table -->
+  <!-- System info panel (col 2, row 2) -->
+  <div class="sysinfo-panel">
+    <div class="panel-title" style="margin-bottom:10px">System</div>
+    <div class="sysinfo-row">
+      <span class="sysinfo-key">Total RAM</span>
+      <span class="sysinfo-val" id="siMemTotal">—</span>
+    </div>
+    <div class="sysinfo-row">
+      <span class="sysinfo-key">Total Swap</span>
+      <span class="sysinfo-val" id="siSwapTotal">—</span>
+    </div>
+    <div class="sysinfo-row">
+      <span class="sysinfo-key">Disk Free</span>
+      <span class="sysinfo-val" id="siDiskFree">—</span>
+    </div>
+    <div class="sysinfo-row">
+      <span class="sysinfo-key">Throttled</span>
+      <span class="sysinfo-val" id="siThrCount" style="color:var(--muted)">none</span>
+    </div>
+    <div class="throttled-list" id="siThrList"></div>
+  </div>
+
+  <!-- Process table (col 1-2, row 3) -->
   <div class="proc-panel">
     <div class="panel-title" style="margin-bottom:8px">Top Processes</div>
     <table>
       <thead>
         <tr>
-          <th>Process</th><th>PID</th><th>CPU %</th>
-          <th>CPU Bar</th><th>MEM %</th><th>Status</th>
+          <th>Process</th><th>PID</th>
+          <th>CPU %</th><th>CPU</th>
+          <th>MEM %</th><th>MEM</th>
+          <th>Status</th>
         </tr>
       </thead>
       <tbody id="procBody"></tbody>
@@ -438,19 +754,38 @@ HTML = r"""<!DOCTYPE html>
 <!-- Footer -->
 <div class="footer">
   <span id="lastUpdate">Initializing…</span>
-  <span>Monitor: 1 s &nbsp;·&nbsp; Throttle: &gt;85% CPU &nbsp;·&nbsp; Warn: &gt;80% RAM</span>
+  <span id="footerRight">Poll: 1 s · Throttle: &gt;85% CPU · Warn: &gt;80% RAM · Sweep: idle XPC/widgets</span>
 </div>
 
 <script>
-// ── Chart setup ──────────────────────────────────────────────────────────────
-function makeChart(id, color, fill) {
+// ── Chart factory ─────────────────────────────────────────────────────────────
+function makeChart(id, color, fill, warnPct) {
   const ctx = document.getElementById(id).getContext('2d');
+  const warnPlugin = {
+    id: 'warnLine',
+    beforeDraw(chart) {
+      if (!warnPct) return;
+      const {ctx: c, chartArea, scales} = chart;
+      if (!chartArea) return;
+      const y = scales.y.getPixelForValue(warnPct);
+      c.save();
+      c.strokeStyle = 'rgba(248,81,73,.3)';
+      c.lineWidth = 1;
+      c.setLineDash([3, 5]);
+      c.beginPath();
+      c.moveTo(chartArea.left, y);
+      c.lineTo(chartArea.right, y);
+      c.stroke();
+      c.setLineDash([]);
+      c.restore();
+    }
+  };
   return new Chart(ctx, {
     type: 'line',
     data: {
       labels: [],
       datasets: [{
-        data: [], borderColor: color, borderWidth: 2,
+        data: [], borderColor: color, borderWidth: 1.5,
         backgroundColor: fill, fill: true,
         tension: 0.3, pointRadius: 0,
       }]
@@ -461,18 +796,23 @@ function makeChart(id, color, fill) {
         x: { display: false },
         y: {
           min: 0, max: 100,
-          ticks: { color: '#656d76', stepSize: 25, callback: v => v + '%' },
+          ticks: {
+            color: '#656d76', stepSize: 25,
+            callback: v => v + '%', font: { size: 10 }
+          },
           grid: { color: '#21262d' },
           border: { display: false },
         }
       },
       plugins: { legend: { display: false }, tooltip: { enabled: false } },
-    }
+    },
+    plugins: [warnPlugin],
   });
 }
 
-const cpuChart = makeChart('cpuChart', '#ff7b54', 'rgba(255,123,84,.15)');
-const memChart = makeChart('memChart', '#7ee787', 'rgba(126,231,135,.15)');
+const cpuChart  = makeChart('cpuChart',  '#ff7b54', 'rgba(255,123,84,.1)',   80);
+const memChart  = makeChart('memChart',  '#7ee787', 'rgba(126,231,135,.1)',  80);
+const swapChart = makeChart('swapChart', '#58a6ff', 'rgba(88,166,255,.1)',   50);
 
 function updateChart(chart, data) {
   chart.data.labels = data.map((_, i) => i);
@@ -480,50 +820,59 @@ function updateChart(chart, data) {
   chart.update('none');
 }
 
-// ── State ────────────────────────────────────────────────────────────────────
-let evCount = 0;
-let seenEvents = new Set();
-let paused = false;
+// ── State ─────────────────────────────────────────────────────────────────────
+let evCount = 0, seenEvents = new Set(), paused = false;
+let memTotalGb = 0, swapTotalGb = 0;
 
-// ── Stat cards ───────────────────────────────────────────────────────────────
-function colorFor(val, lo=60, hi=80, def='') {
-  return val > hi ? 'var(--red)' : val > lo ? 'var(--yellow)' : def;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function colorFor(v, lo, hi, def) {
+  return v > hi ? 'var(--red)' : v > lo ? 'var(--yellow)' : def;
 }
-
 function setCard(id, text, color) {
   const el = document.getElementById(id);
   el.textContent = text;
-  if (color) el.style.color = color;
+  if (color !== undefined) el.style.color = color;
+}
+function setSub(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+function fmtUptime(s) {
+  if (s < 60)   return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s % 60) + 's';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
 }
 
 // ── Process table ─────────────────────────────────────────────────────────────
-function barHtml(pct, color) {
+function barCell(pct, color) {
   return `<td class="bar-cell">
-    <div class="bar"><div class="bar-fill" style="width:${Math.min(pct,100)}%;background:${color}"></div></div>
+    <div class="bar">
+      <div class="bar-fill" style="width:${Math.min(pct,100).toFixed(1)}%;background:${color}"></div>
+    </div>
   </td>`;
 }
-
-function buildProcTable(procs, throttledPids) {
-  const body = document.getElementById('procBody');
-  body.innerHTML = procs.map(([cpu, mem, pid, name, status]) => {
-    const thr = throttledPids.includes(pid);
-    const hi  = !thr && cpu >= 70;
-    const cls = thr ? 'thr' : hi ? 'hi' : '';
-    const cpuColor = thr ? 'var(--orange)' : hi ? 'var(--yellow)' : 'var(--cpu)';
+function buildProcTable(procs, thrPids) {
+  document.getElementById('procBody').innerHTML = procs.map(([cpu, mem, pid, name, status]) => {
+    const thr = thrPids.includes(pid);
+    const hiCpu = !thr && cpu >= 70;
+    const cls = thr ? 'thr' : hiCpu ? 'hi' : '';
+    const cpuColor = thr ? 'var(--orange)' : hiCpu ? 'var(--yellow)' : 'var(--cpu)';
+    const memColor = mem >= 10 ? 'var(--red)' : mem >= 4 ? 'var(--yellow)' : 'var(--mem)';
+    const badge = thr ? '<span class="thr-badge">THROTTLED</span>' : '';
     return `<tr class="${cls}">
-      <td>${name}</td>
+      <td>${name}${badge}</td>
       <td>${pid}</td>
       <td>${cpu.toFixed(1)}%</td>
-      ${barHtml(cpu, cpuColor)}
+      ${barCell(cpu, cpuColor)}
       <td>${mem.toFixed(1)}%</td>
+      ${barCell(mem * 8, memColor)}
       <td>${status}</td>
     </tr>`;
   }).join('');
 }
 
-// ── Activity feed ─────────────────────────────────────────────────────────────
-const BADGE = {fix:'✓ FIX  ', warn:'⚠ WARN ', issue:'✗ ISSUE', info:'ℹ INFO '};
-
+// ── Activity feed ──────────────────────────────────────────────────────────────
+const BADGE = { fix:'✓ FIX', warn:'⚠ WARN', issue:'✗ ISSUE', info:'ℹ INFO' };
 function addEvent(ev) {
   const key = ev.ts + ev.msg;
   if (seenEvents.has(key)) return;
@@ -532,83 +881,147 @@ function addEvent(ev) {
   document.getElementById('evCount').textContent = evCount + ' events';
   const div = document.createElement('div');
   div.className = 'ev ' + ev.kind;
-  div.innerHTML = `<span class="ev-ts">${ev.ts}</span>
-    <span class="ev-badge">${BADGE[ev.kind]||'?'}</span>
-    <span class="ev-msg">${ev.msg}</span>`;
-  const body = document.getElementById('feedBody');
-  body.prepend(div);
+  div.innerHTML =
+    `<span class="ev-ts">${ev.ts}</span>` +
+    `<span class="ev-badge">${BADGE[ev.kind] || '?'}</span>` +
+    `<span class="ev-msg">${ev.msg}</span>`;
+  document.getElementById('feedBody').prepend(div);
 }
-
 function clearFeed() {
-  evCount = 0;
-  seenEvents.clear();
+  evCount = 0; seenEvents.clear();
   document.getElementById('evCount').textContent = '0 events';
   document.getElementById('feedBody').innerHTML = '';
 }
 
-// ── Pause/Resume ──────────────────────────────────────────────────────────────
+// ── Pause / Resume ─────────────────────────────────────────────────────────────
 function togglePause() {
   paused = !paused;
   const dot = document.getElementById('statusDot');
   const txt = document.getElementById('statusText');
   const btn = document.getElementById('pauseBtn');
   if (paused) {
-    dot.style.background='var(--yellow)'; dot.style.boxShadow='0 0 6px var(--yellow)';
-    txt.style.color='var(--yellow)'; txt.textContent='PAUSED';
-    btn.textContent='Resume Bot';
+    dot.style.cssText = 'background:var(--yellow);box-shadow:0 0 6px var(--yellow)';
+    txt.style.color = 'var(--yellow)'; txt.textContent = 'PAUSED';
+    btn.textContent = 'Resume Bot';
   } else {
-    dot.style.background='var(--green)'; dot.style.boxShadow='0 0 6px var(--green)';
-    txt.style.color='var(--green)'; txt.textContent='RUNNING';
-    btn.textContent='Pause Bot';
+    dot.style.cssText = 'background:var(--green);box-shadow:0 0 6px var(--green)';
+    txt.style.color = 'var(--green)'; txt.textContent = 'RUNNING';
+    btn.textContent = 'Pause Bot';
   }
   fetch('/pause?state=' + (paused ? '1' : '0'));
 }
 
-// ── Poll loop ─────────────────────────────────────────────────────────────────
+// ── Poll loop ──────────────────────────────────────────────────────────────────
 async function poll() {
   try {
     const r = await fetch('/stats');
     if (!r.ok) return;
     const d = await r.json();
 
+    if (d.mem_total_gb)  memTotalGb  = d.mem_total_gb;
+    if (d.swap_total_gb) swapTotalGb = d.swap_total_gb;
+
     if (!paused) {
-      // Charts
-      updateChart(cpuChart, d.cpu_hist);
-      updateChart(memChart, d.mem_hist);
+      // ── charts ──
+      updateChart(cpuChart,  d.cpu_hist  || []);
+      updateChart(memChart,  d.mem_hist  || []);
+      updateChart(swapChart, d.swap_hist || []);
 
-      // Cards
-      const cpu = d.cpu_hist.at(-1) ?? 0;
-      const mem = d.mem_hist.at(-1) ?? 0;
-      setCard('cCpu',  cpu.toFixed(0)+'%',  colorFor(cpu, 60, 80, 'var(--cpu)'));
-      setCard('cMem',  mem.toFixed(0)+'%',  colorFor(mem, 60, 80, 'var(--mem)'));
-      setCard('cDisk', d.disk_pct.toFixed(0)+'%',
-              d.disk_pct > 90 ? 'var(--red)' : 'var(--blue)');
-      const n = Object.keys(d.throttled).length;
-      setCard('cThr', String(n), n > 0 ? 'var(--orange)' : 'var(--muted)');
-      setCard('cAct', String(d.actions));
-      setCard('cIss', String(d.issues), d.issues > 0 ? 'var(--red)' : 'var(--muted)');
+      const cpu  = (d.cpu_hist  || []).at(-1) ?? 0;
+      const mem  = (d.mem_hist  || []).at(-1) ?? 0;
+      const swap = (d.swap_hist || []).at(-1) ?? 0;
+
+      document.getElementById('cpuLive').textContent  = cpu.toFixed(0)  + '%';
+      document.getElementById('memLive').textContent  = mem.toFixed(0)  + '%';
+      document.getElementById('swapLive').textContent = swap.toFixed(0) + '%';
+      document.getElementById('cpuLive').style.color  = colorFor(cpu,  60, 80, 'var(--cpu)');
+      document.getElementById('memLive').style.color  = colorFor(mem,  60, 80, 'var(--mem)');
+      document.getElementById('swapLive').style.color = swap > 50 ? 'var(--yellow)' : 'var(--swap)';
+
+      // ── resource cards ──
+      setCard('cCpu',  cpu.toFixed(0) + '%', colorFor(cpu, 60, 80, 'var(--cpu)'));
+      setSub('cCpuSub', 'system-wide');
+
+      const memUsed = (memTotalGb * mem / 100).toFixed(1);
+      setCard('cMem',  mem.toFixed(0) + '%', colorFor(mem, 60, 80, 'var(--mem)'));
+      setSub('cMemSub', memUsed + ' / ' + memTotalGb.toFixed(1) + ' GB');
+
+      const swapUsed = (swapTotalGb * swap / 100).toFixed(2);
+      setCard('cSwap', swap.toFixed(0) + '%', swap > 50 ? 'var(--yellow)' : 'var(--swap)');
+      setSub('cSwapSub', swapUsed + ' / ' + swapTotalGb.toFixed(1) + ' GB');
+
+      const disk = d.disk_pct ?? 0;
+      setCard('cDisk', disk.toFixed(0) + '%',
+        disk > 90 ? 'var(--red)' : disk > 80 ? 'var(--yellow)' : 'var(--blue)');
+      setSub('cDiskSub', d.disk_free_gb ? d.disk_free_gb.toFixed(1) + ' GB free' : '');
+
+      // ── bot stat cards ──
+      const thrKeys  = Object.keys(d.throttled || {});
+      const thrNames = Object.values(d.throttled || {});
+      setCard('cThr', String(thrKeys.length),
+        thrKeys.length > 0 ? 'var(--orange)' : 'var(--muted)');
+      setSub('cThrSub',
+        thrKeys.length > 0 ? thrNames.slice(0, 2).join(', ') : 'no active throttles');
+
+      setCard('cAct',   String(d.actions), d.actions > 0 ? 'var(--green)' : 'var(--muted)');
+      setCard('cIss',   String(d.issues),  d.issues  > 0 ? 'var(--red)'   : 'var(--muted)');
+
       const freed = d.freed_mb || 0;
-      setCard('cFreed', freed >= 1024 ? (freed/1024).toFixed(1)+' GB' : freed.toFixed(0)+' MB',
-              freed > 0 ? 'var(--blue)' : 'var(--muted)');
+      setCard('cFreed',
+        freed >= 1024 ? (freed / 1024).toFixed(1) + ' GB' : freed.toFixed(0) + ' MB',
+        freed > 0 ? 'var(--blue)' : 'var(--muted)');
 
-      // Table
-      buildProcTable(d.top_procs, Object.keys(d.throttled).map(Number));
+      // ── process table ──
+      buildProcTable(d.top_procs || [], thrKeys.map(Number));
 
-      // Footer
-      let thr = '';
-      if (n > 0) thr = '  ·  Throttled: ' + Object.entries(d.throttled)
-          .map(([pid,name]) => `${name}(${pid})`).join(', ');
+      // ── system info panel ──
+      document.getElementById('siMemTotal').textContent =
+        memTotalGb ? memTotalGb.toFixed(1) + ' GB' : '—';
+      document.getElementById('siSwapTotal').textContent =
+        swapTotalGb ? swapTotalGb.toFixed(1) + ' GB' : 'none';
+      document.getElementById('siDiskFree').textContent =
+        d.disk_free_gb ? d.disk_free_gb.toFixed(1) + ' GB' : '—';
+
+      const siThr = document.getElementById('siThrCount');
+      const siList = document.getElementById('siThrList');
+      if (thrKeys.length > 0) {
+        siThr.textContent = thrKeys.length + ' process' + (thrKeys.length > 1 ? 'es' : '');
+        siThr.style.color = 'var(--orange)';
+        siList.textContent = thrNames.join('\n');
+      } else {
+        siThr.textContent = 'none'; siThr.style.color = 'var(--muted)';
+        siList.textContent = '';
+      }
+
+      // ── titlebar pills ──
+      document.getElementById('uptimePill').textContent = '⏱ ' + fmtUptime(d.uptime_s || 0);
+
+      const pp = document.getElementById('powerPill');
+      if (d.on_battery) {
+        pp.textContent = '🔋 Battery'; pp.className = 'pill battery';
+      } else {
+        pp.textContent = '⚡ AC'; pp.className = 'pill';
+      }
+
+      const tp = document.getElementById('thermalPill');
+      const tpct = d.thermal_pct ?? 100;
+      if (tpct < 100) {
+        tp.textContent = '🌡 ' + tpct + '%'; tp.className = 'pill thermal-hot';
+      } else {
+        tp.textContent = '🌡 Normal'; tp.className = 'pill';
+      }
+
+      // ── footer ──
       document.getElementById('lastUpdate').textContent =
-          'Last update: ' + new Date().toLocaleTimeString() + thr;
+        'Last update: ' + new Date().toLocaleTimeString();
     }
 
-    // Events always drain (even when paused)
-    d.events.forEach(ev => addEvent(ev));
+    // events always drain (even when paused)
+    (d.events || []).forEach(ev => addEvent(ev));
 
-  } catch(e) { /* server restarting */ }
+  } catch (e) { /* server restarting */ }
 }
 
-// Start polling
 setInterval(poll, 1000);
 poll();
 </script>
@@ -617,7 +1030,7 @@ poll();
 """
 
 # ─── HTTP Handler ─────────────────────────────────────────────────────────────
-_engine: BotEngine = None   # set in main
+_engine: BotEngine = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -633,16 +1046,16 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/stats":
             snap = _engine.snapshot()
             try:
-                snap["disk_pct"] = psutil.disk_usage("/").percent
+                d = psutil.disk_usage("/")
+                snap["disk_pct"]     = d.percent
+                snap["disk_free_gb"] = round(d.free / 1e9, 1)
             except Exception:
-                snap["disk_pct"] = 0
-            self._send(200, "application/json",
-                       json.dumps(snap).encode())
+                snap["disk_pct"]     = 0
+                snap["disk_free_gb"] = 0
+            self._send(200, "application/json", json.dumps(snap).encode())
         elif path == "/pause":
             if "state=1" in q:
                 _engine.stop()
-            else:
-                pass   # resume handled client-side (data just keeps flowing)
             self._send(200, "application/json", b'{"ok":true}')
         else:
             self._send(404, "text/plain", b"Not found")
@@ -668,7 +1081,6 @@ def main():
     print(f"Performance Bot  →  {url}")
     print("Press Ctrl+C to stop.\n")
 
-    # Open browser after a short delay (let server bind first)
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
     try:
