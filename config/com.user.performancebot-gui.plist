@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.performancebot-gui</string>
+
+    <!-- Runs the GUI app at login -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3.11</string>
+        <string>/Users/sivaranjani/performance-bot/performance_gui.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Do NOT restart if the user closes the window -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Required so the process can access the Aqua (GUI) session -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/sivaranjani/Library/Logs/performance-bot/gui_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/sivaranjani/Library/Logs/performance-bot/gui_stderr.log</string>
+
+    <!-- Low I/O priority — the bot must not compete with real work -->
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>Nice</key>
+    <integer>5</integer>
+</dict>
+</plist>
