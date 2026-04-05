@@ -6,6 +6,7 @@ Backend: Python http.server  |  Frontend: Chart.js (CDN)
 """
 
 import os, sys, time, json, threading, subprocess, webbrowser, sqlite3
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -258,7 +259,7 @@ class BotEngine(threading.Thread):
         self.swap_hist        = []
         self.top_procs        = []
         self.throttled        = {}      # pid → name
-        self.events           = []      # ring-buffer of last 200 events
+        self.events           = deque(maxlen=200)   # O(1) append+bound, no pop(0)
         self.actions          = 0
         self.issues           = 0
         self.freed_mb         = 0.0
@@ -270,12 +271,19 @@ class BotEngine(threading.Thread):
         self._rss_history     = {}     # pid → [(ts, rss_mb), ...]
         self._warned_leaks    = set()  # pids already flagged this session
         self._cache_warned    = False
+        self.disk_pct         = 0.0
+        self.disk_free_gb     = 0.0
         self._last_consumer   = 0.0    # timestamp of last consumer report
         vm = psutil.virtual_memory()
         sw = psutil.swap_memory()
         self._mem_total_gb   = vm.total / 1e9
         self._swap_total_gb  = sw.total / 1e9
         psutil.cpu_percent(interval=None)
+        # ── Performance: cached constants to avoid repeated syscalls ────────
+        self._ncpu           = psutil.cpu_count(logical=True) or 1   # immutable
+        self._last_vm        = vm          # updated each _collect() — shared with _check_memory()
+        self._last_swap      = sw
+        self._last_disk_pct  = 0.0        # updated by _check_disk()
         # ── MMIE state ──────────────────────────────────────────────────────
         self.mem_pressure_level  = "normal"   # 'normal'|'warn'|'critical'
         self.vm_breakdown        = {}         # wired/active/inactive/free/purgeable/compressed MB
@@ -312,13 +320,15 @@ class BotEngine(threading.Thread):
                 "swap_hist":     list(self.swap_hist),
                 "top_procs":     list(self.top_procs),
                 "throttled":     dict(self.throttled),
-                "events":        list(self.events[-60:]),
+                "events":        list(self.events),   # deque already capped at 200
                 "actions":       self.actions,
                 "issues":        self.issues,
                 "freed_mb":      round(self.freed_mb, 0),
                 "thermal_pct":   self.thermal_pct,
                 "on_battery":    self.on_battery,
                 "uptime_s":      int(time.time() - self._start_time),
+                "disk_pct":           self.disk_pct,
+                "disk_free_gb":       self.disk_free_gb,
                 "mem_total_gb":       round(self._mem_total_gb, 1),
                 "swap_total_gb":      round(self._swap_total_gb, 1),
                 "mem_pressure_level":   self.mem_pressure_level,
@@ -339,27 +349,24 @@ class BotEngine(threading.Thread):
         ev = {"kind": kind, "msg": msg,
               "ts": datetime.now().strftime("%H:%M:%S")}
         with self._lock:
-            self.events.append(ev)
-            if len(self.events) > 200:
-                self.events.pop(0)
+            self.events.append(ev)   # deque(maxlen=200) auto-discards oldest
 
     def run(self):
         self._emit("info", "Performance Bot started — monitoring every second.")
         tick = 0
         while self.running:
             try:
-                self._collect()
-                self._check_cpu()
-                if tick % 3  == 0: self._check_memory()
-                if tick % 10 == 0: self._check_disk()
+                self._collect()                                          # 1 Hz — single process scan
+                if tick % 3  == 0: self._check_memory()                 # 0.33 Hz
+                if tick % 5  == 0: self._update_pressure_and_forecast() # 0.2 Hz — sysctl + vm_stat
+                if tick % 10 == 0: self._check_disk()                   # 0.1 Hz
+                if tick % 30 == 0: self._check_power_mode()             # 0.03 Hz
+                if tick % 30 == 0: self._detect_xpc_respawn()           # 0.03 Hz (was 0.1 Hz)
+                if tick % 60 == 0: self._check_thermal()                # 0.016 Hz — pmset subprocess
+                if tick % 60 == 0: self._check_zombies()
+                if tick % 60 == 0: self._track_memory_leaks()
                 if tick % IDLE_SWEEP_S == 0: self._sweep_idle_services()
-                if tick % 30  == 0: self._check_power_mode()
-                if tick % 5   == 0: self._update_pressure_and_forecast()
-                if tick % 60  == 0: self._check_thermal()
-                if tick % 60  == 0: self._check_zombies()
-                if tick % 60  == 0: self._track_memory_leaks()
                 if tick % 300 == 0 and tick > 0: self._check_caches()
-                if tick % 10  == 0: self._detect_xpc_respawn()
                 if tick % CACHE_WRITE_S == 0:
                     self._cache.flush()
                     self._cache.prune()
@@ -374,77 +381,122 @@ class BotEngine(threading.Thread):
         self._emit("info", "Performance Bot stopped.")
 
     def _collect(self):
+        """
+        Single process scan per second.
+        Collects system metrics AND performs CPU throttle detection in one
+        psutil.process_iter() call — eliminating the second full scan that
+        _check_cpu() previously performed.
+        """
         cpu  = psutil.cpu_percent(interval=None)
         vm   = psutil.virtual_memory()
         swap = psutil.swap_memory()
-        rows = []
+        ncpu = self._ncpu   # cached at init — no repeated syscall
+
+        rows        = []
+        to_throttle = []   # (Process, name, pid, cpu_pct) — applied after loop
+
+        with self._lock:
+            ram_lock   = self._ram_pressure_lock
+            throttled  = set(self.throttled)
+            sys_cpu    = cpu
+
         for p in psutil.process_iter(["pid", "name", "cpu_percent",
                                        "memory_percent", "status"]):
             try:
-                c = p.cpu_percent(interval=None) / (psutil.cpu_count(logical=True) or 1)
-                rows.append((c, p.memory_percent(), p.pid,
-                              p.name()[:30], p.status()))
+                info  = p.info
+                name  = info["name"][:30]
+                pid   = info["pid"]
+                c     = (info["cpu_percent"] or 0.0) / ncpu
+                mem_p = info["memory_percent"] or 0.0
+                stat  = info["status"]
+
+                rows.append((c, mem_p, pid, name, stat))
+
+                # CPU throttle detection — inline, no second iteration
+                if sys_cpu >= CPU_WARN and name not in PROTECTED \
+                        and pid not in throttled:
+                    if c >= CPU_THROTTLE:
+                        to_throttle.append((p, name, pid, c))
+                    elif c >= CPU_WARN:
+                        self.issues += 1
+                        self._emit("warn",
+                            f"High CPU: {name} (PID {pid}) using {c:.0f}%")
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
+
         rows.sort(reverse=True)
+
+        # Restore calmed throttled procs (tiny loop — usually 0–3 items)
+        self._restore_calmed_procs(ram_lock)
+
+        # Apply new throttles (outside the iteration loop)
+        for p, name, pid, c in to_throttle:
+            try:
+                p.nice(RENICE_VAL)
+                self.throttled[pid] = name
+                self.actions += 1
+                self.issues  += 1
+                self._emit("fix",
+                    f"AUTO-THROTTLED {name} (PID {pid}): "
+                    f"{c:.0f}% CPU → nice set to {RENICE_VAL}")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        swap_pct = swap.percent if swap.total > 0 else 0.0
         with self._lock:
             self.cpu_hist.append(cpu)
             self.mem_hist.append(vm.percent)
-            self.swap_hist.append(swap.percent if swap.total > 0 else 0)
+            self.swap_hist.append(swap_pct)
             if len(self.cpu_hist)  > HISTORY_LEN: self.cpu_hist.pop(0)
             if len(self.mem_hist)  > HISTORY_LEN: self.mem_hist.pop(0)
             if len(self.swap_hist) > HISTORY_LEN: self.swap_hist.pop(0)
             self.top_procs = rows[:12]
+            # stash vm/swap for _check_memory() — avoids a second virtual_memory() call
+            self._last_vm   = vm
+            self._last_swap = swap
             _tier = self.effective_tier
             _tte  = self.mem_forecast_min
             _pres = self.mem_pressure_level
-        # Buffer one sample per second — no disk I/O here
-        try:
-            d = psutil.disk_usage("/").percent
-        except Exception:
-            d = 0.0
-        self._cache.record(
-            int(time.time()), round(cpu, 1), round(vm.percent, 1),
-            round(swap.percent, 1), round(d, 1),
-            _pres, _tier, _tte
-        )
 
-    def _check_cpu(self):
+        # Cache: record every 10 s (use stored disk_pct — updated by _check_disk())
+        if int(time.time()) % 10 == 0:
+            self._cache.record(
+                int(time.time()), round(cpu, 1), round(vm.percent, 1),
+                round(swap_pct, 1), round(self._last_disk_pct, 1),
+                _pres, _tier, _tte
+            )
+
+    def _restore_calmed_procs(self, ram_lock: bool):
+        """
+        Restore scheduling priority for throttled procs that have calmed down.
+        Only iterates self.throttled (typically 0–3 entries) — no process scan.
+        CPU-RAM conflict gate: defer nice(0) if Tier 3+ RAM lock is active and
+        the process belongs to a top-RSS application family.
+        """
+        if not self.throttled:
+            return
         with self._lock:
-            hist          = list(self.cpu_hist)
-            ram_lock      = self._ram_pressure_lock
-            ancestry_snap = list(self.mem_ancestry)   # [{app, mb, pct}]
-        if not hist: return
+            ancestry_snap = list(self.mem_ancestry)
 
-        # Build set of root-app names that are top RAM owners under lock
         high_ram_families: set = set()
         if ram_lock and ancestry_snap:
-            # top-3 families by MB are considered dominant RAM holders
             for entry in ancestry_snap[:3]:
                 high_ram_families.add(entry["app"].lower())
 
-        # restore calmed procs — but defer if CPU-RAM conflict detected
         for pid in list(self.throttled):
             try:
                 p = psutil.Process(pid)
-                c = p.cpu_percent(interval=None) / (psutil.cpu_count(logical=True) or 1)
+                c = p.cpu_percent(interval=None) / self._ncpu
                 if c < CPU_WARN / 2:
-                    # CPU-RAM conflict resolution: if memory Tier 3+ is active and this
-                    # process belongs to a high-RSS family, block nice(0) restoration —
-                    # restoring priority would allow it to re-expand its memory footprint
-                    if ram_lock:
-                        try:
-                            proc_name = p.name().lower()
-                            # check if this process's ancestry maps to a high-RAM family
-                            if any(fam in proc_name or proc_name in fam
-                                   for fam in high_ram_families):
-                                self._emit("info",
-                                    f"CPU-RAM LOCK: deferring priority restore for "
-                                    f"{p.name()} (PID {pid}) — top RAM family under "
-                                    f"Tier 3+ pressure ({c:.0f}% CPU, lock active)")
-                                continue   # skip nice(0) — do NOT restore priority
-                        except Exception:
-                            pass
+                    if ram_lock and high_ram_families:
+                        proc_name = p.name().lower()
+                        if any(fam in proc_name or proc_name in fam
+                               for fam in high_ram_families):
+                            self._emit("info",
+                                f"CPU-RAM LOCK: deferring priority restore for "
+                                f"{p.name()} (PID {pid}) — top RAM family under "
+                                f"Tier 3+ pressure ({c:.0f}% CPU)")
+                            continue
                     p.nice(0)
                     name = self.throttled.pop(pid)
                     self.actions += 1
@@ -452,29 +504,11 @@ class BotEngine(threading.Thread):
                         f"Priority restored: {name} (PID {pid}) — CPU back to {c:.0f}%")
             except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
                 self.throttled.pop(pid, None)
-        if hist[-1] < CPU_WARN: return
-        # throttle hogs
-        for p in psutil.process_iter(["pid", "name", "cpu_percent", "nice"]):
-            try:
-                if p.name() in PROTECTED: continue
-                c = p.cpu_percent(interval=None) / (psutil.cpu_count(logical=True) or 1)
-                if c >= CPU_THROTTLE and p.pid not in self.throttled:
-                    p.nice(RENICE_VAL)
-                    self.throttled[p.pid] = p.name()
-                    self.actions += 1
-                    self.issues  += 1
-                    self._emit("fix",
-                        f"AUTO-THROTTLED {p.name()} (PID {p.pid}): "
-                        f"{c:.0f}% CPU → nice set to {RENICE_VAL}")
-                elif c >= CPU_WARN:
-                    self.issues += 1
-                    self._emit("warn",
-                        f"High CPU: {p.name()} (PID {p.pid}) using {c:.0f}%")
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
 
     def _check_memory(self):
-        vm = psutil.virtual_memory()
+        with self._lock:
+            vm = self._last_vm      # already fetched in _collect() — no extra syscall
+            sw = self._last_swap
         mem_pct = vm.percent
 
         # ── Compute effective tier (static % + TTE predictive escalation) ─────
@@ -520,14 +554,14 @@ class BotEngine(threading.Thread):
             if self._frozen_pids:
                 self._thaw_frozen_daemons()
 
-        swap = psutil.swap_memory()
-        if swap.total > 0:
-            if swap.percent >= SWAP_WARN and not self._swap_warned:
+        # swap already fetched in _collect() — no extra syscall
+        if sw.total > 0:
+            if sw.percent >= SWAP_WARN and not self._swap_warned:
                 self._swap_warned = True
                 self._emit("warn",
-                    f"Swap in use: {swap.percent:.0f}% "
-                    f"({swap.used/1e9:.1f} GB) — system is memory-constrained")
-            elif swap.percent < 30:
+                    f"Swap in use: {sw.percent:.0f}% "
+                    f"({sw.used/1e9:.1f} GB) — system is memory-constrained")
+            elif sw.percent < 30:
                 self._swap_warned = False
 
     def _report_memory_consumers(self):
@@ -1141,6 +1175,10 @@ class BotEngine(threading.Thread):
     def _check_disk(self):
         try:
             d = psutil.disk_usage("/")
+            self._last_disk_pct = d.percent   # cache for _collect() cache.record()
+            with self._lock:
+                self.disk_pct     = d.percent
+                self.disk_free_gb = round(d.free / 1e9, 1)
             if d.percent >= 90:
                 self.issues += 1
                 self._emit("issue",
@@ -2042,14 +2080,7 @@ class Handler(BaseHTTPRequestHandler):
                    b'<text y=".9em" font-size="86" x="7">&#x26A1;</text></svg>')
             self._send(200, "image/svg+xml", svg)
         elif path == "/stats":
-            snap = _engine.snapshot()
-            try:
-                d = psutil.disk_usage("/")
-                snap["disk_pct"]     = d.percent
-                snap["disk_free_gb"] = round(d.free / 1e9, 1)
-            except Exception:
-                snap["disk_pct"]     = 0
-                snap["disk_free_gb"] = 0
+            snap = _engine.snapshot()   # disk_pct + disk_free_gb already in snapshot
             self._send(200, "application/json", json.dumps(snap).encode())
         elif path == "/pause":
             if "state=1" in q:
