@@ -10,7 +10,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/python3.11</string>
-        <string>/Users/sivaranjani/performance-bot/performance_gui.py</string>
+        <string>/Users/sivaranjani/performance-bot/app/performance_gui.py</string>
     </array>
 
     <key>RunAtLoad</key>
