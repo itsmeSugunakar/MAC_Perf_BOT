@@ -13,7 +13,7 @@
 |--------------------|-----------------------------------------------------|
 | **App Name**       | MAC Performance Bot                                 |
 | **Short Name**     | mac-perf-bot                                        |
-| **Version**        | 1.1.0                                               |
+| **Version**        | 1.3.0                                               |
 | **Owner**          | itsmeSugunakar                                      |
 | **Contact**        | sugun.sr@gmail.com                                  |
 | **Repository**     | https://github.com/itsmeSugunakar/MAC_Perf_BOT      |
@@ -31,10 +31,12 @@ A lightweight, always-on macOS daemon that:
 
 1. **Monitors** CPU, RAM, Disk, and Swap every second
 2. **Detects** resource hogs automatically (thresholds configurable)
-3. **Remediates** through a 4-tier adaptive cascade — renice → freeze → terminate
-4. **Surfaces** everything through a live PWA browser dashboard
-5. **Auto-starts** at login via a macOS LaunchAgent
-6. **Analyses** memory at kernel depth via the Multi-Dimensional Memory Intelligence Engine (MMIE)
+3. **Predicts** memory exhaustion via OLS linear-regression Time-to-Exhaustion (TTE) forecast
+4. **Remediates** through a 4-tier adaptive cascade — renice → freeze → terminate — driven by the Predictive Remediation Engine (PRE)
+5. **Surfaces** everything through a live PWA browser dashboard
+6. **Auto-starts** at login via a macOS LaunchAgent
+7. **Analyses** memory at kernel depth via the Multi-Dimensional Memory Intelligence Engine (MMIE)
+8. **Accumulates** 90 days of metric history on disk (SQLite) for application-level performance predictions
 
 ---
 
@@ -60,7 +62,8 @@ MAC_Perf_BOT/
 │   └── uninstall.sh        ← Remove all LaunchAgents + stop processes
 │
 ├── docs/
-│   └── architecture.md     ← Component diagram and data-flow notes
+│   ├── architecture.md     ← Component diagram, data-flow, cache design
+│   └── provisional-patent-application.md  ← USPTO PPA technical spec
 │
 └── logs/                   ← Runtime logs (git-ignored)
     └── .gitkeep
@@ -104,14 +107,20 @@ MAC_Perf_BOT/
 
 ### Component Responsibilities
 
-| Component               | File                     | Role                                                        |
-|-------------------------|--------------------------|-------------------------------------------------------------|
-| `BotEngine`             | `app/performance_gui.py` | Background thread; collects metrics, remediates             |
-| **MMIE methods**        | `app/performance_gui.py` | Kernel pressure, vm_stat, genealogy, forecast, freeze/thaw  |
-| `Handler` (HTTP)        | `app/performance_gui.py` | Serves PWA dashboard + JSON API + manifest + SVG icon       |
-| `performance_bot.py`    | `app/performance_bot.py` | Headless variant (LaunchAgent, no browser needed)           |
-| LaunchAgent (GUI)       | `config/*.plist`         | macOS service manager — starts bot at login                 |
-| Dashboard HTML+JS       | Embedded in `gui.py`     | PWA; polls `/stats` every 1 s; installable via browser      |
+| Component                        | File                     | Role                                                                        |
+|----------------------------------|--------------------------|-----------------------------------------------------------------------------|
+| `BotEngine`                      | `app/performance_gui.py` | Background thread; collects metrics, remediates                             |
+| **MMIE methods**                 | `app/performance_gui.py` | Kernel oracle, vm_stat, genealogy, OLS forecast, freeze/thaw                |
+| **Predictive Remediation Engine**| `app/performance_gui.py` | `_compute_effective_tier()` — TTE-driven tier escalation above static %     |
+| **CPU-RAM Conflict Gate**        | `app/performance_gui.py` | `_check_cpu()` — defers `nice(0)` for top-RAM families under Tier 3+ lock  |
+| **Genealogy Freeze Scoring**     | `app/performance_gui.py` | `_freeze_background_daemons()` — `family×2 + pattern×1` weighted scoring   |
+| **XPC Respawn Guard**            | `app/performance_gui.py` | `_detect_xpc_respawn()` — blocklists respawning launchd services            |
+| **MetricsCache**                 | `app/performance_gui.py` | SQLite 90-day disk store; batch writes; aggregate-only reads                |
+| **App Predictions**              | `app/performance_gui.py` | `_analyse_app_predictions()` — 24 h risk analysis from cache                |
+| `Handler` (HTTP)                 | `app/performance_gui.py` | Serves PWA dashboard + JSON API + manifest + SVG icon                       |
+| `performance_bot.py`             | `app/performance_bot.py` | Headless variant (LaunchAgent, no browser needed)                           |
+| LaunchAgent (GUI)                | `config/*.plist`         | macOS service manager — starts bot at login                                 |
+| Dashboard HTML+JS                | Embedded in `gui.py`     | PWA; polls `/stats` every 1 s; installable via browser                      |
 
 ---
 
@@ -131,17 +140,33 @@ MAC_Perf_BOT/
 | `HTTP_PORT`      | 8765    | Localhost port for the web dashboard             |
 
 ### MMIE thresholds
-| Parameter             | Default | Description                                           |
-|-----------------------|---------|-------------------------------------------------------|
-| `MEM_TIER2_PCT`       | 82 %    | Trigger purgeable scan + memory genealogy report      |
-| `MEM_TIER3_PCT`       | 87 %    | SIGSTOP safe background daemons (auto-thaws on drop)  |
-| `MEM_TIER4_PCT`       | 92 %    | Emergency idle-XPC service termination                |
-| `WIRED_WARN_PCT`      | 40 %    | Warn when wired memory exceeds this % of total RAM    |
-| `LEAK_RATE_MB_MIN`    | 50 MB/m | Flag a process as a potential memory leak             |
-| `LEAK_MIN_RSS_MB`     | 200 MB  | Minimum RSS before leak flagging applies              |
-| `CACHE_WARN_GB`       | 5 GB    | Warn when `~/Library/Caches` exceeds this size        |
-| `FREEZE_COOL_S`       | 120 s   | Minimum seconds between daemon freeze cycles          |
-| `MEM_ANCESTRY_COOL_S` | 120 s   | Minimum seconds between genealogy reports             |
+| Parameter             | Default  | Description                                              |
+|-----------------------|----------|----------------------------------------------------------|
+| `MEM_TIER2_PCT`       | 82 %     | Trigger purgeable scan + memory genealogy report         |
+| `MEM_TIER3_PCT`       | 87 %     | SIGSTOP safe background daemons (auto-thaws on drop)     |
+| `MEM_TIER4_PCT`       | 92 %     | Emergency idle-XPC service termination                   |
+| `WIRED_WARN_PCT`      | 40 %     | Warn when wired memory exceeds this % of total RAM       |
+| `LEAK_RATE_MB_MIN`    | 50 MB/m  | Flag a process as a potential memory leak                |
+| `LEAK_MIN_RSS_MB`     | 200 MB   | Minimum RSS before leak flagging applies                 |
+| `CACHE_WARN_GB`       | 5 GB     | Warn when `~/Library/Caches` exceeds this size           |
+| `FREEZE_COOL_S`       | 120 s    | Minimum seconds between daemon freeze cycles             |
+| `MEM_ANCESTRY_COOL_S` | 120 s    | Minimum seconds between genealogy reports                |
+
+### Predictive Remediation Engine thresholds
+| Parameter          | Default | Description                                              |
+|--------------------|---------|----------------------------------------------------------|
+| `TTE_TIER2_MIN`    | 10 min  | TTE at or below this → escalate to Tier 2 early         |
+| `TTE_TIER3_MIN`    | 5 min   | TTE at or below this → escalate to Tier 3 early         |
+| `TTE_TIER4_MIN`    | 2 min   | TTE at or below this → escalate to Tier 4 early         |
+| `TTE_MIN_SAMPLES`  | 20      | Minimum `mem_hist` samples before TTE can drive escalation |
+| `XPC_RESPAWN_S`    | 10 s    | Services reappearing within this window are blocklisted  |
+
+### Disk cache constants
+| Parameter               | Default | Description                                          |
+|-------------------------|---------|------------------------------------------------------|
+| `CACHE_RETENTION_DAYS`  | 90      | Rows older than this are pruned from SQLite          |
+| `CACHE_WRITE_S`         | 60 s    | Flush interval — `executemany()` batch write cadence |
+| `CACHE_PRUNE_S`         | 86400 s | Minimum interval between prune operations            |
 
 To change a threshold, edit the constants at the top of `app/performance_gui.py`
 and reload the LaunchAgent (`scripts/install_gui.sh`).
@@ -156,7 +181,7 @@ and reload the LaunchAgent (`scripts/install_gui.sh`).
 | `psutil` | ≥ 5.9    | PyPI     | Cross-platform process/system metrics |
 
 All other imports are Python standard library (`http.server`, `threading`,
-`queue`, `json`, `webbrowser`).
+`sqlite3`, `json`, `subprocess`, `webbrowser`, `pathlib`).
 
 ### Front-end (CDN, no install)
 | Library    | Version | URL                                          |
@@ -231,44 +256,73 @@ Dashboard server listens on `http://127.0.0.1:8765`.
 ### `/stats` JSON schema
 ```json
 {
-  "cpu_hist":           [float],   // last 90 CPU % readings
-  "mem_hist":           [float],   // last 90 RAM % readings
-  "swap_hist":          [float],   // last 90 Swap % readings
-  "top_procs":          [[cpu, mem, pid, name, status]],
-  "throttled":          {"pid": "name"},
-  "events":             [{"kind", "msg", "ts"}],
-  "actions":            int,
-  "issues":             int,
-  "freed_mb":           float,     // MB reclaimed by idle sweeps + freezes
-  "disk_pct":           float,
-  "disk_free_gb":       float,
-  "mem_total_gb":       float,
-  "swap_total_gb":      float,
-  "thermal_pct":        int,       // CPU speed limit % (100 = normal)
-  "on_battery":         bool,
-  "uptime_s":           int,
-  "mem_pressure_level": "normal"|"warn"|"critical",  // macOS kernel sysctl
-  "vm_breakdown":       {          // parsed from vm_stat
+  "cpu_hist":             [float],   // last 90 CPU % readings
+  "mem_hist":             [float],   // last 90 RAM % readings
+  "swap_hist":            [float],   // last 90 Swap % readings
+  "top_procs":            [[cpu, mem, pid, name, status]],
+  "throttled":            {"pid": "name"},
+  "events":               [{"kind", "msg", "ts"}],
+  "actions":              int,
+  "issues":               int,
+  "freed_mb":             float,     // MB reclaimed by idle sweeps + freezes
+  "disk_pct":             float,
+  "disk_free_gb":         float,
+  "mem_total_gb":         float,
+  "swap_total_gb":        float,
+  "thermal_pct":          int,       // CPU speed limit % (100 = normal)
+  "on_battery":           bool,
+  "uptime_s":             int,
+  "mem_pressure_level":   "normal"|"warn"|"critical",  // macOS kernel sysctl
+  "vm_breakdown":         {          // parsed from vm_stat
     "wired": float, "active": float, "inactive": float,
     "free": float, "purgeable": float, "compressed": float
   },
-  "mem_forecast_min":   float,     // minutes to 95% exhaustion; -1 = stable
-  "mem_ancestry":       [{"app": str, "mb": int, "pct": float}]
+  "mem_forecast_min":     float,     // minutes to 95% exhaustion; -1 = stable
+  "mem_ancestry":         [{"app": str, "mb": int, "pct": float}],
+  "effective_tier":       int,       // 0–4; PRE output (may exceed static threshold)
+  "predictive_escalation": bool,     // true when TTE drove tier above static %
+  "cpu_ram_lock":         bool,      // true when Tier 3+ RAM lock blocks nice(0)
+  "xpc_blocked":          int,       // count of names in _no_kill blocklist
+  "cache_db_mb":          float,     // current size of metrics.db in MB
+  "cache_rows":           int,       // approximate row count in metrics table
+  "app_predictions":      [          // populated after first 24-h analysis cycle
+    {
+      "app":         str,
+      "mb":          int,
+      "pct":         float,
+      "trend":       "rising"|"stable"|"falling",
+      "risk":        "high"|"medium"|"low",
+      "week1_avg":   float,          // avg system mem_pct, last 7 days
+      "week2_avg":   float,          // avg system mem_pct, 7–14 days ago
+      "chronic_pct": float           // % of last 7 days RAM above MEM_WARN
+    }
+  ]
 }
 ```
 
 ---
 
-## 10. Logging
+## 10. Logging & Persistent Storage
 
-| Log file                    | Content                             |
-|-----------------------------|-------------------------------------|
+### Runtime logs
+| Log file                                          | Content                      |
+|---------------------------------------------------|------------------------------|
 | `~/Library/Logs/performance-bot/gui_stdout.log`  | Server startup, port binding |
 | `~/Library/Logs/performance-bot/gui_stderr.log`  | Python tracebacks (if any)   |
 | `~/Library/Logs/performance-bot/stdout.log`      | Headless bot output          |
 
 Logs are **not** rotated automatically. Truncate manually or add `newsyslog`
 config if the bot runs for months.
+
+### Disk cache
+| Path                                                                    | Content                           |
+|-------------------------------------------------------------------------|-----------------------------------|
+| `~/Library/Application Support/performance-bot/metrics.db`             | 90-day SQLite metric history      |
+
+The cache grows at ~1 row/second → ~86 400 rows/day → ~350–450 MB at 90 days.
+Rows older than `CACHE_RETENTION_DAYS` (90) are deleted automatically once per day.
+To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db`
+(the bot recreates the schema on next start).
 
 ---
 
@@ -278,8 +332,10 @@ config if the bot runs for months.
 - Uses `nice()` and `SIGSTOP`/`SIGCONT` only — cannot crash or delete processes.
 - `PROTECTED` and `NEVER_TERMINATE` sets prevent touching system processes and the bot itself.
 - `FREEZE_PATTERNS` list restricts SIGSTOP to known-safe background daemons only.
+- `_no_kill` blocklist (XPC Respawn Guard) prevents repeated SIGTERM to launchd-managed services.
 - No credentials, tokens, or secrets in code or config.
 - Renicing and signalling unprivileged processes does not require `sudo`.
+- Disk cache (`metrics.db`) contains only numeric metric values — no process names, file paths, or user-identifiable data are stored.
 
 ---
 
@@ -294,6 +350,9 @@ config if the bot runs for months.
 | MMIE genealogy scan cost | `_build_memory_ancestry()` iterates all processes; runs every 120 s max. |
 | SIGSTOP requires user ownership | MMIE Tier 3 freeze only works on processes owned by the current user. |
 | `memory_pressure` sysctl | `kern.memorystatus_vm_pressure_level` may require SIP adjustments on some configurations. Falls back to percent-derived level automatically. |
+| App Predictions cold start | The `_analyse_app_predictions()` panel is empty for the first 24 h. After the first full day the cache has enough data to show risk ratings. |
+| Cache disk size | At 1 row/s for 90 days the database reaches ~350–450 MB. On low-storage Macs consider reducing `CACHE_RETENTION_DAYS`. |
+| PRE TTE requires 20 samples | The Predictive Remediation Engine requires `TTE_MIN_SAMPLES` (20) seconds of `mem_hist` before TTE-driven escalation activates. |
 
 ---
 
@@ -314,6 +373,8 @@ config if the bot runs for months.
 |------------|---------|----------------|------------------------------------------------------------------------|
 | 2026-04-04 | 1.0.0   | itsmeSugunakar | Initial release: headless bot + web GUI                                |
 | 2026-04-05 | 1.1.0   | itsmeSugunakar | MMIE engine: kernel pressure oracle, vm_stat breakdown, memory genealogy, linear-regression forecast, 4-tier remediation cascade, SIGSTOP/SIGCONT freeze-thaw; PWA dashboard redesign with ring gauges, Memory Intelligence panel, metric strip, `/manifest.json` |
+| 2026-04-05 | 1.2.0   | itsmeSugunakar | Predictive Remediation Engine (`_compute_effective_tier`); CPU-RAM Conflict Resolution Gate; genealogy-guided SIGSTOP scoring (`family×2 + pattern×1`); XPC Respawn Guard (`_detect_xpc_respawn`, `_no_kill`); dashboard: Active Tier, CPU-RAM Lock, XPC Blocked, predictive escalation banner; PPA document added |
+| 2026-04-05 | 1.3.0   | itsmeSugunakar | 90-day SQLite disk cache (`MetricsCache`): batch writes every 60 s, daily prune, aggregate-only reads; `_analyse_app_predictions()` for app-level risk classification; `app_mem_trend()` and `chronic_pressure_pct()` queries; dashboard App Predictions panel + Cache (90d) vmrow; `/stats` extended with `effective_tier`, `predictive_escalation`, `cpu_ram_lock`, `xpc_blocked`, `cache_db_mb`, `cache_rows`, `app_predictions` |
 
 ---
 
