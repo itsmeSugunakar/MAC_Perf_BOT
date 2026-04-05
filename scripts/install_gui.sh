@@ -3,8 +3,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PLIST_NAME="com.user.performancebot-gui"
-PLIST_SRC="$SCRIPT_DIR/${PLIST_NAME}.plist"
+if [[ -f "$REPO_ROOT/${PLIST_NAME}.plist" ]]; then
+    PLIST_SRC="$REPO_ROOT/${PLIST_NAME}.plist"
+elif [[ -f "$REPO_ROOT/config/${PLIST_NAME}.plist" ]]; then
+    PLIST_SRC="$REPO_ROOT/config/${PLIST_NAME}.plist"
+else
+    echo "Error: Could not find ${PLIST_NAME}.plist in '$REPO_ROOT' or '$REPO_ROOT/config'." >&2
+    exit 1
+fi
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 PLIST_DST="$LAUNCH_AGENTS/${PLIST_NAME}.plist"
 LOG_DIR="$HOME/Library/Logs/performance-bot"
