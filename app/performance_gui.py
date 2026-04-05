@@ -13,9 +13,11 @@ from urllib.parse import urlparse
 
 try:
     import psutil
-except ImportError:
-    subprocess.run([sys.executable, "-m", "pip", "install", "psutil", "-q"], check=True)
-    import psutil
+except ImportError as exc:
+    raise SystemExit(
+        "Missing required dependency 'psutil'. Install it before running this app, "
+        "for example with: python3 -m pip install psutil"
+    ) from exc
 
 PORT         = 8765
 HOST         = "127.0.0.1"
