@@ -59,6 +59,20 @@ LEAK_RATE_MB_MIN = 50    # MB/min growth rate to flag as potential leak
 LEAK_MIN_RSS_MB  = 200   # minimum RSS before flagging a leak
 CONSUMER_COOL_S  = 300   # min seconds between top-consumer reports
 
+# ─── Memory Intelligence (MMIE) constants ─────────────────────────────────────
+MEM_TIER2_PCT        = 82.0   # purgeable scan + ancestry report trigger
+MEM_TIER3_PCT        = 87.0   # background daemon freeze trigger
+MEM_TIER4_PCT        = 92.0   # emergency idle-service termination
+WIRED_WARN_PCT       = 40.0   # wired % of total RAM → structural pressure alert
+FREEZE_COOL_S        = 120    # min seconds between freeze cycles
+MEM_ANCESTRY_COOL_S  = 120    # min seconds between ancestry reports
+FREEZE_PATTERNS      = (      # background daemons safe to SIGSTOP temporarily
+    "photoanalysisd", "photolibraryd", "mediaanalysisd", "mediaremoted",
+    "suggestd", "cloudd", "bird", "nsurlsessiond", "amsaccountsd",
+    "rapportd", "helpd", "AirPlayXPCHelper", "weatherd", "tipsd",
+    "triald", "UsageTrackingAgent", "com.apple.ap.adprivacyd",
+)
+
 
 # ─── Bot Engine ───────────────────────────────────────────────────────────────
 class BotEngine(threading.Thread):
@@ -89,6 +103,15 @@ class BotEngine(threading.Thread):
         self._mem_total_gb   = vm.total / 1e9
         self._swap_total_gb  = sw.total / 1e9
         psutil.cpu_percent(interval=None)
+        # ── MMIE state ──────────────────────────────────────────────────────
+        self.mem_pressure_level  = "normal"   # 'normal'|'warn'|'critical'
+        self.vm_breakdown        = {}         # wired/active/inactive/free/purgeable/compressed MB
+        self.mem_forecast_min    = -1         # minutes to ~95% exhaustion; -1 = stable
+        self.mem_ancestry        = []         # [{app,mb,pct}] top process families by RSS
+        self._wired_warned       = False
+        self._frozen_pids        = {}         # pid → (name, freeze_ts, rss_mb)
+        self._last_freeze        = 0.0
+        self._last_ancestry      = 0.0
 
     # ── public ────────────────────────────────────────────────────────────────
     def stop(self):
@@ -109,8 +132,12 @@ class BotEngine(threading.Thread):
                 "thermal_pct":   self.thermal_pct,
                 "on_battery":    self.on_battery,
                 "uptime_s":      int(time.time() - self._start_time),
-                "mem_total_gb":  round(self._mem_total_gb, 1),
-                "swap_total_gb": round(self._swap_total_gb, 1),
+                "mem_total_gb":       round(self._mem_total_gb, 1),
+                "swap_total_gb":      round(self._swap_total_gb, 1),
+                "mem_pressure_level": self.mem_pressure_level,
+                "vm_breakdown":       dict(self.vm_breakdown),
+                "mem_forecast_min":   self.mem_forecast_min,
+                "mem_ancestry":       list(self.mem_ancestry),
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
@@ -133,6 +160,7 @@ class BotEngine(threading.Thread):
                 if tick % 10 == 0: self._check_disk()
                 if tick % IDLE_SWEEP_S == 0: self._sweep_idle_services()
                 if tick % 30  == 0: self._check_power_mode()
+                if tick % 5   == 0: self._update_pressure_and_forecast()
                 if tick % 60  == 0: self._check_thermal()
                 if tick % 60  == 0: self._check_zombies()
                 if tick % 60  == 0: self._track_memory_leaks()
@@ -217,7 +245,12 @@ class BotEngine(threading.Thread):
             if now - self._last_consumer >= CONSUMER_COOL_S:
                 self._last_consumer = now
                 self._report_memory_consumers()
-
+            # MMIE: escalate through tiered remediation cascade
+            if vm.percent >= MEM_TIER2_PCT:
+                self._tiered_memory_remediation(vm.percent)
+        elif vm.percent < MEM_WARN - 5 and self._frozen_pids:
+            # pressure has eased — restore frozen daemons
+            self._thaw_frozen_daemons()
         swap = psutil.swap_memory()
         if swap.total > 0:
             if swap.percent >= SWAP_WARN and not self._swap_warned:
@@ -388,6 +421,264 @@ class BotEngine(threading.Thread):
                 f"Idle sweep: {len(swept)} services cleared, "
                 f"~{total:.0f} MB freed (session total: {self.freed_mb:.0f} MB)")
 
+    # ── MMIE: Multi-Dimensional Memory Intelligence Engine ────────────────────
+
+    def _get_macos_pressure_level(self) -> str:
+        """
+        Query macOS kernel memory pressure level via sysctl.
+        kern.memorystatus_vm_pressure_level: 1=Normal, 2=Warn, 4=Critical.
+        Falls back to percent-derived tier if sysctl is unavailable.
+        """
+        try:
+            r = subprocess.run(
+                ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                capture_output=True, text=True, timeout=2
+            )
+            val = int(r.stdout.strip())
+            return {1: "normal", 2: "warn", 4: "critical"}.get(val, "normal")
+        except Exception:
+            vm = psutil.virtual_memory()
+            if vm.percent >= 92: return "critical"
+            if vm.percent >= 82: return "warn"
+            return "normal"
+
+    def _parse_vm_stat(self) -> dict:
+        """
+        Parse vm_stat for detailed macOS memory breakdown.
+        Returns dict with wired/active/inactive/free/purgeable/compressed in MB.
+        """
+        result = {"wired": 0, "active": 0, "inactive": 0,
+                  "free": 0, "purgeable": 0, "compressed": 0, "page_kb": 16}
+        try:
+            r = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3)
+            page_kb = 16  # Apple Silicon default; Intel is 4 KB
+            for line in r.stdout.splitlines():
+                if "page size of" in line:
+                    try:
+                        page_bytes = int(
+                            line.split("page size of")[1].split("bytes")[0].strip()
+                        )
+                        page_kb = page_bytes / 1024
+                        result["page_kb"] = page_kb
+                    except (ValueError, IndexError):
+                        pass
+                    continue
+                if ":" not in line:
+                    continue
+                label, _, val_str = line.rpartition(":")
+                try:
+                    pages = int(val_str.strip().rstrip(".").replace(",", ""))
+                except ValueError:
+                    continue
+                mb = pages * page_kb / 1024
+                if   "wired down" in label:               result["wired"]      = mb
+                elif "Pages active" in label:             result["active"]     = mb
+                elif "Pages inactive" in label:           result["inactive"]   = mb
+                elif "Pages free" in label:               result["free"]       = mb
+                elif "Pages purgeable" in label:          result["purgeable"]  = mb
+                elif "Pages stored in compressor" in label: result["compressed"] = mb
+        except Exception:
+            pass
+        return result
+
+    def _build_memory_ancestry(self) -> list:
+        """
+        Walk the process tree and attribute RSS to root application families
+        (first-generation children of launchd). Returns [{app, mb, pct}] sorted
+        by MB descending — revealing which app *ecosystem* owns the most RAM.
+        """
+        pid_info = {}
+        try:
+            for p in psutil.process_iter(["pid", "ppid", "name", "memory_info"]):
+                try:
+                    rss = p.memory_info().rss / 1e6
+                    pid_info[p.pid] = {"ppid": p.ppid(), "name": p.name(), "rss": rss}
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            def root_ancestor(pid, visited=None):
+                visited = visited or set()
+                if pid in visited or pid not in pid_info:
+                    return pid
+                visited.add(pid)
+                ppid = pid_info[pid]["ppid"]
+                if ppid <= 1 or ppid not in pid_info:
+                    return pid
+                return root_ancestor(ppid, visited)
+
+            family_rss: dict = {}
+            for pid, info in pid_info.items():
+                root = root_ancestor(pid)
+                root_name = pid_info.get(root, {}).get("name", "unknown")
+                if root_name in PROTECTED:
+                    continue
+                if root not in family_rss:
+                    family_rss[root] = [root_name, 0.0]
+                family_rss[root][1] += info["rss"]
+
+            total_mb = sum(v[1] for v in family_rss.values()) or 1
+            return sorted(
+                [{"app": v[0], "mb": round(v[1]), "pct": round(v[1] / total_mb * 100, 1)}
+                 for v in family_rss.values()],
+                key=lambda x: x["mb"], reverse=True
+            )[:8]
+        except Exception:
+            return []
+
+    def _compute_mem_forecast(self) -> float:
+        """
+        Linear regression over the last 30 mem_hist samples to estimate minutes
+        until memory reaches 95%. Returns -1 if stable/declining or data is sparse.
+        """
+        with self._lock:
+            hist = list(self.mem_hist)
+        window = hist[-30:] if len(hist) >= 10 else []
+        if len(window) < 10:
+            return -1.0
+        n = len(window)
+        mean_x = (n - 1) / 2.0
+        mean_y = sum(window) / n
+        num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(window))
+        den = sum((i - mean_x) ** 2 for i in range(n))
+        if den == 0:
+            return -1.0
+        slope = num / den          # % per second (1 sample = 1 s)
+        if slope < 0.005:          # stable or declining
+            return -1.0
+        current = window[-1]
+        target  = 95.0
+        if current >= target:
+            return 0.0
+        return round((target - current) / slope / 60, 1)
+
+    def _update_pressure_and_forecast(self):
+        """Refresh kernel pressure level, vm_stat breakdown, and forecast every 5 s."""
+        level    = self._get_macos_pressure_level()
+        forecast = self._compute_mem_forecast()
+        vm_bd    = self._parse_vm_stat()
+        with self._lock:
+            self.mem_pressure_level = level
+            self.mem_forecast_min   = forecast
+            self.vm_breakdown       = vm_bd
+        if level == "critical":
+            vm = psutil.virtual_memory()
+            self._emit("issue",
+                f"Kernel memory pressure: CRITICAL — system at {vm.percent:.0f}% RAM")
+        # Ancestry is expensive; refresh every 30 s outside of pressure events
+        now = time.time()
+        if now - self._last_ancestry >= MEM_ANCESTRY_COOL_S:
+            self._last_ancestry = now
+            ancestry = self._build_memory_ancestry()
+            with self._lock:
+                self.mem_ancestry = ancestry
+
+    def _tiered_memory_remediation(self, mem_pct: float):
+        """
+        4-tier adaptive remediation cascade:
+          Tier 2 (≥82%): vm_stat breakdown + purgeable advisory + memory genealogy
+          Tier 3 (≥87%): SIGSTOP safe background daemons to pause their RSS
+          Tier 4 (≥92%): Delegate to _sweep_idle_services for emergency termination
+        (Tier 1 ≥80% is handled by existing _check_memory path.)
+        """
+        now = time.time()
+
+        # ── Tier 2: structural analysis ───────────────────────────────────────
+        vm_bd = self._parse_vm_stat()
+        with self._lock:
+            self.vm_breakdown = vm_bd
+
+        purg_mb  = vm_bd.get("purgeable", 0)
+        wired_mb = vm_bd.get("wired", 0)
+        total_mb = self._mem_total_gb * 1024
+
+        if purg_mb > 200:
+            self._emit("issue",
+                f"Purgeable opportunity: {purg_mb:.0f} MB reclaimable — "
+                f"macOS will reclaim under pressure (manual: sudo purge)")
+
+        if total_mb > 0 and wired_mb / total_mb * 100 >= WIRED_WARN_PCT \
+                and not self._wired_warned:
+            self._wired_warned = True
+            self.issues += 1
+            self._emit("warn",
+                f"Structural pressure: {wired_mb:.0f} MB wired "
+                f"({wired_mb/total_mb*100:.0f}% of RAM) — cannot be paged or compressed")
+        elif wired_mb < total_mb * 0.3:
+            self._wired_warned = False
+
+        if now - self._last_ancestry >= MEM_ANCESTRY_COOL_S:
+            self._last_ancestry = now
+            ancestry = self._build_memory_ancestry()
+            with self._lock:
+                self.mem_ancestry = ancestry
+            if ancestry:
+                summary = ", ".join(
+                    f"{a['app']} {a['mb']}MB" for a in ancestry[:3]
+                )
+                self._emit("issue", f"Memory genealogy (top families): {summary}")
+
+        # ── Tier 3: freeze idle background daemons ────────────────────────────
+        if mem_pct >= MEM_TIER3_PCT and now - self._last_freeze >= FREEZE_COOL_S:
+            self._freeze_background_daemons()
+
+        # ── Tier 4: emergency termination ────────────────────────────────────
+        if mem_pct >= MEM_TIER4_PCT:
+            self._sweep_idle_services()
+
+    def _freeze_background_daemons(self):
+        """
+        SIGSTOP background daemons matching safe patterns when under severe
+        memory pressure (Tier 3). _thaw_frozen_daemons() reverses this when
+        pressure drops below MEM_WARN - 5%.
+        """
+        self._last_freeze = time.time()
+        frozen, freed_mb = 0, 0.0
+        for p in psutil.process_iter(["pid", "name", "status", "username", "memory_info"]):
+            try:
+                if p.info["username"] == "root":
+                    continue
+                name = p.name()
+                if name in PROTECTED or name in NEVER_TERMINATE:
+                    continue
+                if p.pid in self._frozen_pids:
+                    continue
+                if not any(pat in name for pat in FREEZE_PATTERNS):
+                    continue
+                if p.info["status"] not in ("sleeping", "idle"):
+                    continue
+                rss = (p.info.get("memory_info") or p.memory_info()).rss / 1e6
+                p.send_signal(19)  # SIGSTOP — suspend without terminating
+                self._frozen_pids[p.pid] = (name, time.time(), rss)
+                freed_mb += rss
+                frozen   += 1
+                self.actions += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if frozen:
+            self.freed_mb += freed_mb
+            self._emit("fix",
+                f"MEMORY TRIAGE (Tier 3): froze {frozen} background daemons "
+                f"(~{freed_mb:.0f} MB paused) — auto-thaw when pressure drops")
+
+    def _thaw_frozen_daemons(self):
+        """
+        Send SIGCONT to all frozen daemons when system memory pressure eases.
+        Called automatically from _check_memory when usage drops below threshold.
+        """
+        to_thaw = list(self._frozen_pids.items())
+        thawed  = []
+        for pid, (name, _ts, _rss) in to_thaw:
+            try:
+                psutil.Process(pid).send_signal(18)  # SIGCONT — resume
+                thawed.append(name)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            self._frozen_pids.pop(pid, None)
+        if thawed:
+            self._emit("fix",
+                f"Pressure normalised — thawed {len(thawed)} daemons: "
+                + ", ".join(thawed[:4]))
+
     def _check_disk(self):
         try:
             d = psutil.disk_usage("/")
@@ -410,508 +701,640 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0d1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PerfBot">
+<link rel="manifest" href="/manifest.json">
 <title>Performance Bot</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
+  /* ── Reset & design tokens ── */
   *{box-sizing:border-box;margin:0;padding:0}
   :root{
-    --bg:#0d1117;--panel:#161b22;--border:#21262d;
-    --text:#e6edf3;--muted:#656d76;--muted2:#484f58;
+    --bg:#0d1117;--surface:#161b22;--surface2:#1c2128;
+    --border:#21262d;--border2:#30363d;
+    --text:#e6edf3;--muted:#8b949e;--muted2:#484f58;
     --green:#3fb950;--yellow:#d29922;--red:#f85149;
     --blue:#58a6ff;--orange:#e3b341;--accent:#1f6feb;--purple:#bc8cff;
     --cpu:#ff7b54;--mem:#7ee787;--swap:#58a6ff;
   }
   body{
     background:var(--bg);color:var(--text);
-    font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;
-    font-size:13px;height:100vh;overflow:hidden;display:flex;flex-direction:column;
+    font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif;
+    font-size:13px;height:100dvh;overflow:hidden;
+    display:flex;flex-direction:column;
   }
 
-  /* ── title bar ── */
+  /* ── Titlebar ── */
   .titlebar{
-    display:flex;align-items:center;gap:10px;
-    background:var(--panel);padding:11px 16px;
-    border-bottom:1px solid var(--border);
-    position:sticky;top:0;z-index:99;
+    display:flex;align-items:center;gap:10px;flex-shrink:0;
+    background:var(--surface);padding:8px 14px;
+    border-bottom:1px solid var(--border);z-index:99;
   }
-  .dots{display:flex;gap:6px}
-  .dot{width:12px;height:12px;border-radius:50%}
-  .titlebar h1{font-size:13px;font-weight:700;letter-spacing:.3px}
-  .status{display:flex;align-items:center;gap:5px;margin-left:4px}
+  .app-icon{
+    width:26px;height:26px;border-radius:7px;flex-shrink:0;
+    background:linear-gradient(135deg,#1f6feb,#7c3aed);
+    display:flex;align-items:center;justify-content:center;font-size:13px;
+  }
+  .app-name{font-size:13px;font-weight:700;letter-spacing:.2px}
+  .status-chip{
+    display:inline-flex;align-items:center;gap:4px;
+    background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.22);
+    border-radius:20px;padding:2px 8px;
+  }
   .status-dot{
-    width:7px;height:7px;border-radius:50%;
-    background:var(--green);box-shadow:0 0 6px var(--green);
+    width:6px;height:6px;border-radius:50%;
+    background:var(--green);box-shadow:0 0 5px var(--green);
     animation:pulse 2s infinite;
   }
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-  .status-text{font-size:11px;font-weight:700;color:var(--green)}
-  .spacer{flex:1}
-  .meta-pills{display:flex;align-items:center;gap:8px}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .status-label{font-size:10px;font-weight:700;color:var(--green);letter-spacing:.4px}
+  .tb-spacer{flex:1}
+  .tb-pills{display:flex;align-items:center;gap:5px}
   .pill{
-    display:inline-flex;align-items:center;gap:4px;
-    background:var(--bg);border:1px solid var(--border);
-    border-radius:20px;padding:3px 10px;font-size:11px;color:var(--muted);
-    transition:border-color .2s,color .2s;
+    display:inline-flex;align-items:center;gap:3px;
+    background:transparent;border:1px solid var(--border);
+    border-radius:20px;padding:2px 8px;font-size:10px;color:var(--muted);
+    transition:all .2s;white-space:nowrap;
   }
-  .pill.battery{color:var(--green);border-color:rgba(63,185,80,.3)}
-  .pill.thermal-hot{color:var(--red);border-color:rgba(248,81,73,.4)}
+  .pill.on-battery{color:var(--green);border-color:rgba(63,185,80,.28);background:rgba(63,185,80,.05)}
+  .pill.thermal-hot{color:var(--red);border-color:rgba(248,81,73,.35);background:rgba(248,81,73,.05)}
+  .pill.mem-warn{color:var(--yellow);border-color:rgba(210,153,34,.35);background:rgba(210,153,34,.05)}
+  .pill.mem-critical{color:var(--red);border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.08);animation:pulse 1.4s infinite}
+  .tb-btns{display:flex;gap:5px}
   .btn{
-    background:var(--border);color:var(--text);border:none;
-    padding:5px 13px;border-radius:6px;cursor:pointer;font-size:11px;
-    transition:background .15s;
+    background:var(--surface2);color:var(--text);
+    border:1px solid var(--border2);padding:4px 11px;
+    border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;
+    transition:all .15s;
   }
-  .btn:hover{background:var(--accent)}
+  .btn:hover{background:var(--accent);border-color:var(--accent)}
+  .btn.paused{background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35);color:var(--yellow)}
 
-  /* ── cards ── */
-  .cards-section{padding:10px 12px 0;display:flex;flex-direction:column;gap:8px;flex-shrink:0}
-  .cards-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
-  .card{
-    background:var(--panel);border:1px solid var(--border);
-    border-radius:10px;padding:13px 15px;
-    transition:border-color .2s;
+  /* ── Metric strip ── */
+  .metric-strip{
+    display:grid;grid-template-columns:repeat(6,1fr);
+    gap:1px;background:var(--border);
+    border-bottom:1px solid var(--border);flex-shrink:0;
   }
-  .card:hover{border-color:#30363d}
-  .card-label{
-    font-size:10px;font-weight:700;color:var(--muted);
-    letter-spacing:.6px;text-transform:uppercase;margin-bottom:5px;
+  .metric{
+    background:var(--surface);padding:8px 12px;
+    display:flex;align-items:center;gap:9px;
+    cursor:default;transition:background .15s;
   }
-  .card-val{
-    font-size:26px;font-weight:700;line-height:1;
-    margin-bottom:5px;transition:color .3s;
-  }
-  .card-sub{
-    font-size:10px;color:var(--muted);
-    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  }
+  .metric:hover{background:var(--surface2)}
+  .metric-ring{flex-shrink:0}
+  .ring-bg{fill:none;stroke:var(--surface2);stroke-width:3.5}
+  .ring-fill{fill:none;stroke-width:3.5;stroke-linecap:round;
+    transform:rotate(-90deg);transform-origin:50% 50%;
+    transition:stroke-dasharray .5s,stroke .3s}
+  .metric-info{min-width:0}
+  .metric-name{font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.55px;text-transform:uppercase}
+  .metric-val{font-size:19px;font-weight:700;line-height:1.1;transition:color .3s}
+  .metric-sub{font-size:9px;color:var(--muted);margin-top:1px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-  /* ── main grid (3 columns) ── */
+  /* ── Body wrapper ── */
+  .body-wrap{flex:1;min-height:0;display:flex;flex-direction:column}
+
+  /* ── Main 3-col grid ── */
   .main{
     display:grid;
-    grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,320px);
-    grid-template-rows:auto auto 1fr;
-    gap:10px;padding:10px 12px 12px;
-    flex:1;min-height:0;overflow:hidden;
+    grid-template-columns:230px 1fr 288px;
+    gap:1px;background:var(--border);
+    flex:1;min-height:0;
   }
 
-  /* ── chart panels ── */
-  .chart-panel{
-    background:var(--panel);border:1px solid var(--border);
-    border-radius:10px;padding:13px;
+  /* ── Left column: CPU + Swap charts + Bot status ── */
+  .left-col{display:flex;flex-direction:column;gap:1px;background:var(--border);min-height:0}
+  .chart-card{
+    background:var(--surface);padding:11px 12px;
+    flex:1;min-height:0;display:flex;flex-direction:column;
   }
-  .panel-hdr{
+  .card-hdr{
     display:flex;justify-content:space-between;align-items:baseline;
-    margin-bottom:10px;
+    margin-bottom:7px;flex-shrink:0;
   }
-  .panel-title{
-    font-size:10px;font-weight:700;color:var(--muted);
-    letter-spacing:.5px;text-transform:uppercase;
+  .card-title{font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.55px;text-transform:uppercase}
+  .card-live{font-size:15px;font-weight:700;transition:color .3s}
+  .chart-wrap{flex:1;min-height:0;position:relative}
+  .bot-card{background:var(--surface);padding:11px 12px;flex-shrink:0}
+  .bs-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:7px}
+  .bs-item{
+    background:var(--surface2);border:1px solid var(--border);
+    border-radius:6px;padding:6px 8px;
   }
-  .panel-live{font-size:18px;font-weight:700;transition:color .3s}
-  .chart-wrap{position:relative;height:120px}
+  .bs-label{font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.45px;text-transform:uppercase;margin-bottom:2px}
+  .bs-val{font-size:17px;font-weight:700;transition:color .3s}
+  .bs-sub{font-size:9px;color:var(--muted);margin-top:1px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .thr-names{margin-top:5px;font-size:9px;font-family:'SF Mono',monospace;color:var(--orange);line-height:1.5}
 
-  /* ── system info panel ── */
-  .sysinfo-panel{
-    background:var(--panel);border:1px solid var(--border);
-    border-radius:10px;padding:13px;
-  }
-  .sysinfo-row{
-    display:flex;justify-content:space-between;align-items:center;
-    padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;
-  }
-  .sysinfo-row:last-child{border:none}
-  .sysinfo-key{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.4px;font-weight:700}
-  .sysinfo-val{font-family:'SF Mono',monospace;font-size:11px}
-  .throttled-list{
-    margin-top:6px;font-size:10px;font-family:'SF Mono',monospace;
-    color:var(--orange);line-height:1.6;
-  }
+  /* ── Center column: Memory Intelligence ── */
+  .center-col{background:var(--surface);display:flex;flex-direction:column;min-height:0;overflow:hidden}
 
-  /* ── activity feed ── */
-  .feed{
-    background:var(--panel);border:1px solid var(--border);
-    border-radius:10px;padding:13px;
-    display:flex;flex-direction:column;
-    grid-column:3;grid-row:1/4;
-    min-width:0;min-height:0;overflow:hidden;
+  /* memory hero */
+  .mem-hero{
+    display:flex;align-items:center;gap:16px;
+    padding:12px 14px;border-bottom:1px solid var(--border);flex-shrink:0;
   }
+  .mem-arc-svg{width:76px;height:76px;flex-shrink:0}
+  .mem-arc-bg2{fill:none;stroke:var(--surface2);stroke-width:7}
+  .mem-arc-fill2{fill:none;stroke-width:7;stroke-linecap:round;
+    transform:rotate(-90deg);transform-origin:50% 50%;
+    transition:stroke-dasharray .5s,stroke .3s}
+  .mem-hero-info{flex:1;min-width:0}
+  .mem-title-row{
+    display:flex;align-items:center;gap:8px;margin-bottom:4px;
+  }
+  .section-title{font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.55px;text-transform:uppercase}
+  .mem-pct{font-size:34px;font-weight:700;line-height:1;transition:color .3s}
+  .mem-gb{font-size:11px;color:var(--muted);margin-top:2px}
+  .mem-forecast{margin-top:5px;font-size:10px;font-weight:600}
+  .fc-stable{color:var(--green)}
+  .fc-warn{color:var(--yellow)}
+  .fc-critical{color:var(--red)}
+
+  /* breakdown section */
+  .bd-section{padding:9px 14px;border-bottom:1px solid var(--border);flex-shrink:0}
+  .bd-bar{height:8px;display:flex;border-radius:4px;overflow:hidden;gap:1px;margin:6px 0}
+  .bds{height:100%;transition:width .5s;min-width:1px}
+  .bds-wired{background:#bc8cff}
+  .bds-active{background:#7ee787}
+  .bds-inactive{background:#58a6ff}
+  .bds-compressed{background:#e3b341}
+  .bds-free{background:#1c2128;border:1px solid var(--border2)}
+  .bd-legend{display:flex;flex-wrap:wrap;gap:6px 12px}
+  .bdl{display:flex;align-items:center;gap:3px;font-size:9px;color:var(--muted)}
+  .bdl-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+  .bdl-val{font-family:'SF Mono',monospace;color:var(--text);margin-left:1px}
+
+  /* vm detail rows */
+  .vmrow-section{padding:6px 14px;border-bottom:1px solid var(--border);flex-shrink:0}
+  .vmrow{
+    display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:10px;
+    border-bottom:1px solid var(--border);
+  }
+  .vmrow:last-child{border:none}
+  .vmkey{color:var(--muted);font-weight:600}
+  .vmval{font-family:'SF Mono',monospace}
+
+  /* memory families */
+  .families-section{padding:9px 14px;flex:1;overflow-y:auto;min-height:0}
+  .fam-row{display:flex;align-items:center;gap:7px;padding:3px 0;font-size:11px}
+  .fam-icon{
+    width:20px;height:20px;border-radius:5px;flex-shrink:0;
+    display:flex;align-items:center;justify-content:center;
+    font-size:9px;font-weight:700;
+    background:rgba(88,166,255,.12);color:var(--blue);
+    border:1px solid rgba(88,166,255,.18);
+  }
+  .fam-name{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .fam-bar-wrap{width:72px;flex-shrink:0}
+  .fam-bar{height:3px;border-radius:2px;background:var(--border);overflow:hidden}
+  .fam-bar-fill{height:100%;border-radius:2px;background:var(--mem);transition:width .5s}
+  .fam-mb{font-family:'SF Mono',monospace;font-size:9px;color:var(--muted);flex-shrink:0;min-width:56px;text-align:right}
+
+  /* ── Activity feed ── */
+  .feed-col{background:var(--surface);display:flex;flex-direction:column;min-height:0}
   .feed-hdr{
-    display:flex;justify-content:space-between;align-items:center;
-    margin-bottom:10px;flex-shrink:0;
+    padding:9px 10px 7px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;justify-content:space-between;flex-shrink:0;
   }
-  .feed-title{font-size:10px;font-weight:700;color:var(--muted);letter-spacing:.5px;text-transform:uppercase}
-  .ev-count{font-size:11px;color:var(--muted)}
-  .feed-body{flex:1;overflow-y:auto;overflow-x:hidden;min-width:0;min-height:0}
+  .feed-title{font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.55px;text-transform:uppercase}
+  .ev-badge-pill{
+    background:var(--surface2);border:1px solid var(--border);
+    border-radius:20px;padding:1px 7px;font-size:9px;color:var(--muted);
+  }
+  .feed-body{flex:1;overflow-y:auto;padding:5px 7px;min-height:0}
   .ev{
-    display:flex;gap:7px;padding:5px 7px;margin-bottom:2px;
-    border-radius:5px;min-width:0;
-    border-left:2px solid transparent;
-    background:rgba(255,255,255,.015);
+    display:flex;gap:6px;padding:4px 6px;margin-bottom:2px;
+    border-radius:4px;border-left:2px solid transparent;
+    background:rgba(255,255,255,.012);transition:background .15s;
   }
   .ev:hover{background:rgba(255,255,255,.04)}
-  .ev-ts{color:var(--muted);white-space:nowrap;flex-shrink:0;font-size:10px;font-family:'SF Mono',monospace;padding-top:1px}
-  .ev-badge{font-weight:700;white-space:nowrap;flex-shrink:0;font-size:10px;padding-top:1px;min-width:42px}
-  .ev-msg{color:var(--text);word-break:break-word;min-width:0;font-size:11px;font-family:'SF Mono',monospace;line-height:1.5}
-  .fix   {border-left-color:var(--green)} .fix   .ev-badge{color:var(--green)}
-  .warn  {border-left-color:var(--yellow)}.warn  .ev-badge{color:var(--yellow)}
-  .issue {border-left-color:var(--red)}   .issue .ev-badge{color:var(--red)}
-  .info  {border-left-color:var(--blue)}  .info  .ev-badge{color:var(--blue)}
+  .ev-ts{color:var(--muted2);white-space:nowrap;flex-shrink:0;font-size:9px;font-family:'SF Mono',monospace;padding-top:1px}
+  .ev-badge{font-weight:700;white-space:nowrap;flex-shrink:0;font-size:9px;padding-top:1px;min-width:36px}
+  .ev-msg{color:var(--text);word-break:break-word;min-width:0;font-size:10px;font-family:'SF Mono',monospace;line-height:1.45}
+  .ev.fix  {border-left-color:var(--green)} .ev.fix   .ev-badge{color:var(--green)}
+  .ev.warn {border-left-color:var(--yellow)}.ev.warn  .ev-badge{color:var(--yellow)}
+  .ev.issue{border-left-color:var(--red)}   .ev.issue .ev-badge{color:var(--red)}
+  .ev.info {border-left-color:var(--blue)}  .ev.info  .ev-badge{color:var(--blue)}
 
-  /* ── process table ── */
-  .proc-panel{
-    background:var(--panel);border:1px solid var(--border);
-    border-radius:10px;padding:13px;
-    grid-column:1/3;
-    min-height:0;overflow-y:auto;
+  /* ── Process table footer ── */
+  .proc-footer{
+    flex-shrink:0;height:184px;overflow-y:auto;
+    background:var(--surface);border-top:1px solid var(--border);
+    padding:8px 14px;
   }
+  .proc-hdr-row{
+    display:flex;justify-content:space-between;align-items:center;
+    margin-bottom:5px;position:sticky;top:0;background:var(--surface);z-index:1;
+    padding-bottom:4px;border-bottom:1px solid var(--border);
+  }
+  .mem-trend-toggle{font-size:9px;color:var(--muted);cursor:pointer;user-select:none}
+  .mem-trend-toggle:hover{color:var(--text)}
+  .mem-trend-panel{height:50px;margin-bottom:6px;position:relative}
   table{width:100%;border-collapse:collapse}
   th{
-    text-align:left;font-size:10px;font-weight:700;color:var(--muted);
-    letter-spacing:.5px;text-transform:uppercase;padding:4px 8px;
+    text-align:left;font-size:9px;font-weight:700;color:var(--muted);
+    letter-spacing:.5px;text-transform:uppercase;padding:3px 7px;
     border-bottom:1px solid var(--border);
+    position:sticky;top:0;background:var(--surface);
   }
-  td{
-    padding:5px 8px;font-family:'SF Mono',monospace;font-size:11px;
-    border-bottom:1px solid var(--border);
-  }
+  td{padding:3px 7px;font-family:'SF Mono',monospace;font-size:10px;border-bottom:1px solid var(--border)}
   tr:last-child td{border:none}
   tr:hover td{background:rgba(255,255,255,.02)}
-  .hi  td:nth-child(3){color:var(--yellow)}
+  .hi td:nth-child(3){color:var(--yellow)}
   .thr td:nth-child(3){color:var(--orange);font-weight:700}
-  .bar-cell{width:60px}
-  .bar{height:4px;border-radius:2px;background:var(--border)}
+  .bar-cell{width:52px}
+  .bar{height:3px;border-radius:2px;background:var(--border);overflow:hidden}
   .bar-fill{height:100%;border-radius:2px;transition:width .4s}
   .thr-badge{
-    display:inline-block;
-    background:rgba(227,179,65,.12);color:var(--orange);
-    border:1px solid rgba(227,179,65,.3);
-    border-radius:3px;font-size:9px;font-weight:700;
-    padding:0 4px;margin-left:5px;letter-spacing:.3px;
+    display:inline-block;background:rgba(227,179,65,.1);color:var(--orange);
+    border:1px solid rgba(227,179,65,.25);border-radius:3px;
+    font-size:8px;font-weight:700;padding:0 3px;margin-left:4px;
   }
 
-  /* ── footer ── */
+  /* ── Footer ── */
   .footer{
-    flex-shrink:0;padding:7px 16px;
-    background:var(--panel);border-top:1px solid var(--border);
-    font-size:10px;color:var(--muted);
-    display:flex;justify-content:space-between;align-items:center;gap:16px;
+    flex-shrink:0;padding:5px 14px;
+    background:var(--surface);border-top:1px solid var(--border);
+    font-size:9px;color:var(--muted);
+    display:flex;justify-content:space-between;align-items:center;
   }
 
-  /* scrollbar */
-  ::-webkit-scrollbar{width:4px;height:4px}
+  ::-webkit-scrollbar{width:3px;height:3px}
   ::-webkit-scrollbar-track{background:transparent}
-  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+  ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
 </style>
 </head>
 <body>
 
-<!-- Title bar -->
+<!-- ═══ Titlebar ════════════════════════════════════════════════════════ -->
 <div class="titlebar">
-  <div class="dots">
-    <div class="dot" style="background:#ff5f57"></div>
-    <div class="dot" style="background:#ffbd2e"></div>
-    <div class="dot" style="background:#28c840"></div>
-  </div>
-  <h1>Performance Bot</h1>
-  <div class="status">
+  <div class="app-icon">⚡</div>
+  <span class="app-name">Performance Bot</span>
+  <div class="status-chip" id="statusChip">
     <div class="status-dot" id="statusDot"></div>
-    <span class="status-text" id="statusText">RUNNING</span>
+    <span class="status-label" id="statusText">RUNNING</span>
   </div>
-  <span class="spacer"></span>
-  <div class="meta-pills">
-    <span id="uptimePill" class="pill">⏱ 0s</span>
-    <span id="powerPill"  class="pill">⚡ AC</span>
-    <span id="thermalPill" class="pill">🌡 Normal</span>
+  <span class="tb-spacer"></span>
+  <div class="tb-pills">
+    <span id="uptimePill"      class="pill">⏱ 0s</span>
+    <span id="powerPill"       class="pill">⚡ AC</span>
+    <span id="thermalPill"     class="pill">🌡 Normal</span>
+    <span id="memPressurePill" class="pill">🧠 Normal</span>
   </div>
-  <button class="btn" id="pauseBtn" onclick="togglePause()">Pause Bot</button>
-  <button class="btn" onclick="clearFeed()">Clear Log</button>
-</div>
-
-<!-- Cards row 1: resources -->
-<div class="cards-section">
-  <div class="cards-row">
-    <div class="card">
-      <div class="card-label">CPU</div>
-      <div class="card-val" id="cCpu" style="color:var(--cpu)">—</div>
-      <div class="card-sub" id="cCpuSub">system-wide</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Memory</div>
-      <div class="card-val" id="cMem" style="color:var(--mem)">—</div>
-      <div class="card-sub" id="cMemSub">— / — GB</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Swap</div>
-      <div class="card-val" id="cSwap" style="color:var(--swap)">—</div>
-      <div class="card-sub" id="cSwapSub">— GB used</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Disk</div>
-      <div class="card-val" id="cDisk" style="color:var(--blue)">—</div>
-      <div class="card-sub" id="cDiskSub">— GB free</div>
-    </div>
-  </div>
-  <!-- Cards row 2: bot stats -->
-  <div class="cards-row">
-    <div class="card">
-      <div class="card-label">Throttled Now</div>
-      <div class="card-val" id="cThr" style="color:var(--muted)">0</div>
-      <div class="card-sub" id="cThrSub">no active throttles</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Actions Taken</div>
-      <div class="card-val" id="cAct" style="color:var(--muted)">0</div>
-      <div class="card-sub">auto-remediations</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Issues Found</div>
-      <div class="card-val" id="cIss" style="color:var(--muted)">0</div>
-      <div class="card-sub">warnings + issues</div>
-    </div>
-    <div class="card">
-      <div class="card-label">RAM Freed</div>
-      <div class="card-val" id="cFreed" style="color:var(--muted)">0 MB</div>
-      <div class="card-sub">idle service sweep</div>
-    </div>
+  <div class="tb-btns">
+    <button class="btn" id="pauseBtn" onclick="togglePause()">Pause</button>
+    <button class="btn" onclick="clearFeed()">Clear Log</button>
   </div>
 </div>
 
-<!-- Main grid -->
-<div class="main">
-
-  <!-- CPU chart (col 1, row 1) -->
-  <div class="chart-panel">
-    <div class="panel-hdr">
-      <span class="panel-title">CPU — 90 s</span>
-      <span class="panel-live" id="cpuLive" style="color:var(--cpu)">—</span>
+<!-- ═══ Metric strip ═════════════════════════════════════════════════════ -->
+<div class="metric-strip">
+  <div class="metric">
+    <svg class="metric-ring" width="42" height="42" viewBox="0 0 42 42">
+      <circle class="ring-bg" cx="21" cy="21" r="15"/>
+      <circle id="rCpu" class="ring-fill" cx="21" cy="21" r="15" stroke="var(--cpu)" stroke-dasharray="0 95"/>
+    </svg>
+    <div class="metric-info">
+      <div class="metric-name">CPU</div>
+      <div class="metric-val" id="mCpu" style="color:var(--cpu)">—</div>
+      <div class="metric-sub">system-wide</div>
     </div>
-    <div class="chart-wrap"><canvas id="cpuChart"></canvas></div>
   </div>
-
-  <!-- Memory chart (col 2, row 1) -->
-  <div class="chart-panel">
-    <div class="panel-hdr">
-      <span class="panel-title">Memory — 90 s</span>
-      <span class="panel-live" id="memLive" style="color:var(--mem)">—</span>
+  <div class="metric">
+    <svg class="metric-ring" width="42" height="42" viewBox="0 0 42 42">
+      <circle class="ring-bg" cx="21" cy="21" r="15"/>
+      <circle id="rMem" class="ring-fill" cx="21" cy="21" r="15" stroke="var(--mem)" stroke-dasharray="0 95"/>
+    </svg>
+    <div class="metric-info">
+      <div class="metric-name">Memory</div>
+      <div class="metric-val" id="mMem" style="color:var(--mem)">—</div>
+      <div class="metric-sub" id="mMemSub">— / — GB</div>
     </div>
-    <div class="chart-wrap"><canvas id="memChart"></canvas></div>
   </div>
-
-  <!-- Activity feed (col 3, rows 1-4) -->
-  <div class="feed">
-    <div class="feed-hdr">
-      <span class="feed-title">Activity Log</span>
-      <span class="ev-count" id="evCount">0 events</span>
+  <div class="metric">
+    <svg class="metric-ring" width="42" height="42" viewBox="0 0 42 42">
+      <circle class="ring-bg" cx="21" cy="21" r="15"/>
+      <circle id="rSwap" class="ring-fill" cx="21" cy="21" r="15" stroke="var(--swap)" stroke-dasharray="0 95"/>
+    </svg>
+    <div class="metric-info">
+      <div class="metric-name">Swap</div>
+      <div class="metric-val" id="mSwap" style="color:var(--swap)">—</div>
+      <div class="metric-sub" id="mSwapSub">— GB</div>
     </div>
-    <div class="feed-body" id="feedBody"></div>
   </div>
-
-  <!-- Swap chart (col 1, row 2) -->
-  <div class="chart-panel">
-    <div class="panel-hdr">
-      <span class="panel-title">Swap — 90 s</span>
-      <span class="panel-live" id="swapLive" style="color:var(--swap)">—</span>
+  <div class="metric">
+    <svg class="metric-ring" width="42" height="42" viewBox="0 0 42 42">
+      <circle class="ring-bg" cx="21" cy="21" r="15"/>
+      <circle id="rDisk" class="ring-fill" cx="21" cy="21" r="15" stroke="var(--blue)" stroke-dasharray="0 95"/>
+    </svg>
+    <div class="metric-info">
+      <div class="metric-name">Disk</div>
+      <div class="metric-val" id="mDisk" style="color:var(--blue)">—</div>
+      <div class="metric-sub" id="mDiskSub">— GB free</div>
     </div>
-    <div class="chart-wrap"><canvas id="swapChart"></canvas></div>
   </div>
-
-  <!-- System info panel (col 2, row 2) -->
-  <div class="sysinfo-panel">
-    <div class="panel-title" style="margin-bottom:10px">System</div>
-    <div class="sysinfo-row">
-      <span class="sysinfo-key">Total RAM</span>
-      <span class="sysinfo-val" id="siMemTotal">—</span>
+  <div class="metric">
+    <div class="metric-info">
+      <div class="metric-name">Bot Actions</div>
+      <div class="metric-val" id="mAct" style="color:var(--muted)">0</div>
+      <div class="metric-sub">remediations</div>
     </div>
-    <div class="sysinfo-row">
-      <span class="sysinfo-key">Total Swap</span>
-      <span class="sysinfo-val" id="siSwapTotal">—</span>
-    </div>
-    <div class="sysinfo-row">
-      <span class="sysinfo-key">Disk Free</span>
-      <span class="sysinfo-val" id="siDiskFree">—</span>
-    </div>
-    <div class="sysinfo-row">
-      <span class="sysinfo-key">Throttled</span>
-      <span class="sysinfo-val" id="siThrCount" style="color:var(--muted)">none</span>
-    </div>
-    <div class="throttled-list" id="siThrList"></div>
   </div>
+  <div class="metric">
+    <div class="metric-info">
+      <div class="metric-name">Issues</div>
+      <div class="metric-val" id="mIss" style="color:var(--muted)">0</div>
+      <div class="metric-sub" id="mIssSub">— freed</div>
+    </div>
+  </div>
+</div>
 
-  <!-- Process table (col 1-2, row 3) -->
-  <div class="proc-panel">
-    <div class="panel-title" style="margin-bottom:8px">Top Processes</div>
+<!-- ═══ Body ═══════════════════════════════════════════════════════════ -->
+<div class="body-wrap">
+  <div class="main">
+
+    <!-- ── Left col: charts + bot status ── -->
+    <div class="left-col">
+      <div class="chart-card">
+        <div class="card-hdr">
+          <span class="card-title">CPU — 90 s</span>
+          <span class="card-live" id="cpuLive" style="color:var(--cpu)">—</span>
+        </div>
+        <div class="chart-wrap"><canvas id="cpuChart"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="card-hdr">
+          <span class="card-title">Swap — 90 s</span>
+          <span class="card-live" id="swapLive" style="color:var(--swap)">—</span>
+        </div>
+        <div class="chart-wrap"><canvas id="swapChart"></canvas></div>
+      </div>
+      <div class="bot-card">
+        <span class="card-title">Bot Status</span>
+        <div class="bs-grid">
+          <div class="bs-item">
+            <div class="bs-label">Throttled</div>
+            <div class="bs-val" id="bsThr" style="color:var(--muted)">0</div>
+            <div class="bs-sub" id="bsThrSub">none active</div>
+          </div>
+          <div class="bs-item">
+            <div class="bs-label">Actions</div>
+            <div class="bs-val" id="bsAct" style="color:var(--muted)">0</div>
+            <div class="bs-sub">total fixes</div>
+          </div>
+          <div class="bs-item">
+            <div class="bs-label">Issues</div>
+            <div class="bs-val" id="bsIss" style="color:var(--muted)">0</div>
+            <div class="bs-sub">detected</div>
+          </div>
+          <div class="bs-item">
+            <div class="bs-label">RAM Freed</div>
+            <div class="bs-val" id="bsFreed" style="color:var(--muted)">0</div>
+            <div class="bs-sub">MB cleared</div>
+          </div>
+        </div>
+        <div class="thr-names" id="thrNames"></div>
+      </div>
+    </div>
+
+    <!-- ── Center: Memory Intelligence ── -->
+    <div class="center-col">
+
+      <!-- Hero: arc + big % -->
+      <div class="mem-hero">
+        <svg class="mem-arc-svg" viewBox="0 0 76 76">
+          <circle class="mem-arc-bg2" cx="38" cy="38" r="30"/>
+          <circle id="memArc" class="mem-arc-fill2" cx="38" cy="38" r="30"
+            stroke="var(--mem)" stroke-dasharray="0 189"/>
+        </svg>
+        <div class="mem-hero-info">
+          <div class="mem-title-row">
+            <span class="section-title">Memory Intelligence</span>
+            <span id="memPressBadge" class="pill">Normal</span>
+          </div>
+          <div class="mem-pct" id="memPct" style="color:var(--mem)">—</div>
+          <div class="mem-gb" id="memGb">— / — GB</div>
+          <div class="mem-forecast" id="memFcLine"></div>
+        </div>
+      </div>
+
+      <!-- Breakdown bar -->
+      <div class="bd-section">
+        <div class="section-title">Memory Composition</div>
+        <div class="bd-bar" id="bdBar">
+          <div class="bds bds-free" style="width:100%"></div>
+        </div>
+        <div class="bd-legend">
+          <div class="bdl"><div class="bdl-dot" style="background:#bc8cff"></div>Wired<span class="bdl-val" id="bdWired">—</span></div>
+          <div class="bdl"><div class="bdl-dot" style="background:#7ee787"></div>Active<span class="bdl-val" id="bdActive">—</span></div>
+          <div class="bdl"><div class="bdl-dot" style="background:#58a6ff"></div>Inactive<span class="bdl-val" id="bdInactive">—</span></div>
+          <div class="bdl"><div class="bdl-dot" style="background:#e3b341"></div>Compressed<span class="bdl-val" id="bdCompressed">—</span></div>
+          <div class="bdl"><div class="bdl-dot" style="background:#1c2128;border:1px solid #30363d"></div>Free<span class="bdl-val" id="bdFree">—</span></div>
+          <div class="bdl"><div class="bdl-dot" style="background:#58a6ff;opacity:.5"></div>Purgeable<span class="bdl-val" id="bdPurgeable">—</span></div>
+        </div>
+      </div>
+
+      <!-- vm detail rows -->
+      <div class="vmrow-section">
+        <div class="vmrow">
+          <span class="vmkey">Total RAM</span>
+          <span class="vmval" id="vsRam">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">Swap Used</span>
+          <span class="vmval" id="vsSwap" style="color:var(--swap)">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">Disk Free</span>
+          <span class="vmval" id="vsDisk" style="color:var(--blue)">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">Uptime</span>
+          <span class="vmval" id="vsUptime">—</span>
+        </div>
+      </div>
+
+      <!-- Memory families -->
+      <div class="families-section">
+        <div class="section-title" style="margin-bottom:7px">Memory Families</div>
+        <div id="familyList"><div style="color:var(--muted);font-size:10px">Scanning process tree…</div></div>
+      </div>
+    </div>
+
+    <!-- ── Right: Activity feed ── -->
+    <div class="feed-col">
+      <div class="feed-hdr">
+        <span class="feed-title">Activity Log</span>
+        <span class="ev-badge-pill" id="evCount">0</span>
+      </div>
+      <div class="feed-body" id="feedBody"></div>
+    </div>
+
+  </div><!-- /main -->
+
+  <!-- ── Process table ── -->
+  <div class="proc-footer">
+    <div class="proc-hdr-row">
+      <span class="card-title">Top Processes</span>
+      <span class="mem-trend-toggle" id="trendToggle" onclick="toggleTrend()">show memory trend ▾</span>
+    </div>
+    <div class="mem-trend-panel" id="trendPanel" style="display:none">
+      <canvas id="memChart"></canvas>
+    </div>
     <table>
       <thead>
         <tr>
           <th>Process</th><th>PID</th>
-          <th>CPU %</th><th>CPU</th>
-          <th>MEM %</th><th>MEM</th>
+          <th>CPU %</th><th style="width:52px">CPU</th>
+          <th>MEM %</th><th style="width:52px">MEM</th>
           <th>Status</th>
         </tr>
       </thead>
       <tbody id="procBody"></tbody>
     </table>
   </div>
+</div><!-- /body-wrap -->
 
-</div><!-- /main -->
-
-<!-- Footer -->
+<!-- ── Footer ── -->
 <div class="footer">
   <span id="lastUpdate">Initializing…</span>
-  <span id="footerRight">Poll: 1 s · Throttle: &gt;85% CPU · Warn: &gt;80% RAM · Sweep: idle XPC/widgets</span>
+  <span>Poll 1 s · Throttle &gt;85% CPU · Warn &gt;80% RAM · MMIE active</span>
 </div>
 
 <script>
+// ── Ring gauge helpers ─────────────────────────────────────────────────────────
+const RC = 2 * Math.PI * 15;   // circumference for r=15 rings (~94.2)
+const MAC = 2 * Math.PI * 30;  // circumference for r=30 memory arc (~188.5)
+function setRing(id, pct, color) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const f = RC * Math.min(pct, 100) / 100;
+  el.setAttribute('stroke-dasharray', f.toFixed(1) + ' ' + RC.toFixed(1));
+  if (color) el.setAttribute('stroke', color);
+}
+function setMemArc(pct, color) {
+  const el = document.getElementById('memArc');
+  if (!el) return;
+  const f = MAC * Math.min(pct, 100) / 100;
+  el.setAttribute('stroke-dasharray', f.toFixed(1) + ' ' + MAC.toFixed(1));
+  if (color) el.setAttribute('stroke', color);
+}
+
 // ── Chart factory ─────────────────────────────────────────────────────────────
 function makeChart(id, color, fill, warnPct) {
   const ctx = document.getElementById(id).getContext('2d');
   const warnPlugin = {
-    id: 'warnLine',
+    id:'warnLine',
     beforeDraw(chart) {
       if (!warnPct) return;
-      const {ctx: c, chartArea, scales} = chart;
+      const {ctx:c, chartArea, scales} = chart;
       if (!chartArea) return;
       const y = scales.y.getPixelForValue(warnPct);
-      c.save();
-      c.strokeStyle = 'rgba(248,81,73,.3)';
-      c.lineWidth = 1;
-      c.setLineDash([3, 5]);
-      c.beginPath();
-      c.moveTo(chartArea.left, y);
-      c.lineTo(chartArea.right, y);
-      c.stroke();
-      c.setLineDash([]);
-      c.restore();
+      c.save(); c.strokeStyle='rgba(248,81,73,.22)'; c.lineWidth=1;
+      c.setLineDash([3,5]); c.beginPath();
+      c.moveTo(chartArea.left, y); c.lineTo(chartArea.right, y);
+      c.stroke(); c.setLineDash([]); c.restore();
     }
   };
   return new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: [],
-      datasets: [{
-        data: [], borderColor: color, borderWidth: 1.5,
-        backgroundColor: fill, fill: true,
-        tension: 0.3, pointRadius: 0,
-      }]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false, animation: false,
-      scales: {
-        x: { display: false },
-        y: {
-          min: 0, max: 100,
-          ticks: {
-            color: '#656d76', stepSize: 25,
-            callback: v => v + '%', font: { size: 10 }
-          },
-          grid: { color: '#21262d' },
-          border: { display: false },
-        }
+    type:'line',
+    data:{ labels:[], datasets:[{ data:[], borderColor:color, borderWidth:1.5,
+      backgroundColor:fill, fill:true, tension:0.3, pointRadius:0 }] },
+    options:{
+      responsive:true, maintainAspectRatio:false, animation:false,
+      scales:{
+        x:{display:false},
+        y:{min:0, max:100,
+          ticks:{color:'#656d76', stepSize:25, callback:v=>v+'%', font:{size:9}},
+          grid:{color:'#21262d'}, border:{display:false}}
       },
-      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      plugins:{legend:{display:false}, tooltip:{enabled:false}},
     },
-    plugins: [warnPlugin],
+    plugins:[warnPlugin],
   });
 }
-
-const cpuChart  = makeChart('cpuChart',  '#ff7b54', 'rgba(255,123,84,.1)',   80);
-const memChart  = makeChart('memChart',  '#7ee787', 'rgba(126,231,135,.1)',  80);
-const swapChart = makeChart('swapChart', '#58a6ff', 'rgba(88,166,255,.1)',   50);
-
+const cpuChart  = makeChart('cpuChart',  '#ff7b54', 'rgba(255,123,84,.1)',  80);
+const swapChart = makeChart('swapChart', '#58a6ff', 'rgba(88,166,255,.1)',  50);
+const memChart  = makeChart('memChart',  '#7ee787', 'rgba(126,231,135,.1)', 80);
 function updateChart(chart, data) {
-  chart.data.labels = data.map((_, i) => i);
+  chart.data.labels = data.map((_,i)=>i);
   chart.data.datasets[0].data = data;
   chart.update('none');
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let evCount = 0, seenEvents = new Set(), paused = false;
-let memTotalGb = 0, swapTotalGb = 0;
+let evCnt=0, seenEvs=new Set(), paused=false, trendVisible=false;
+let memTotalGb=0, swapTotalGb=0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function colorFor(v, lo, hi, def) {
-  return v > hi ? 'var(--red)' : v > lo ? 'var(--yellow)' : def;
-}
-function setCard(id, text, color) {
-  const el = document.getElementById(id);
-  el.textContent = text;
-  if (color !== undefined) el.style.color = color;
-}
-function setSub(id, text) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = text;
-}
-function fmtUptime(s) {
-  if (s < 60)   return s + 's';
-  if (s < 3600) return Math.floor(s/60) + 'm ' + (s % 60) + 's';
-  return Math.floor(s/3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+function colorFor(v,lo,hi,def){ return v>hi?'var(--red)':v>lo?'var(--yellow)':def; }
+function fmtUp(s){ if(s<60)return s+'s'; if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s'; return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; }
+function fmtMb(v){ if(v==null)return'—'; return v>=1024?(v/1024).toFixed(1)+' GB':Math.round(v)+' MB'; }
+
+// ── Memory trend toggle ───────────────────────────────────────────────────────
+function toggleTrend() {
+  trendVisible = !trendVisible;
+  document.getElementById('trendPanel').style.display = trendVisible ? '' : 'none';
+  document.getElementById('trendToggle').textContent =
+    trendVisible ? 'hide memory trend ▴' : 'show memory trend ▾';
+  if (trendVisible) memChart.resize();
 }
 
 // ── Process table ─────────────────────────────────────────────────────────────
-function barCell(pct, color) {
-  return `<td class="bar-cell">
-    <div class="bar">
-      <div class="bar-fill" style="width:${Math.min(pct,100).toFixed(1)}%;background:${color}"></div>
-    </div>
-  </td>`;
+function barCell(pct,color){
+  return `<td class="bar-cell"><div class="bar"><div class="bar-fill" style="width:${Math.min(pct,100).toFixed(1)}%;background:${color}"></div></div></td>`;
 }
 function buildProcTable(procs, thrPids) {
-  document.getElementById('procBody').innerHTML = procs.map(([cpu, mem, pid, name, status]) => {
-    const thr = thrPids.includes(pid);
-    const hiCpu = !thr && cpu >= 70;
-    const cls = thr ? 'thr' : hiCpu ? 'hi' : '';
-    const cpuColor = thr ? 'var(--orange)' : hiCpu ? 'var(--yellow)' : 'var(--cpu)';
-    const memColor = mem >= 10 ? 'var(--red)' : mem >= 4 ? 'var(--yellow)' : 'var(--mem)';
-    const badge = thr ? '<span class="thr-badge">THROTTLED</span>' : '';
-    return `<tr class="${cls}">
-      <td>${name}${badge}</td>
-      <td>${pid}</td>
-      <td>${cpu.toFixed(1)}%</td>
-      ${barCell(cpu, cpuColor)}
-      <td>${mem.toFixed(1)}%</td>
-      ${barCell(mem * 8, memColor)}
-      <td>${status}</td>
-    </tr>`;
+  document.getElementById('procBody').innerHTML = procs.map(([cpu,mem,pid,name,status])=>{
+    const thr=thrPids.includes(pid), hiCpu=!thr&&cpu>=70;
+    const cls=thr?'thr':hiCpu?'hi':'';
+    const cc=thr?'var(--orange)':hiCpu?'var(--yellow)':'var(--cpu)';
+    const mc=mem>=10?'var(--red)':mem>=4?'var(--yellow)':'var(--mem)';
+    const badge=thr?'<span class="thr-badge">THROTTLED</span>':'';
+    return `<tr class="${cls}"><td>${name}${badge}</td><td>${pid}</td><td>${cpu.toFixed(1)}%</td>${barCell(cpu,cc)}<td>${mem.toFixed(1)}%</td>${barCell(mem*8,mc)}<td>${status}</td></tr>`;
   }).join('');
 }
 
 // ── Activity feed ──────────────────────────────────────────────────────────────
-const BADGE = { fix:'✓ FIX', warn:'⚠ WARN', issue:'✗ ISSUE', info:'ℹ INFO' };
+const BADGE={fix:'✓ FIX',warn:'⚠ WARN',issue:'✗ ISS',info:'ℹ INFO'};
 function addEvent(ev) {
-  const key = ev.ts + ev.msg;
-  if (seenEvents.has(key)) return;
-  seenEvents.add(key);
-  evCount++;
-  document.getElementById('evCount').textContent = evCount + ' events';
-  const div = document.createElement('div');
-  div.className = 'ev ' + ev.kind;
-  div.innerHTML =
-    `<span class="ev-ts">${ev.ts}</span>` +
-    `<span class="ev-badge">${BADGE[ev.kind] || '?'}</span>` +
-    `<span class="ev-msg">${ev.msg}</span>`;
+  const key=ev.ts+ev.msg; if(seenEvs.has(key))return; seenEvs.add(key); evCnt++;
+  document.getElementById('evCount').textContent = evCnt;
+  const div=document.createElement('div'); div.className='ev '+ev.kind;
+  div.innerHTML=`<span class="ev-ts">${ev.ts}</span><span class="ev-badge">${BADGE[ev.kind]||'?'}</span><span class="ev-msg">${ev.msg}</span>`;
   document.getElementById('feedBody').prepend(div);
 }
-function clearFeed() {
-  evCount = 0; seenEvents.clear();
-  document.getElementById('evCount').textContent = '0 events';
-  document.getElementById('feedBody').innerHTML = '';
+function clearFeed(){
+  evCnt=0; seenEvs.clear();
+  document.getElementById('evCount').textContent='0';
+  document.getElementById('feedBody').innerHTML='';
 }
 
 // ── Pause / Resume ─────────────────────────────────────────────────────────────
 function togglePause() {
-  paused = !paused;
-  const dot = document.getElementById('statusDot');
-  const txt = document.getElementById('statusText');
-  const btn = document.getElementById('pauseBtn');
+  paused=!paused;
+  const chip=document.getElementById('statusChip');
+  const dot=document.getElementById('statusDot');
+  const txt=document.getElementById('statusText');
+  const btn=document.getElementById('pauseBtn');
   if (paused) {
-    dot.style.cssText = 'background:var(--yellow);box-shadow:0 0 6px var(--yellow)';
-    txt.style.color = 'var(--yellow)'; txt.textContent = 'PAUSED';
-    btn.textContent = 'Resume Bot';
+    chip.style.cssText='background:rgba(210,153,34,.08);border-color:rgba(210,153,34,.28)';
+    dot.style.cssText='background:var(--yellow);box-shadow:0 0 5px var(--yellow)';
+    txt.style.color='var(--yellow)'; txt.textContent='PAUSED';
+    btn.textContent='Resume'; btn.classList.add('paused');
   } else {
-    dot.style.cssText = 'background:var(--green);box-shadow:0 0 6px var(--green)';
-    txt.style.color = 'var(--green)'; txt.textContent = 'RUNNING';
-    btn.textContent = 'Pause Bot';
+    chip.style.cssText='background:rgba(63,185,80,.08);border-color:rgba(63,185,80,.22)';
+    dot.style.cssText='background:var(--green);box-shadow:0 0 5px var(--green)';
+    txt.style.color='var(--green)'; txt.textContent='RUNNING';
+    btn.textContent='Pause'; btn.classList.remove('paused');
   }
-  fetch('/pause?state=' + (paused ? '1' : '0'));
+  fetch('/pause?state='+(paused?'1':'0'));
 }
 
 // ── Poll loop ──────────────────────────────────────────────────────────────────
@@ -920,111 +1343,133 @@ async function poll() {
     const r = await fetch('/stats');
     if (!r.ok) return;
     const d = await r.json();
-
     if (d.mem_total_gb)  memTotalGb  = d.mem_total_gb;
     if (d.swap_total_gb) swapTotalGb = d.swap_total_gb;
 
     if (!paused) {
-      // ── charts ──
-      updateChart(cpuChart,  d.cpu_hist  || []);
-      updateChart(memChart,  d.mem_hist  || []);
-      updateChart(swapChart, d.swap_hist || []);
+      const cpu  = (d.cpu_hist  ||[]).at(-1)??0;
+      const mem  = (d.mem_hist  ||[]).at(-1)??0;
+      const swap = (d.swap_hist ||[]).at(-1)??0;
+      const disk = d.disk_pct??0;
+      const cpuC = colorFor(cpu,60,80,'var(--cpu)');
+      const memC = colorFor(mem,60,80,'var(--mem)');
+      const swpC = swap>50?'var(--yellow)':'var(--swap)';
+      const dskC = disk>90?'var(--red)':disk>80?'var(--yellow)':'var(--blue)';
 
-      const cpu  = (d.cpu_hist  || []).at(-1) ?? 0;
-      const mem  = (d.mem_hist  || []).at(-1) ?? 0;
-      const swap = (d.swap_hist || []).at(-1) ?? 0;
+      // charts
+      updateChart(cpuChart,  d.cpu_hist  ||[]);
+      updateChart(swapChart, d.swap_hist ||[]);
+      if (trendVisible) updateChart(memChart, d.mem_hist||[]);
 
-      document.getElementById('cpuLive').textContent  = cpu.toFixed(0)  + '%';
-      document.getElementById('memLive').textContent  = mem.toFixed(0)  + '%';
-      document.getElementById('swapLive').textContent = swap.toFixed(0) + '%';
-      document.getElementById('cpuLive').style.color  = colorFor(cpu,  60, 80, 'var(--cpu)');
-      document.getElementById('memLive').style.color  = colorFor(mem,  60, 80, 'var(--mem)');
-      document.getElementById('swapLive').style.color = swap > 50 ? 'var(--yellow)' : 'var(--swap)';
+      // chart live labels
+      const set=(id,t,c)=>{const e=document.getElementById(id);e.textContent=t;if(c)e.style.color=c;};
+      set('cpuLive', cpu.toFixed(0)+'%', cpuC);
+      set('swapLive',swap.toFixed(0)+'%',swpC);
 
-      // ── resource cards ──
-      setCard('cCpu',  cpu.toFixed(0) + '%', colorFor(cpu, 60, 80, 'var(--cpu)'));
-      setSub('cCpuSub', 'system-wide');
+      // metric strip rings
+      setRing('rCpu',  cpu,  cpuC);
+      setRing('rMem',  mem,  memC);
+      setRing('rSwap', swap, swpC);
+      setRing('rDisk', disk, dskC);
+      set('mCpu',  cpu.toFixed(0)+'%',  cpuC);
+      set('mMem',  mem.toFixed(0)+'%',  memC);
+      set('mSwap', swap.toFixed(0)+'%', swpC);
+      set('mDisk', disk.toFixed(0)+'%', dskC);
+      document.getElementById('mMemSub').textContent  = (memTotalGb*mem/100).toFixed(1)+' / '+memTotalGb.toFixed(1)+' GB';
+      document.getElementById('mSwapSub').textContent = (swapTotalGb*swap/100).toFixed(2)+' / '+swapTotalGb.toFixed(1)+' GB';
+      document.getElementById('mDiskSub').textContent = d.disk_free_gb ? d.disk_free_gb.toFixed(1)+' GB free' : '—';
 
-      const memUsed = (memTotalGb * mem / 100).toFixed(1);
-      setCard('cMem',  mem.toFixed(0) + '%', colorFor(mem, 60, 80, 'var(--mem)'));
-      setSub('cMemSub', memUsed + ' / ' + memTotalGb.toFixed(1) + ' GB');
+      const act=d.actions||0, iss=d.issues||0, freed=d.freed_mb||0;
+      set('mAct', String(act), act>0?'var(--green)':'var(--muted)');
+      set('mIss', String(iss), iss>0?'var(--red)':'var(--muted)');
+      document.getElementById('mIssSub').textContent = freed>=1024?(freed/1024).toFixed(1)+' GB freed':freed.toFixed(0)+' MB freed';
 
-      const swapUsed = (swapTotalGb * swap / 100).toFixed(2);
-      setCard('cSwap', swap.toFixed(0) + '%', swap > 50 ? 'var(--yellow)' : 'var(--swap)');
-      setSub('cSwapSub', swapUsed + ' / ' + swapTotalGb.toFixed(1) + ' GB');
+      // memory hero arc
+      setMemArc(mem, memC);
+      set('memPct', mem.toFixed(0)+'%', memC);
+      document.getElementById('memGb').textContent = (memTotalGb*mem/100).toFixed(1)+' / '+memTotalGb.toFixed(1)+' GB';
 
-      const disk = d.disk_pct ?? 0;
-      setCard('cDisk', disk.toFixed(0) + '%',
-        disk > 90 ? 'var(--red)' : disk > 80 ? 'var(--yellow)' : 'var(--blue)');
-      setSub('cDiskSub', d.disk_free_gb ? d.disk_free_gb.toFixed(1) + ' GB free' : '');
+      // forecast line
+      const fc=d.mem_forecast_min??-1;
+      const fcEl=document.getElementById('memFcLine');
+      if (fc===0)      { fcEl.textContent='⚠ Memory exhausted'; fcEl.className='mem-forecast fc-critical'; }
+      else if (fc>0)   { fcEl.textContent='↑ ~'+fc+' min to 95%'; fcEl.className='mem-forecast '+(fc<5?'fc-critical':fc<15?'fc-warn':'fc-stable'); }
+      else             { fcEl.textContent='✓ Stable'; fcEl.className='mem-forecast fc-stable'; }
 
-      // ── bot stat cards ──
-      const thrKeys  = Object.keys(d.throttled || {});
-      const thrNames = Object.values(d.throttled || {});
-      setCard('cThr', String(thrKeys.length),
-        thrKeys.length > 0 ? 'var(--orange)' : 'var(--muted)');
-      setSub('cThrSub',
-        thrKeys.length > 0 ? thrNames.slice(0, 2).join(', ') : 'no active throttles');
+      // pressure pills (titlebar + badge)
+      const mpl=d.mem_pressure_level||'normal';
+      const mpMap={normal:['🧠 Normal','pill'],warn:['🧠 Warn','pill mem-warn'],critical:['🧠 Critical','pill mem-critical']};
+      const [mpt,mpc]=mpMap[mpl]||mpMap.normal;
+      const mpEl=document.getElementById('memPressurePill'); mpEl.textContent=mpt; mpEl.className=mpc;
+      const mpb=document.getElementById('memPressBadge');    mpb.textContent=mpl.charAt(0).toUpperCase()+mpl.slice(1); mpb.className=mpc;
 
-      setCard('cAct',   String(d.actions), d.actions > 0 ? 'var(--green)' : 'var(--muted)');
-      setCard('cIss',   String(d.issues),  d.issues  > 0 ? 'var(--red)'   : 'var(--muted)');
+      // titlebar pills
+      set('uptimePill','⏱ '+fmtUp(d.uptime_s||0));
+      const pp=document.getElementById('powerPill');
+      pp.textContent=d.on_battery?'🔋 Battery':'⚡ AC';
+      pp.className=d.on_battery?'pill on-battery':'pill';
+      const tp=document.getElementById('thermalPill'), tpct=d.thermal_pct??100;
+      tp.textContent=tpct<100?'🌡 '+tpct+'%':'🌡 Normal'; tp.className=tpct<100?'pill thermal-hot':'pill';
 
-      const freed = d.freed_mb || 0;
-      setCard('cFreed',
-        freed >= 1024 ? (freed / 1024).toFixed(1) + ' GB' : freed.toFixed(0) + ' MB',
-        freed > 0 ? 'var(--blue)' : 'var(--muted)');
-
-      // ── process table ──
-      buildProcTable(d.top_procs || [], thrKeys.map(Number));
-
-      // ── system info panel ──
-      document.getElementById('siMemTotal').textContent =
-        memTotalGb ? memTotalGb.toFixed(1) + ' GB' : '—';
-      document.getElementById('siSwapTotal').textContent =
-        swapTotalGb ? swapTotalGb.toFixed(1) + ' GB' : 'none';
-      document.getElementById('siDiskFree').textContent =
-        d.disk_free_gb ? d.disk_free_gb.toFixed(1) + ' GB' : '—';
-
-      const siThr = document.getElementById('siThrCount');
-      const siList = document.getElementById('siThrList');
-      if (thrKeys.length > 0) {
-        siThr.textContent = thrKeys.length + ' process' + (thrKeys.length > 1 ? 'es' : '');
-        siThr.style.color = 'var(--orange)';
-        siList.textContent = thrNames.join('\n');
-      } else {
-        siThr.textContent = 'none'; siThr.style.color = 'var(--muted)';
-        siList.textContent = '';
+      // breakdown bar
+      const vbd=d.vm_breakdown||{};
+      if (vbd.wired!==undefined) {
+        const tot=(vbd.wired||0)+(vbd.active||0)+(vbd.inactive||0)+(vbd.compressed||0)+(vbd.free||0);
+        if (tot>0) {
+          const w=v=>Math.max(0.5,(v||0)/tot*100).toFixed(1)+'%';
+          document.getElementById('bdBar').innerHTML=
+            `<div class="bds bds-wired"      style="width:${w(vbd.wired)}"></div>`+
+            `<div class="bds bds-active"     style="width:${w(vbd.active)}"></div>`+
+            `<div class="bds bds-inactive"   style="width:${w(vbd.inactive)}"></div>`+
+            `<div class="bds bds-compressed" style="width:${w(vbd.compressed)}"></div>`+
+            `<div class="bds bds-free"       style="flex:1"></div>`;
+        }
+        set('bdWired',     fmtMb(vbd.wired));
+        set('bdActive',    fmtMb(vbd.active));
+        set('bdInactive',  fmtMb(vbd.inactive));
+        set('bdCompressed',fmtMb(vbd.compressed));
+        set('bdFree',      fmtMb(vbd.free));
+        set('bdPurgeable', fmtMb(vbd.purgeable));
       }
 
-      // ── titlebar pills ──
-      document.getElementById('uptimePill').textContent = '⏱ ' + fmtUptime(d.uptime_s || 0);
+      // vm rows
+      set('vsRam',    memTotalGb?memTotalGb.toFixed(1)+' GB':'—');
+      set('vsSwap',   (swapTotalGb*swap/100).toFixed(2)+' / '+swapTotalGb.toFixed(1)+' GB');
+      set('vsDisk',   d.disk_free_gb?d.disk_free_gb.toFixed(1)+' GB':'—');
+      set('vsUptime', fmtUp(d.uptime_s||0));
 
-      const pp = document.getElementById('powerPill');
-      if (d.on_battery) {
-        pp.textContent = '🔋 Battery'; pp.className = 'pill battery';
-      } else {
-        pp.textContent = '⚡ AC'; pp.className = 'pill';
+      // memory families
+      const anc=d.mem_ancestry||[];
+      if (anc.length) {
+        const mx=anc[0].mb||1;
+        document.getElementById('familyList').innerHTML=anc.slice(0,8).map(a=>{
+          const letter=(a.app||'?').charAt(0).toUpperCase();
+          const bw=Math.round(a.mb/mx*100);
+          const bc=a.pct>20?'var(--red)':a.pct>10?'var(--yellow)':'var(--mem)';
+          return `<div class="fam-row">
+            <div class="fam-icon">${letter}</div>
+            <div class="fam-name">${a.app}</div>
+            <div class="fam-bar-wrap"><div class="fam-bar"><div class="fam-bar-fill" style="width:${bw}%;background:${bc}"></div></div></div>
+            <div class="fam-mb">${fmtMb(a.mb)} (${a.pct}%)</div>
+          </div>`;
+        }).join('');
       }
 
-      const tp = document.getElementById('thermalPill');
-      const tpct = d.thermal_pct ?? 100;
-      if (tpct < 100) {
-        tp.textContent = '🌡 ' + tpct + '%'; tp.className = 'pill thermal-hot';
-      } else {
-        tp.textContent = '🌡 Normal'; tp.className = 'pill';
-      }
+      // bot status
+      const thrKeys=Object.keys(d.throttled||{}), thrNames=Object.values(d.throttled||{});
+      set('bsThr',  String(thrKeys.length), thrKeys.length>0?'var(--orange)':'var(--muted)');
+      set('bsThrSub', thrKeys.length>0?thrNames[0]:'none active');
+      set('bsAct',  String(act), act>0?'var(--green)':'var(--muted)');
+      set('bsIss',  String(iss), iss>0?'var(--red)':'var(--muted)');
+      set('bsFreed',freed>=1024?(freed/1024).toFixed(1)+' GB':freed.toFixed(0)+' MB', freed>0?'var(--blue)':'var(--muted)');
+      document.getElementById('thrNames').textContent=thrNames.join('\n');
 
-      // ── footer ──
-      document.getElementById('lastUpdate').textContent =
-        'Last update: ' + new Date().toLocaleTimeString();
+      buildProcTable(d.top_procs||[], thrKeys.map(Number));
+      document.getElementById('lastUpdate').textContent='Last update: '+new Date().toLocaleTimeString();
     }
-
-    // events always drain (even when paused)
-    (d.events || []).forEach(ev => addEvent(ev));
-
-  } catch (e) { /* server restarting */ }
+    (d.events||[]).forEach(ev=>addEvent(ev));
+  } catch(e) {}
 }
-
 setInterval(poll, 1000);
 poll();
 </script>
@@ -1046,6 +1491,23 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/":
             self._send(200, "text/html; charset=utf-8", HTML.encode())
+        elif path == "/manifest.json":
+            m = json.dumps({
+                "name": "Performance Bot",
+                "short_name": "PerfBot",
+                "description": "macOS system performance monitor & auto-remediation",
+                "start_url": "/",
+                "display": "standalone",
+                "background_color": "#0d1117",
+                "theme_color": "#0d1117",
+                "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"}]
+            })
+            self._send(200, "application/manifest+json", m.encode())
+        elif path == "/icon.svg":
+            svg = (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+                   b'<rect width="100" height="100" rx="22" fill="#1f6feb"/>'
+                   b'<text y=".9em" font-size="86" x="7">&#x26A1;</text></svg>')
+            self._send(200, "image/svg+xml", svg)
         elif path == "/stats":
             snap = _engine.snapshot()
             try:
