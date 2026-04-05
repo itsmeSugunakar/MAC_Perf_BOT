@@ -73,6 +73,13 @@ FREEZE_PATTERNS      = (      # background daemons safe to SIGSTOP temporarily
     "triald", "UsageTrackingAgent", "com.apple.ap.adprivacyd",
 )
 
+# ─── Predictive Remediation Engine constants ──────────────────────────────────
+TTE_TIER2_MIN    = 10.0   # trigger Tier 2 early when TTE ≤ this many minutes
+TTE_TIER3_MIN    =  5.0   # trigger Tier 3 early when TTE ≤ this
+TTE_TIER4_MIN    =  2.0   # trigger Tier 4 early when TTE ≤ this
+TTE_MIN_SAMPLES  = 20     # minimum mem_hist samples before TTE can drive escalation
+XPC_RESPAWN_S    = 10     # seconds; services restarting within this window → blocklisted
+
 
 # ─── Bot Engine ───────────────────────────────────────────────────────────────
 class BotEngine(threading.Thread):
@@ -112,6 +119,12 @@ class BotEngine(threading.Thread):
         self._frozen_pids        = {}         # pid → (name, freeze_ts, rss_mb)
         self._last_freeze        = 0.0
         self._last_ancestry      = 0.0
+        # ── Predictive Remediation Engine state ─────────────────────────────
+        self.effective_tier       = 0         # actual tier being acted on (may exceed threshold_tier)
+        self.predictive_escalation = False    # True when TTE drove tier above static threshold
+        self._ram_pressure_lock   = False     # True during Tier 3+ — blocks CPU nice(0) restoration
+        self._no_kill             = set()     # process names blocklisted after XPC respawn detection
+        self._terminated_ts       = {}        # name → timestamp of last SIGTERM
 
     # ── public ────────────────────────────────────────────────────────────────
     def stop(self):
@@ -134,10 +147,14 @@ class BotEngine(threading.Thread):
                 "uptime_s":      int(time.time() - self._start_time),
                 "mem_total_gb":       round(self._mem_total_gb, 1),
                 "swap_total_gb":      round(self._swap_total_gb, 1),
-                "mem_pressure_level": self.mem_pressure_level,
-                "vm_breakdown":       dict(self.vm_breakdown),
-                "mem_forecast_min":   self.mem_forecast_min,
-                "mem_ancestry":       list(self.mem_ancestry),
+                "mem_pressure_level":   self.mem_pressure_level,
+                "vm_breakdown":         dict(self.vm_breakdown),
+                "mem_forecast_min":     self.mem_forecast_min,
+                "mem_ancestry":         list(self.mem_ancestry),
+                "effective_tier":       self.effective_tier,
+                "predictive_escalation": self.predictive_escalation,
+                "cpu_ram_lock":         self._ram_pressure_lock,
+                "xpc_blocked":          len(self._no_kill),
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
@@ -165,6 +182,7 @@ class BotEngine(threading.Thread):
                 if tick % 60  == 0: self._check_zombies()
                 if tick % 60  == 0: self._track_memory_leaks()
                 if tick % 300 == 0 and tick > 0: self._check_caches()
+                if tick % 10  == 0: self._detect_xpc_respawn()
             except Exception as exc:
                 self._emit("warn", f"Engine error: {exc}")
             tick += 1
@@ -196,14 +214,40 @@ class BotEngine(threading.Thread):
 
     def _check_cpu(self):
         with self._lock:
-            hist = list(self.cpu_hist)
+            hist          = list(self.cpu_hist)
+            ram_lock      = self._ram_pressure_lock
+            ancestry_snap = list(self.mem_ancestry)   # [{app, mb, pct}]
         if not hist: return
-        # restore calmed procs
+
+        # Build set of root-app names that are top RAM owners under lock
+        high_ram_families: set = set()
+        if ram_lock and ancestry_snap:
+            # top-3 families by MB are considered dominant RAM holders
+            for entry in ancestry_snap[:3]:
+                high_ram_families.add(entry["app"].lower())
+
+        # restore calmed procs — but defer if CPU-RAM conflict detected
         for pid in list(self.throttled):
             try:
                 p = psutil.Process(pid)
                 c = p.cpu_percent(interval=None) / (psutil.cpu_count(logical=True) or 1)
                 if c < CPU_WARN / 2:
+                    # CPU-RAM conflict resolution: if memory Tier 3+ is active and this
+                    # process belongs to a high-RSS family, block nice(0) restoration —
+                    # restoring priority would allow it to re-expand its memory footprint
+                    if ram_lock:
+                        try:
+                            proc_name = p.name().lower()
+                            # check if this process's ancestry maps to a high-RAM family
+                            if any(fam in proc_name or proc_name in fam
+                                   for fam in high_ram_families):
+                                self._emit("info",
+                                    f"CPU-RAM LOCK: deferring priority restore for "
+                                    f"{p.name()} (PID {pid}) — top RAM family under "
+                                    f"Tier 3+ pressure ({c:.0f}% CPU, lock active)")
+                                continue   # skip nice(0) — do NOT restore priority
+                        except Exception:
+                            pass
                     p.nice(0)
                     name = self.throttled.pop(pid)
                     self.actions += 1
@@ -234,23 +278,51 @@ class BotEngine(threading.Thread):
 
     def _check_memory(self):
         vm = psutil.virtual_memory()
-        if vm.percent >= MEM_WARN:
+        mem_pct = vm.percent
+
+        # ── Compute effective tier (static % + TTE predictive escalation) ─────
+        effective_tier, threshold_tier = self._compute_effective_tier(mem_pct)
+        was_predictive = effective_tier > threshold_tier
+        with self._lock:
+            self.effective_tier        = effective_tier
+            self.predictive_escalation = was_predictive
+            self._ram_pressure_lock    = (effective_tier >= 3)
+
+        if mem_pct >= MEM_WARN or effective_tier >= 1:
             self.issues += 1
             used_gb = (vm.total - vm.available) / 1e9
             self._emit("issue",
-                f"RAM pressure: {vm.percent:.0f}% used "
+                f"RAM pressure: {mem_pct:.0f}% used "
                 f"({used_gb:.1f} / {vm.total/1e9:.1f} GB)")
+
+            # Predictive escalation announcement
+            if was_predictive:
+                tte = self.mem_forecast_min
+                self._emit("warn",
+                    f"PREDICTIVE ESCALATION: TTE={tte:.1f} min → "
+                    f"acting at Tier {effective_tier} "
+                    f"(static threshold would be Tier {threshold_tier}) "
+                    f"— intervening {TTE_TIER2_MIN - tte:.1f} min early")
+
             # report top consumers with cooldown
             now = time.time()
             if now - self._last_consumer >= CONSUMER_COOL_S:
                 self._last_consumer = now
                 self._report_memory_consumers()
+
             # MMIE: escalate through tiered remediation cascade
-            if vm.percent >= MEM_TIER2_PCT:
-                self._tiered_memory_remediation(vm.percent)
-        elif vm.percent < MEM_WARN - 5 and self._frozen_pids:
-            # pressure has eased — restore frozen daemons
-            self._thaw_frozen_daemons()
+            if effective_tier >= 2:
+                self._tiered_memory_remediation(mem_pct, effective_tier)
+
+        elif mem_pct < MEM_WARN - 5:
+            # pressure has eased — release RAM lock and restore frozen daemons
+            with self._lock:
+                self._ram_pressure_lock = False
+                self.effective_tier     = 0
+                self.predictive_escalation = False
+            if self._frozen_pids:
+                self._thaw_frozen_daemons()
+
         swap = psutil.swap_memory()
         if swap.total > 0:
             if swap.percent >= SWAP_WARN and not self._swap_warned:
@@ -380,7 +452,10 @@ class BotEngine(threading.Thread):
             pass
 
     def _sweep_idle_services(self):
-        """Auto-terminate sleeping XPC helpers / widget extensions eating RAM."""
+        """Auto-terminate sleeping XPC helpers / widget extensions eating RAM.
+        Respects _no_kill blocklist populated by _detect_xpc_respawn() — services
+        that launchd immediately restarts are skipped to avoid futile kill loops.
+        """
         swept = []
         for p in psutil.process_iter(["pid", "name", "status",
                                        "memory_info", "username", "cpu_percent"]):
@@ -390,6 +465,8 @@ class BotEngine(threading.Thread):
                 if name in PROTECTED or name in NEVER_TERMINATE: continue
                 if "Python" in name or "python" in name: continue
                 if p.pid in self._terminated: continue
+                # XPC respawn guard — skip blocklisted services
+                if name in self._no_kill: continue
 
                 stat = p.info["status"]
                 cpu  = p.cpu_percent(interval=None) / (psutil.cpu_count(logical=True) or 1)
@@ -405,6 +482,7 @@ class BotEngine(threading.Thread):
 
                 p.terminate()
                 self._terminated.add(p.pid)
+                self._terminated_ts[name] = time.time()   # record for respawn detection
                 self.freed_mb += rss
                 self.actions  += 1
                 swept.append((name, p.pid, rss))
@@ -420,6 +498,72 @@ class BotEngine(threading.Thread):
             self._emit("fix",
                 f"Idle sweep: {len(swept)} services cleared, "
                 f"~{total:.0f} MB freed (session total: {self.freed_mb:.0f} MB)")
+
+    # ── Predictive Remediation Engine ─────────────────────────────────────────
+
+    def _compute_effective_tier(self, mem_pct: float):
+        """
+        Determine the effective remediation tier by combining static RAM-% thresholds
+        with the OLS Time-to-Exhaustion forecast. When TTE predicts imminent exhaustion,
+        the effective tier is escalated ABOVE what the raw percentage would trigger —
+        this is the core of the Predictive Remediation Engine patent claim.
+
+        Returns: (effective_tier: int, threshold_tier: int)
+          threshold_tier = tier driven by mem_pct alone (0–4)
+          effective_tier = tier after TTE escalation (may exceed threshold_tier)
+        """
+        # ── Threshold tier from static percentages ────────────────────────────
+        if   mem_pct >= MEM_TIER4_PCT: threshold_tier = 4
+        elif mem_pct >= MEM_TIER3_PCT: threshold_tier = 3
+        elif mem_pct >= MEM_TIER2_PCT: threshold_tier = 2
+        elif mem_pct >= MEM_WARN:      threshold_tier = 1
+        else:                          threshold_tier = 0
+
+        # ── TTE escalation — only when we have enough history ─────────────────
+        with self._lock:
+            hist_len = len(self.mem_hist)
+            tte      = self.mem_forecast_min
+        if hist_len < TTE_MIN_SAMPLES or tte < 0:
+            return threshold_tier, threshold_tier   # stable/declining — no escalation
+
+        predictive_tier = threshold_tier
+        if   tte <= TTE_TIER4_MIN: predictive_tier = max(predictive_tier, 4)
+        elif tte <= TTE_TIER3_MIN: predictive_tier = max(predictive_tier, 3)
+        elif tte <= TTE_TIER2_MIN: predictive_tier = max(predictive_tier, 2)
+
+        return predictive_tier, threshold_tier
+
+    def _detect_xpc_respawn(self):
+        """
+        XPC Respawn Guard: scan running processes against the recently terminated set.
+        Any service that reappears within XPC_RESPAWN_S seconds is launchd-managed and
+        cannot be durably terminated — add it to _no_kill to prevent futile kill loops.
+        """
+        if not self._terminated_ts:
+            return
+        now = time.time()
+        stale = [name for name, ts in self._terminated_ts.items()
+                 if now - ts > XPC_RESPAWN_S * 6]
+        for name in stale:
+            self._terminated_ts.pop(name, None)
+
+        running_names = set()
+        try:
+            for p in psutil.process_iter(["name"]):
+                try:
+                    running_names.add(p.name())
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception:
+            return
+
+        for name, ts in list(self._terminated_ts.items()):
+            if name in running_names and now - ts <= XPC_RESPAWN_S:
+                if name not in self._no_kill:
+                    self._no_kill.add(name)
+                    self._emit("warn",
+                        f"XPC RESPAWN GUARD: {name} relaunched within {XPC_RESPAWN_S}s "
+                        f"— blocklisted (launchd-managed service, termination futile)")
 
     # ── MMIE: Multi-Dimensional Memory Intelligence Engine ────────────────────
 
@@ -572,13 +716,14 @@ class BotEngine(threading.Thread):
             with self._lock:
                 self.mem_ancestry = ancestry
 
-    def _tiered_memory_remediation(self, mem_pct: float):
+    def _tiered_memory_remediation(self, mem_pct: float, effective_tier: int = 2):
         """
-        4-tier adaptive remediation cascade:
-          Tier 2 (≥82%): vm_stat breakdown + purgeable advisory + memory genealogy
-          Tier 3 (≥87%): SIGSTOP safe background daemons to pause their RSS
-          Tier 4 (≥92%): Delegate to _sweep_idle_services for emergency termination
-        (Tier 1 ≥80% is handled by existing _check_memory path.)
+        4-tier adaptive remediation cascade — driven by effective_tier (which may
+        have been escalated above the static threshold by the Predictive Remediation Engine):
+          Tier 2 (≥82% OR TTE≤10 min): vm_stat breakdown + purgeable advisory + ancestry
+          Tier 3 (≥87% OR TTE≤5 min):  SIGSTOP background daemons via genealogy scoring
+          Tier 4 (≥92% OR TTE≤2 min):  Emergency idle-XPC termination
+        (Tier 1 ≥80% is handled by _check_memory.)
         """
         now = time.time()
 
@@ -617,23 +762,37 @@ class BotEngine(threading.Thread):
                 )
                 self._emit("issue", f"Memory genealogy (top families): {summary}")
 
-        # ── Tier 3: freeze idle background daemons ────────────────────────────
-        if mem_pct >= MEM_TIER3_PCT and now - self._last_freeze >= FREEZE_COOL_S:
+        # ── Tier 3: freeze idle background daemons (genealogy-guided) ─────────
+        if effective_tier >= 3 and now - self._last_freeze >= FREEZE_COOL_S:
             self._freeze_background_daemons()
 
         # ── Tier 4: emergency termination ────────────────────────────────────
-        if mem_pct >= MEM_TIER4_PCT:
+        if effective_tier >= 4:
             self._sweep_idle_services()
 
     def _freeze_background_daemons(self):
         """
-        SIGSTOP background daemons matching safe patterns when under severe
-        memory pressure (Tier 3). _thaw_frozen_daemons() reverses this when
-        pressure drops below MEM_WARN - 5%.
+        Genealogy-guided SIGSTOP: score background daemon candidates using two signals:
+          family_match (weight 2): process belongs to a top-RSS application family
+                                   identified by the ppid-tree genealogy walk
+          pattern_match (weight 1): name matches the known-safe FREEZE_PATTERNS list
+        Candidates are sorted by (score DESC, rss DESC) so that daemons belonging to
+        the heaviest RAM-owning families are frozen first — maximally targeted pressure
+        relief rather than arbitrary pattern matching.
         """
         self._last_freeze = time.time()
-        frozen, freed_mb = 0, 0.0
-        for p in psutil.process_iter(["pid", "name", "status", "username", "memory_info"]):
+
+        # Snapshot ancestry for genealogy scoring
+        with self._lock:
+            ancestry_snap = list(self.mem_ancestry)  # [{app, mb, pct}]
+
+        # Build set of root-app names that own significant RAM (top 5 families)
+        heavy_families = {entry["app"].lower() for entry in ancestry_snap[:5]}
+
+        # ── Score all candidate processes ─────────────────────────────────────
+        candidates = []
+        for p in psutil.process_iter(["pid", "name", "ppid", "status",
+                                       "username", "memory_info"]):
             try:
                 if p.info["username"] == "root":
                     continue
@@ -642,18 +801,57 @@ class BotEngine(threading.Thread):
                     continue
                 if p.pid in self._frozen_pids:
                     continue
-                if not any(pat in name for pat in FREEZE_PATTERNS):
-                    continue
                 if p.info["status"] not in ("sleeping", "idle"):
                     continue
+
                 rss = (p.info.get("memory_info") or p.memory_info()).rss / 1e6
-                p.send_signal(19)  # SIGSTOP — suspend without terminating
-                self._frozen_pids[p.pid] = (name, time.time(), rss)
+
+                # Scoring: genealogy match outweighs pattern match
+                pattern_match = int(any(pat in name for pat in FREEZE_PATTERNS))
+                name_lower    = name.lower()
+                family_match  = int(any(fam in name_lower or name_lower in fam
+                                        for fam in heavy_families))
+                score = family_match * 2 + pattern_match
+
+                if score == 0:
+                    continue   # not a freeze candidate at all
+
+                candidates.append((score, rss, p.pid, name, p))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        # Sort: highest score first, then highest RSS
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+        frozen, freed_mb = 0, 0.0
+        for score, rss, pid, name, p in candidates:
+            try:
+                p.send_signal(19)  # SIGSTOP — reversible suspension
+                self._frozen_pids[pid] = (name, time.time(), rss)
                 freed_mb += rss
                 frozen   += 1
                 self.actions += 1
+
+                # Emit genealogy attribution when family-matched
+                with self._lock:
+                    ancestry_snap2 = list(self.mem_ancestry)
+                family_info = next(
+                    (f"{e['app']} family ({e['mb']}MB)"
+                     for e in ancestry_snap2
+                     if e["app"].lower() in name.lower() or name.lower() in e["app"].lower()),
+                    None
+                )
+                if family_info:
+                    self._emit("fix",
+                        f"GENEALOGY FREEZE: {name} (PID {pid}, {rss:.0f}MB) "
+                        f"← {family_info} — SIGSTOP applied")
+                else:
+                    self._emit("fix",
+                        f"PATTERN FREEZE: {name} (PID {pid}, {rss:.0f}MB) "
+                        f"— SIGSTOP applied (score={score})")
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
+
         if frozen:
             self.freed_mb += freed_mb
             self._emit("fix",
@@ -1121,6 +1319,11 @@ HTML = r"""<!DOCTYPE html>
           <div class="mem-pct" id="memPct" style="color:var(--mem)">—</div>
           <div class="mem-gb" id="memGb">— / — GB</div>
           <div class="mem-forecast" id="memFcLine"></div>
+          <div id="predBanner" style="display:none;margin-top:5px;padding:3px 7px;
+            border-radius:4px;font-size:9px;font-weight:600;letter-spacing:.5px;
+            background:rgba(227,179,65,.15);color:#e3b341;border:1px solid rgba(227,179,65,.3)">
+            ⚡ PREDICTIVE ESCALATION ACTIVE
+          </div>
         </div>
       </div>
 
@@ -1157,6 +1360,18 @@ HTML = r"""<!DOCTYPE html>
         <div class="vmrow">
           <span class="vmkey">Uptime</span>
           <span class="vmval" id="vsUptime">—</span>
+        </div>
+        <div class="vmrow" style="border-top:1px solid var(--border);margin-top:3px;padding-top:4px">
+          <span class="vmkey">Active Tier</span>
+          <span class="vmval" id="vsActiveTier" style="font-weight:700">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">CPU-RAM Lock</span>
+          <span class="vmval" id="vsCpuLock">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">XPC Blocked</span>
+          <span class="vmval" id="vsXpcBlocked">—</span>
         </div>
       </div>
 
@@ -1437,6 +1652,27 @@ async function poll() {
       set('vsSwap',   (swapTotalGb*swap/100).toFixed(2)+' / '+swapTotalGb.toFixed(1)+' GB');
       set('vsDisk',   d.disk_free_gb?d.disk_free_gb.toFixed(1)+' GB':'—');
       set('vsUptime', fmtUp(d.uptime_s||0));
+
+      // Predictive Remediation Engine rows
+      const tierLabels = ['—','Tier 1 · Observe','Tier 2 · Advisory','Tier 3 · Freeze','Tier 4 · Terminate'];
+      const tierColors = ['var(--muted)','var(--blue)','var(--yellow)','var(--orange)','var(--red)'];
+      const etier = d.effective_tier||0;
+      const tierEl = document.getElementById('vsActiveTier');
+      tierEl.textContent = tierLabels[etier] || ('Tier '+etier);
+      tierEl.style.color = tierColors[etier] || 'var(--muted)';
+
+      const lockEl = document.getElementById('vsCpuLock');
+      if (d.cpu_ram_lock) { lockEl.textContent='Active'; lockEl.style.color='var(--orange)'; }
+      else                { lockEl.textContent='Off';    lockEl.style.color='var(--muted)';  }
+
+      const xpcEl = document.getElementById('vsXpcBlocked');
+      const xpcN = d.xpc_blocked||0;
+      if (xpcN>0) { xpcEl.textContent=xpcN+' blocked'; xpcEl.style.color='var(--yellow)'; }
+      else        { xpcEl.textContent='None';           xpcEl.style.color='var(--muted)';  }
+
+      // Predictive escalation banner
+      const predBanner = document.getElementById('predBanner');
+      predBanner.style.display = d.predictive_escalation ? 'block' : 'none';
 
       // memory families
       const anc=d.mem_ancestry||[];
