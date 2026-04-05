@@ -15,9 +15,12 @@ from pathlib import Path
 
 try:
     import psutil
-except ImportError:
-    subprocess.run([sys.executable, "-m", "pip", "install", "psutil", "-q"], check=True)
-    import psutil
+except ImportError as exc:
+    raise SystemExit(
+        "Missing required dependency 'psutil'. "
+        "Install it during setup (for example: "
+        f"'{sys.executable} -m pip install psutil') and then rerun performance_bot."
+    ) from exc
 
 # ── Config ──────────────────────────────────────────────────────────────────
 LOG_DIR = Path.home() / "Library" / "Logs" / "performance-bot"
