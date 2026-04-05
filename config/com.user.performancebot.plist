@@ -10,8 +10,8 @@
     <!-- Full path to python3 and the script -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>/Users/sivaranjani/performance-bot/performance_bot.py</string>
+        <string>/opt/homebrew/bin/python3.11</string>
+        <string>/Users/sivaranjani/performance-bot/app/performance_bot.py</string>
     </array>
 
     <!-- Start automatically at login -->
