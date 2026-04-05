@@ -67,6 +67,7 @@ bash scripts/uninstall.sh
 ## How It Works
 
 Every second the bot engine:
+
 1. Samples CPU, RAM, Disk, Swap via `psutil`
 2. Identifies processes exceeding **85 % CPU** per core and renices them to `nice=10`
 3. Restores `nice(0)` automatically when CPU drops back below 35 %
@@ -77,28 +78,28 @@ Every second the bot engine:
 
 ### MMIE Remediation Tiers
 
-| Tier | Trigger | Action |
-|------|---------|--------|
-| 1 | ≥ 80 % RAM | Log issue + identify top RSS consumers |
-| 2 | ≥ 82 % RAM | Report purgeable memory + wired pressure + memory genealogy |
-| 3 | ≥ 87 % RAM | SIGSTOP safe background daemons; SIGCONT auto-restores on pressure drop |
-| 4 | ≥ 92 % RAM | Emergency termination of idle XPC / widget services |
+| Tier | Trigger    | Action                                                                  |
+| ---- | ---------- | ----------------------------------------------------------------------- |
+| 1    | ≥ 80 % RAM | Log issue + identify top RSS consumers                                  |
+| 2    | ≥ 82 % RAM | Report purgeable memory + wired pressure + memory genealogy             |
+| 3    | ≥ 87 % RAM | SIGSTOP safe background daemons; SIGCONT auto-restores on pressure drop |
+| 4    | ≥ 92 % RAM | Emergency termination of idle XPC / widget services                     |
 
 ## Dashboard
 
 The dashboard is a **Progressive Web App** served at `http://127.0.0.1:8765`.
 
-| Panel | Contents |
-|-------|----------|
-| Metric strip | SVG ring gauges for CPU / Memory / Swap / Disk + Actions / Issues |
+| Panel               | Contents                                                                                                                               |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Metric strip        | SVG ring gauges for CPU / Memory / Swap / Disk + Actions / Issues                                                                      |
 | Memory Intelligence | Arc gauge, % + GB, memory forecast ETA, composition bar (wired/active/inactive/compressed/free), vm_stat details, memory families list |
-| CPU / Swap charts | 90-second sparklines with warn threshold line |
-| Bot Status | Throttled count, total actions, issues, RAM freed |
-| Activity Log | Live event feed — FIX / WARN / ISSUE / INFO |
-| Process Table | Top 12 processes with CPU/MEM bars; throttled badge; toggleable memory trend chart |
+| CPU / Swap charts   | 90-second sparklines with warn threshold line                                                                                          |
+| Bot Status          | Throttled count, total actions, issues, RAM freed                                                                                      |
+| Activity Log        | Live event feed — FIX / WARN / ISSUE / INFO                                                                                            |
+| Process Table       | Top 12 processes with CPU/MEM bars; throttled badge; toggleable memory trend chart                                                     |
 
 Activity log colours: 🟢 FIX &nbsp; 🟡 WARN &nbsp; 🔴 ISSUE &nbsp; 🔵 INFO
 
 ## License
 
-MIT
+Itzzdata
