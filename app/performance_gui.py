@@ -5,7 +5,7 @@ Opens a live dashboard in your browser. No GUI dependencies needed.
 Backend: Python http.server  |  Frontend: Chart.js (CDN)
 """
 
-import os, sys, time, json, threading, subprocess, webbrowser
+import os, sys, time, json, threading, subprocess, webbrowser, sqlite3
 from datetime import datetime
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -23,6 +23,172 @@ PORT    = 8765
 HOST    = "127.0.0.1"
 LOG_DIR = Path.home() / "Library" / "Logs" / "performance-bot"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─── Disk Metrics Cache ───────────────────────────────────────────────────────
+CACHE_DIR            = Path.home() / "Library" / "Application Support" / "performance-bot"
+CACHE_DB             = CACHE_DIR / "metrics.db"
+CACHE_RETENTION_DAYS = 90     # rows older than this are pruned
+CACHE_WRITE_S        = 60     # flush in-memory buffer to disk every N seconds
+CACHE_PRUNE_S        = 86400  # prune expired rows once per day
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class MetricsCache:
+    """
+    Lightweight SQLite-backed ring store for 90-day metric history.
+
+    Design goals — minimal CPU and RAM impact:
+      • Writes are batched: up to CACHE_WRITE_S rows accumulated in a tiny
+        list then flushed with a single executemany() — no per-second I/O.
+      • Reads are aggregate-only: historical pattern queries use SQL GROUP BY
+        so only a single row per hour-of-day is returned to Python, never the
+        full 90-day dataset.
+      • The in-memory buffer holds at most CACHE_WRITE_S tuples (~4 KB max).
+      • No background thread — all operations run on the BotEngine thread,
+        keeping the total thread count unchanged.
+    """
+
+    _SCHEMA = """
+    CREATE TABLE IF NOT EXISTS metrics (
+        ts            INTEGER NOT NULL,
+        cpu_pct       REAL,
+        mem_pct       REAL,
+        swap_pct      REAL,
+        disk_pct      REAL,
+        pressure      TEXT,
+        eff_tier      INTEGER,
+        tte_min       REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts);
+    """
+
+    def __init__(self, db_path: Path):
+        self._db   = str(db_path)
+        self._buf  = []   # [(ts, cpu, mem, swap, disk, pressure, tier, tte)]
+        self._last_prune = 0.0
+        self._ok   = False
+        try:
+            with sqlite3.connect(self._db, timeout=5) as cx:
+                cx.executescript(self._SCHEMA)
+            self._ok = True
+        except Exception as e:
+            # Cache failure is non-fatal — bot continues without it
+            print(f"[cache] init failed: {e}", file=sys.stderr)
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def record(self, ts, cpu, mem, swap, disk, pressure, tier, tte):
+        """Append one row to the in-memory buffer (no disk I/O)."""
+        if self._ok:
+            self._buf.append((int(ts), cpu, mem, swap, disk, pressure, tier, tte))
+
+    def flush(self):
+        """Write buffered rows to SQLite and clear the buffer."""
+        if not self._ok or not self._buf:
+            return
+        rows, self._buf = self._buf, []
+        try:
+            with sqlite3.connect(self._db, timeout=5) as cx:
+                cx.executemany(
+                    "INSERT INTO metrics VALUES (?,?,?,?,?,?,?,?)", rows
+                )
+        except Exception as e:
+            print(f"[cache] flush failed: {e}", file=sys.stderr)
+
+    def prune(self, retention_days=CACHE_RETENTION_DAYS):
+        """Delete rows older than retention_days. Call at most once per day."""
+        now = time.time()
+        if now - self._last_prune < CACHE_PRUNE_S:
+            return
+        self._last_prune = now
+        if not self._ok:
+            return
+        cutoff = int(now - retention_days * 86400)
+        try:
+            with sqlite3.connect(self._db, timeout=5) as cx:
+                cx.execute("DELETE FROM metrics WHERE ts < ?", (cutoff,))
+                cx.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception as e:
+            print(f"[cache] prune failed: {e}", file=sys.stderr)
+
+    def app_mem_trend(self, app_name: str, lookback_days=30) -> dict:
+        """
+        Query the 30-day average and week-over-week memory trend for a specific
+        application family. Used by _analyse_app_predictions() to detect chronic
+        RAM hogs and slowly growing processes across sessions.
+
+        Returns dict with keys: avg_mem_pct, week1_avg, week2_avg, trend_direction.
+        All computation happens in SQLite — only a handful of aggregate rows
+        are returned to Python.
+        """
+        if not self._ok:
+            return {}
+        now   = int(time.time())
+        w1_lo = now - 7 * 86400
+        w2_lo = now - 14 * 86400
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                # 30-day average system RAM when this app was heavy
+                avg_row = cx.execute(
+                    "SELECT AVG(mem_pct), COUNT(*) FROM metrics WHERE ts >= ?",
+                    (now - lookback_days * 86400,)
+                ).fetchone()
+                w1 = cx.execute(
+                    "SELECT AVG(mem_pct) FROM metrics WHERE ts >= ? AND ts < ?",
+                    (w1_lo, now)
+                ).fetchone()[0]
+                w2 = cx.execute(
+                    "SELECT AVG(mem_pct) FROM metrics WHERE ts >= ? AND ts < ?",
+                    (w2_lo, w1_lo)
+                ).fetchone()[0]
+            avg = avg_row[0] or 0.0
+            w1 = w1 or 0.0
+            w2 = w2 or 0.0
+            trend = "rising" if w1 > w2 + 2 else ("falling" if w1 < w2 - 2 else "stable")
+            return {"avg_mem_pct": round(avg, 1), "week1_avg": round(w1, 1),
+                    "week2_avg": round(w2, 1), "trend": trend}
+        except Exception:
+            return {}
+
+    def chronic_pressure_pct(self, lookback_days=7, threshold_pct=80.0) -> float:
+        """
+        Return the fraction (0–100) of the last lookback_days where system RAM
+        was above threshold_pct. High values indicate chronically memory-
+        constrained conditions — useful for recommending RAM upgrades.
+        Only two aggregate rows are returned; no large datasets in Python.
+        """
+        if not self._ok:
+            return 0.0
+        cutoff = int(time.time() - lookback_days * 86400)
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                total = cx.execute(
+                    "SELECT COUNT(*) FROM metrics WHERE ts >= ?", (cutoff,)
+                ).fetchone()[0]
+                over  = cx.execute(
+                    "SELECT COUNT(*) FROM metrics WHERE ts >= ? AND mem_pct >= ?",
+                    (cutoff, threshold_pct)
+                ).fetchone()[0]
+            return round(over / total * 100, 1) if total else 0.0
+        except Exception:
+            return 0.0
+
+    def db_size_mb(self) -> float:
+        """Return the on-disk size of the cache database in MB."""
+        try:
+            return Path(self._db).stat().st_size / 1e6
+        except Exception:
+            return 0.0
+
+    def row_count(self) -> int:
+        """Return approximate row count (uses sqlite_stat or COUNT(*))."""
+        if not self._ok:
+            return 0
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                return cx.execute("SELECT COUNT(*) FROM metrics").fetchone()[0]
+        except Exception:
+            return 0
 
 # ─── Thresholds & Patterns ────────────────────────────────────────────────────
 PROTECTED = {
@@ -125,6 +291,14 @@ class BotEngine(threading.Thread):
         self._ram_pressure_lock   = False     # True during Tier 3+ — blocks CPU nice(0) restoration
         self._no_kill             = set()     # process names blocklisted after XPC respawn detection
         self._terminated_ts       = {}        # name → timestamp of last SIGTERM
+        # ── Disk metrics cache ───────────────────────────────────────────────
+        self._cache = MetricsCache(CACHE_DB)
+        self._cache.prune()                   # clean up expired rows on startup
+        self.cache_db_mb: float = self._cache.db_size_mb()
+        self.cache_rows: int    = self._cache.row_count()
+        # App-level predictions derived from cache; refreshed every 24 h
+        self.app_predictions: list = []       # [{app, avg_mb, trend, risk}]
+        self._last_app_predict: float = 0.0
 
     # ── public ────────────────────────────────────────────────────────────────
     def stop(self):
@@ -155,6 +329,9 @@ class BotEngine(threading.Thread):
                 "predictive_escalation": self.predictive_escalation,
                 "cpu_ram_lock":         self._ram_pressure_lock,
                 "xpc_blocked":          len(self._no_kill),
+                "cache_db_mb":          round(self.cache_db_mb, 2),
+                "cache_rows":           self.cache_rows,
+                "app_predictions":      list(self.app_predictions),
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
@@ -183,6 +360,13 @@ class BotEngine(threading.Thread):
                 if tick % 60  == 0: self._track_memory_leaks()
                 if tick % 300 == 0 and tick > 0: self._check_caches()
                 if tick % 10  == 0: self._detect_xpc_respawn()
+                if tick % CACHE_WRITE_S == 0:
+                    self._cache.flush()
+                    self._cache.prune()
+                    self.cache_db_mb = self._cache.db_size_mb()
+                    self.cache_rows  = self._cache.row_count()
+                if tick % 3600 == 0 and tick > 0:
+                    self._analyse_app_predictions()
             except Exception as exc:
                 self._emit("warn", f"Engine error: {exc}")
             tick += 1
@@ -211,6 +395,19 @@ class BotEngine(threading.Thread):
             if len(self.mem_hist)  > HISTORY_LEN: self.mem_hist.pop(0)
             if len(self.swap_hist) > HISTORY_LEN: self.swap_hist.pop(0)
             self.top_procs = rows[:12]
+            _tier = self.effective_tier
+            _tte  = self.mem_forecast_min
+            _pres = self.mem_pressure_level
+        # Buffer one sample per second — no disk I/O here
+        try:
+            d = psutil.disk_usage("/").percent
+        except Exception:
+            d = 0.0
+        self._cache.record(
+            int(time.time()), round(cpu, 1), round(vm.percent, 1),
+            round(swap.percent, 1), round(d, 1),
+            _pres, _tier, _tte
+        )
 
     def _check_cpu(self):
         with self._lock:
@@ -500,6 +697,70 @@ class BotEngine(threading.Thread):
                 f"~{total:.0f} MB freed (session total: {self.freed_mb:.0f} MB)")
 
     # ── Predictive Remediation Engine ─────────────────────────────────────────
+
+    def _analyse_app_predictions(self):
+        """
+        Use the 90-day disk cache to generate application-level performance
+        predictions. Runs at most once per 24 h — purely aggregate SQL queries,
+        never loads raw rows into Python memory.
+
+        Produces self.app_predictions: [{app, avg_mb, trend, risk, chronic_pct}]
+        where:
+          trend   = 'rising' | 'stable' | 'falling'  (week-over-week system RAM)
+          risk    = 'high' | 'medium' | 'low'
+          chronic = % of last 7 days system RAM was above MEM_WARN
+        """
+        now = time.time()
+        if now - self._last_app_predict < 86400:  # at most once per 24 h
+            return
+        self._last_app_predict = now
+
+        # Snapshot current ancestry for app names to analyse
+        with self._lock:
+            ancestry = list(self.mem_ancestry)
+        if not ancestry:
+            return
+
+        chronic = self._cache.chronic_pressure_pct()
+        results = []
+        for entry in ancestry[:6]:
+            app   = entry["app"]
+            mb    = entry["mb"]
+            pct   = entry["pct"]
+            trend_data = self._cache.app_mem_trend(app)
+            trend = trend_data.get("trend", "stable")
+            w1    = trend_data.get("week1_avg", 0.0)
+            w2    = trend_data.get("week2_avg", 0.0)
+
+            # Risk classification
+            if trend == "rising" and pct >= 20:
+                risk = "high"
+            elif trend == "rising" or pct >= 15:
+                risk = "medium"
+            else:
+                risk = "low"
+
+            results.append({
+                "app": app, "mb": mb, "pct": pct,
+                "trend": trend, "risk": risk,
+                "week1_avg": w1, "week2_avg": w2,
+                "chronic_pct": chronic,
+            })
+
+            if risk == "high":
+                self.issues += 1
+                self._emit("warn",
+                    f"APP PREDICTION: {app} is a rising RAM consumer "
+                    f"({mb} MB, {pct}% of total) — system RAM trending "
+                    f"from {w2:.0f}% → {w1:.0f}% over past two weeks")
+            elif chronic >= 40:
+                self._emit("issue",
+                    f"CHRONIC PRESSURE: RAM above {MEM_WARN:.0f}% for "
+                    f"{chronic:.0f}% of the last 7 days — consider closing "
+                    f"persistent apps or increasing physical memory")
+
+        with self._lock:
+            self.app_predictions = results
 
     def _compute_effective_tier(self, mem_pct: float):
         """
@@ -1373,6 +1634,16 @@ HTML = r"""<!DOCTYPE html>
           <span class="vmkey">XPC Blocked</span>
           <span class="vmval" id="vsXpcBlocked">—</span>
         </div>
+        <div class="vmrow" style="border-top:1px solid var(--border);margin-top:3px;padding-top:4px">
+          <span class="vmkey">Cache (90d)</span>
+          <span class="vmval" id="vsCacheSize" style="color:var(--muted)">—</span>
+        </div>
+      </div>
+
+      <!-- App Predictions (from 90-day disk cache) -->
+      <div class="families-section" id="predSection" style="display:none">
+        <div class="section-title" style="margin-bottom:7px">App Predictions <span style="font-size:9px;color:var(--muted);font-weight:400">(90-day cache)</span></div>
+        <div id="predList"></div>
       </div>
 
       <!-- Memory families -->
@@ -1669,6 +1940,32 @@ async function poll() {
       const xpcN = d.xpc_blocked||0;
       if (xpcN>0) { xpcEl.textContent=xpcN+' blocked'; xpcEl.style.color='var(--yellow)'; }
       else        { xpcEl.textContent='None';           xpcEl.style.color='var(--muted)';  }
+
+      // Cache stats
+      const cacheEl = document.getElementById('vsCacheSize');
+      const cMb = d.cache_db_mb||0, cRows = d.cache_rows||0;
+      cacheEl.textContent = cMb>0 ? cMb.toFixed(1)+' MB · '+(cRows/1000).toFixed(0)+'k rows' : 'Collecting…';
+
+      // App predictions from 90-day cache
+      const preds = d.app_predictions||[];
+      const predSection = document.getElementById('predSection');
+      const predList    = document.getElementById('predList');
+      if (preds.length) {
+        predSection.style.display='block';
+        const riskColor = {high:'var(--red)',medium:'var(--yellow)',low:'var(--green)'};
+        const trendIcon = {rising:'↑',stable:'→',falling:'↓'};
+        predList.innerHTML = preds.map(p=>`
+          <div class="fam-row" style="align-items:center">
+            <div class="fam-icon" style="background:${riskColor[p.risk]||'var(--muted)'};opacity:.8">${(p.app||'?').charAt(0).toUpperCase()}</div>
+            <div style="flex:1;min-width:0">
+              <div style="font-size:10px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.app}</div>
+              <div style="font-size:9px;color:var(--muted)">${p.mb} MB · ${p.pct}% · ${trendIcon[p.trend]||'→'} ${p.trend}</div>
+            </div>
+            <div style="font-size:9px;font-weight:700;color:${riskColor[p.risk]||'var(--muted)'};text-transform:uppercase;flex-shrink:0">${p.risk}</div>
+          </div>`).join('');
+      } else {
+        predSection.style.display='none';
+      }
 
       // Predictive escalation banner
       const predBanner = document.getElementById('predBanner');
