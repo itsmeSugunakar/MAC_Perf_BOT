@@ -13,7 +13,7 @@
 |--------------------|-----------------------------------------------------|
 | **App Name**       | MAC Performance Bot                                 |
 | **Short Name**     | mac-perf-bot                                        |
-| **Version**        | 1.3.0                                               |
+| **Version**        | 1.4.0                                               |
 | **Owner**          | itsmeSugunakar                                      |
 | **Contact**        | sugun.sr@gmail.com                                  |
 | **Repository**     | https://github.com/itsmeSugunakar/MAC_Perf_BOT      |
@@ -37,6 +37,7 @@ A lightweight, always-on macOS daemon that:
 6. **Auto-starts** at login via a macOS LaunchAgent
 7. **Analyses** memory at kernel depth via the Multi-Dimensional Memory Intelligence Engine (MMIE)
 8. **Accumulates** 90 days of metric history on disk (SQLite) for application-level performance predictions
+9. **Runs lean** — single `psutil.process_iter()` scan per second, all syscalls cached, `O(1)` event deque
 
 ---
 
@@ -105,6 +106,24 @@ MAC_Perf_BOT/
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Engine Tick Schedule
+
+| Interval | Method | What it does |
+|----------|--------|--------------|
+| 1 s | `_collect()` | Single `process_iter()` scan — metrics + CPU throttle detect + `_restore_calmed_procs()` |
+| 3 s | `_check_memory()` | PRE effective tier + MMIE cascade (uses cached `_last_vm`) |
+| 5 s | `_update_pressure_and_forecast()` | sysctl oracle + `vm_stat` + OLS forecast + ancestry |
+| 10 s | `_check_disk()` | Disk usage — stores `disk_pct` / `disk_free_gb` for snapshot |
+| 30 s | `_check_power_mode()` | Battery vs AC detection |
+| 30 s | `_detect_xpc_respawn()` | XPC Respawn Guard scan |
+| 60 s | `_check_thermal()` | `pmset` thermal throttle check |
+| 60 s | `_check_zombies()` | Zombie process detection |
+| 60 s | `_track_memory_leaks()` | Per-process RSS growth rate |
+| 60 s | `cache.flush()` + `cache.prune()` | Batch SQLite write + daily prune gate |
+| 300 s | `_check_caches()` | `~/Library/Caches` size warning |
+| 3600 s | `_analyse_app_predictions()` | 90-day cache risk analysis (daily gate inside) |
+| 30 s (IDLE_SWEEP_S) | `_sweep_idle_services()` | Tier 4 idle XPC/widget termination |
+
 ### Component Responsibilities
 
 | Component                        | File                     | Role                                                                        |
@@ -115,7 +134,8 @@ MAC_Perf_BOT/
 | **CPU-RAM Conflict Gate**        | `app/performance_gui.py` | `_check_cpu()` — defers `nice(0)` for top-RAM families under Tier 3+ lock  |
 | **Genealogy Freeze Scoring**     | `app/performance_gui.py` | `_freeze_background_daemons()` — `family×2 + pattern×1` weighted scoring   |
 | **XPC Respawn Guard**            | `app/performance_gui.py` | `_detect_xpc_respawn()` — blocklists respawning launchd services            |
-| **MetricsCache**                 | `app/performance_gui.py` | SQLite 90-day disk store; batch writes; aggregate-only reads                |
+| **MetricsCache**                 | `app/performance_gui.py` | SQLite 90-day disk store; batch writes every 60 s; aggregate-only reads     |
+| `_restore_calmed_procs()`        | `app/performance_gui.py` | CPU priority restore loop — only touches `self.throttled` (0–3 items)      |
 | **App Predictions**              | `app/performance_gui.py` | `_analyse_app_predictions()` — 24 h risk analysis from cache                |
 | `Handler` (HTTP)                 | `app/performance_gui.py` | Serves PWA dashboard + JSON API + manifest + SVG icon                       |
 | `performance_bot.py`             | `app/performance_bot.py` | Headless variant (LaunchAgent, no browser needed)                           |
@@ -302,7 +322,39 @@ Dashboard server listens on `http://127.0.0.1:8765`.
 
 ---
 
-## 10. Logging & Persistent Storage
+## 10. Performance Characteristics
+
+The bot is designed to be self-effacing — it must not measurably degrade the system it monitors.
+
+### Hot-path optimisations (v1.4.0)
+
+| Optimisation | Before | After |
+|---|---|---|
+| `psutil.process_iter()` calls/s | 2 (`_collect` + `_check_cpu`) | 1 (merged into `_collect`) |
+| CPU throttle detection | Second full process scan | Inline in the same `_collect` scan using `p.info[]` cache |
+| `psutil.cpu_count()` | Called inside per-process loop every tick | Cached as `self._ncpu` at init |
+| `psutil.virtual_memory()` | Every tick + every 3 s in `_check_memory` | Once per tick; shared as `self._last_vm` |
+| `psutil.swap_memory()` | Every tick + every 3 s | Once per tick; shared as `self._last_swap` |
+| `psutil.disk_usage("/")` | Every tick in `_collect` + every `/stats` HTTP request | Every 10 s in `_check_disk` only; cached in `self.disk_pct` |
+| Event ring-buffer | `list` with `pop(0)` — O(n) on every emit | `collections.deque(maxlen=200)` — O(1) append + auto-discard |
+| Cache record rate | 1 row/s → 86 400 rows/day | 1 row/10 s → 8 640 rows/day (−90 % disk I/O) |
+| `_detect_xpc_respawn()` frequency | Every 10 s | Every 30 s |
+
+### Subprocess budget
+Subprocesses are the most expensive operations. Frequency:
+
+| Subprocess | Command | Frequency |
+|---|---|---|
+| Kernel pressure | `sysctl -n kern.memorystatus_vm_pressure_level` | Every 5 s |
+| VM anatomy | `vm_stat` | Every 5 s |
+| Thermal | `pmset -g therm` | Every 60 s |
+| Power source | `pmset -g ps` | Every 30 s |
+
+All other operations use `psutil` (pure Python + cached libc calls) or read from `self._last_*` cached values.
+
+---
+
+## 11. Logging & Persistent Storage
 
 ### Runtime logs
 | Log file                                          | Content                      |
@@ -319,14 +371,14 @@ config if the bot runs for months.
 |-------------------------------------------------------------------------|-----------------------------------|
 | `~/Library/Application Support/performance-bot/metrics.db`             | 90-day SQLite metric history      |
 
-The cache grows at ~1 row/second → ~86 400 rows/day → ~350–450 MB at 90 days.
+The cache records 1 row every 10 seconds → ~8 640 rows/day → ~35–45 MB at 90 days.
 Rows older than `CACHE_RETENTION_DAYS` (90) are deleted automatically once per day.
 To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db`
 (the bot recreates the schema on next start).
 
 ---
 
-## 11. Security Considerations
+## 12. Security Considerations
 
 - Listens on **loopback only** (`127.0.0.1`) — not accessible from the network.
 - Uses `nice()` and `SIGSTOP`/`SIGCONT` only — cannot crash or delete processes.
@@ -339,7 +391,7 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 
 ---
 
-## 12. Known Limitations
+## 13. Known Limitations
 
 | Limitation | Notes |
 |------------|-------|
@@ -351,12 +403,12 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 | SIGSTOP requires user ownership | MMIE Tier 3 freeze only works on processes owned by the current user. |
 | `memory_pressure` sysctl | `kern.memorystatus_vm_pressure_level` may require SIP adjustments on some configurations. Falls back to percent-derived level automatically. |
 | App Predictions cold start | The `_analyse_app_predictions()` panel is empty for the first 24 h. After the first full day the cache has enough data to show risk ratings. |
-| Cache disk size | At 1 row/s for 90 days the database reaches ~350–450 MB. On low-storage Macs consider reducing `CACHE_RETENTION_DAYS`. |
+| Cache disk size | At 1 row/10 s for 90 days the database reaches ~35–45 MB — acceptable on all Macs. Reduce `CACHE_RETENTION_DAYS` only if storage is extremely limited. |
 | PRE TTE requires 20 samples | The Predictive Remediation Engine requires `TTE_MIN_SAMPLES` (20) seconds of `mem_hist` before TTE-driven escalation activates. |
 
 ---
 
-## 13. Branch Strategy
+## 14. Branch Strategy
 
 | Branch  | Purpose                                   |
 |---------|-------------------------------------------|
@@ -367,7 +419,7 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 
 ---
 
-## 14. Change Log
+## 15. Change Log
 
 | Date       | Version | Author         | Change                                                                 |
 |------------|---------|----------------|------------------------------------------------------------------------|
@@ -375,6 +427,7 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 | 2026-04-05 | 1.1.0   | itsmeSugunakar | MMIE engine: kernel pressure oracle, vm_stat breakdown, memory genealogy, linear-regression forecast, 4-tier remediation cascade, SIGSTOP/SIGCONT freeze-thaw; PWA dashboard redesign with ring gauges, Memory Intelligence panel, metric strip, `/manifest.json` |
 | 2026-04-05 | 1.2.0   | itsmeSugunakar | Predictive Remediation Engine (`_compute_effective_tier`); CPU-RAM Conflict Resolution Gate; genealogy-guided SIGSTOP scoring (`family×2 + pattern×1`); XPC Respawn Guard (`_detect_xpc_respawn`, `_no_kill`); dashboard: Active Tier, CPU-RAM Lock, XPC Blocked, predictive escalation banner; PPA document added |
 | 2026-04-05 | 1.3.0   | itsmeSugunakar | 90-day SQLite disk cache (`MetricsCache`): batch writes every 60 s, daily prune, aggregate-only reads; `_analyse_app_predictions()` for app-level risk classification; `app_mem_trend()` and `chronic_pressure_pct()` queries; dashboard App Predictions panel + Cache (90d) vmrow; `/stats` extended with `effective_tier`, `predictive_escalation`, `cpu_ram_lock`, `xpc_blocked`, `cache_db_mb`, `cache_rows`, `app_predictions` |
+| 2026-04-05 | 1.4.0   | itsmeSugunakar | Lightweight engine: merged `_check_cpu` throttle-detection into `_collect` (single `process_iter` per second); `_check_cpu` → `_restore_calmed_procs` (no process scan); `psutil.cpu_count` cached as `self._ncpu`; `virtual_memory`/`swap_memory` fetched once per tick, shared via `_last_vm`/`_last_swap`; `disk_usage` moved to `_check_disk` (10 s), cached in `disk_pct`/`disk_free_gb`; handler no longer calls `disk_usage` per request; `events` list → `deque(maxlen=200)` (O(1)); cache record rate 1/s → 1/10 s; `_detect_xpc_respawn` 10 s → 30 s |
 
 ---
 

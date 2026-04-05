@@ -21,7 +21,8 @@ A lightweight, always-on macOS performance monitor with **auto-remediation**, a 
 - **App Predictions** — 90-day cache powers week-over-week trend analysis; classifies top-RSS apps as high / medium / low risk; emits `APP PREDICTION` and `CHRONIC PRESSURE` events
 - **Detects** RAM pressure, swap usage, low disk, thermal throttling, zombie processes, memory leaks
 - **Autostart** via macOS LaunchAgent (login item)
-- **Zero heavy dependencies** — only `psutil` + Python stdlib (`sqlite3` included)
+- **Zero heavy dependencies** — only `psutil` + Python stdlib (`sqlite3`, `collections.deque` included)
+- **Lightweight by design** — single `psutil.process_iter()` call per second; all syscall results cached; `O(1)` event ring-buffer; disk I/O batched every 60 s
 
 ---
 
@@ -86,17 +87,23 @@ bash scripts/uninstall.sh
 
 ## How It Works
 
-Every second the bot engine:
+Every second the bot runs a **single** `psutil.process_iter()` call that does two things at once:
 
-1. **Samples** CPU, RAM, Disk, Swap via `psutil` and **records** one row to the in-memory cache buffer
-2. **CPU-RAM conflict check** — identifies CPU-throttled processes; defers `nice(0)` restoration when those processes are also top RAM-owning families under Tier 3+ lock
-3. **Throttles CPU hogs** — processes exceeding **85 % CPU** per core are reniced to `nice=10`
-4. Every **3 s** — `_compute_effective_tier()` merges static % thresholds with the OLS TTE forecast to derive the active remediation tier; triggers the MMIE cascade
-5. Every **5 s** — queries kernel pressure level, parses `vm_stat`, updates memory forecast and ancestry
-6. Every **10 s** — `_detect_xpc_respawn()` scans for services that immediately restarted after SIGTERM and adds them to the `_no_kill` blocklist
-7. Every **60 s** — flushes 60 buffered metric rows to SQLite with a single `executemany()`; prunes rows older than 90 days once per day
-8. Every **hour** — `_analyse_app_predictions()` queries the 90-day cache with aggregate SQL (no raw rows in Python) to classify each top-RSS app family as high / medium / low risk
-9. Pushes events (`FIX` / `WARN` / `ISSUE` / `INFO`) to the live dashboard
+1. **Collects** CPU %, RAM %, Swap % (all three syscalls executed once and cached for the whole tick)
+2. **Detects CPU hogs inline** — processes over 85 % CPU per core are reniced to `nice=10`; processes that have calmed are restored via `_restore_calmed_procs()` (touches only `self.throttled`, usually 0–3 items — no full scan)
+
+Less frequently:
+
+| Interval | What happens |
+|----------|--------------|
+| 3 s | PRE `_compute_effective_tier()` + MMIE cascade (uses cached RAM reading — no extra syscall) |
+| 5 s | `sysctl` kernel pressure oracle + `vm_stat` anatomy + OLS TTE forecast |
+| 10 s | `psutil.disk_usage("/")` — result cached; no per-request disk reads |
+| 30 s | XPC Respawn Guard scan; battery/AC detection |
+| 60 s | Thermal check (`pmset`); zombie scan; memory leak tracking; SQLite batch flush (8 640 rows/day) |
+| 24 h | App Predictions risk analysis from 90-day cache (aggregate SQL only) |
+
+Events are stored in a `deque(maxlen=200)` — O(1) append, automatic discard of oldest.
 
 ---
 
@@ -142,7 +149,7 @@ Activity log colours: 🟢 FIX &nbsp; 🟡 WARN &nbsp; 🔴 ISSUE &nbsp; 🔵 IN
 | Retention | 90 days (pruned automatically each day) |
 | Write cadence | Batch flush every 60 s via `executemany()` |
 | RAM usage | ≤ 4 KB in-memory buffer (60 tuples between flushes) |
-| Max disk size | ~350–450 MB at 90 days / 1 row per second |
+| Max disk size | ~35–45 MB at 90 days / 1 row per 10 seconds |
 | Reads | Aggregate SQL only — `AVG`, `COUNT`, `GROUP BY` — no raw rows in Python |
 
 ---

@@ -65,32 +65,58 @@ timer thread     → webbrowser.open() after 0.8 s  (one-shot)
 ```
 
 All shared state is protected by `BotEngine._lock` (threading.Lock).  
-The HTTP handler only reads via `snapshot()` — never writes — so lock contention
-is minimal.  
-`MetricsCache` runs all SQLite I/O on the `bot-engine` thread (flush every 60 s,
-prune once per day) — no additional threads.
+The HTTP handler reads only via `snapshot()` — never writes — so lock contention
+is minimal and brief.  
+`MetricsCache` runs all SQLite I/O on the `bot-engine` thread — no additional threads.
+
+### Cached values (avoid repeated syscalls)
+
+| Field | Set by | Read by | Syscall saved |
+|---|---|---|---|
+| `self._ncpu` | `__init__` (once) | `_collect`, `_restore_calmed_procs` | `cpu_count()` per tick |
+| `self._last_vm` | `_collect` (1 Hz) | `_check_memory` (0.33 Hz) | `virtual_memory()` every 3 s |
+| `self._last_swap` | `_collect` (1 Hz) | `_check_memory` (0.33 Hz) | `swap_memory()` every 3 s |
+| `self.disk_pct` / `disk_free_gb` | `_check_disk` (0.1 Hz) | `snapshot()` / HTTP handler | `disk_usage()` per request |
+| `self._last_disk_pct` | `_check_disk` (0.1 Hz) | `_collect` cache record | `disk_usage()` per second |
 
 ---
 
 ## Engine Tick Schedule
 
 ```
-Every 1 s   → _collect()                 CPU / RAM / Swap / Disk sampling + cache.record()
-Every 1 s   → _check_cpu()               CPU-RAM conflict resolution + renice hogs
-Every 3 s   → _check_memory()            PRE effective_tier + MMIE cascade
-Every 5 s   → _update_pressure_and_forecast()   kernel oracle + vm_stat + OLS forecast
+Every 1 s   → _collect()
+               ONE psutil.process_iter() scan — collects metrics AND detects
+               CPU hogs inline using p.info[] (cached attrs, no extra syscalls).
+               Stores _last_vm / _last_swap for downstream methods.
+               Records 1 cache row every 10 s (time % 10 gate, no disk I/O otherwise).
+
+               _restore_calmed_procs() — restores nice(0) only for processes in
+               self.throttled (typically 0–3 items); no process scan.
+
+Every 3 s   → _check_memory()
+               Reads _last_vm (no syscall). Calls _compute_effective_tier()
+               (arithmetic + lock read), then _tiered_memory_remediation().
+
+Every 5 s   → _update_pressure_and_forecast()
+               Spawns sysctl + vm_stat subprocesses. Updates mem_pressure_level,
+               vm_breakdown, mem_forecast_min, mem_ancestry.
+
 Every 10 s  → _check_disk()
-Every 10 s  → _detect_xpc_respawn()      XPC Respawn Guard scan
-Every 30 s  → _check_power_mode()
-Every 30 s  → _sweep_idle_services()     Tier 4 emergency termination (on demand)
-Every 60 s  → cache.flush()              Batch SQLite write (executemany 60 rows)
-Every 60 s  → cache.prune()              Prune rows > 90 days (no-op if not due)
-Every 60 s  → cache.db_size_mb() / row_count()   update dashboard stats
-Every 60 s  → _check_thermal()
+               Single psutil.disk_usage("/") call; stores disk_pct / disk_free_gb
+               for snapshot(). No per-request disk reads in Handler.
+
+Every 30 s  → _check_power_mode()   (pmset -g ps subprocess)
+Every 30 s  → _detect_xpc_respawn() (process name set scan)
+Every 30 s  → _sweep_idle_services() (IDLE_SWEEP_S default)
+
+Every 60 s  → cache.flush()          executemany() — 6 rows (1 per 10 s × 60 s)
+Every 60 s  → cache.prune()          DELETE WHERE ts < cutoff (no-op if < 24 h since last)
+Every 60 s  → _check_thermal()       (pmset -g therm subprocess)
 Every 60 s  → _check_zombies()
 Every 60 s  → _track_memory_leaks()
-Every 300 s → _check_caches()            ~/Library/Caches size warning
-Every 3600 s → _analyse_app_predictions()  90-day risk analysis (daily in practice)
+
+Every 300 s → _check_caches()        ~/Library/Caches du scan
+Every 3600 s→ _analyse_app_predictions()  guarded by 86400 s internal cooldown
 ```
 
 ---
@@ -98,17 +124,32 @@ Every 3600 s → _analyse_app_predictions()  90-day risk analysis (daily in prac
 ## Remediation Logic
 
 ```
-_check_cpu() — every second:
-  for each throttled pid:
-    if cpu < CPU_WARN/2 (35 %):
+_collect() — every second (replaces separate _check_cpu scan):
+  sys_cpu = psutil.cpu_percent()          ← one call
+  vm      = psutil.virtual_memory()       ← one call, stored as _last_vm
+  swap    = psutil.swap_memory()          ← one call, stored as _last_swap
+
+  for p in psutil.process_iter(attrs):    ← ONE scan total
+      c = p.info["cpu_percent"] / _ncpu   ← cached attr, no extra syscall
+      rows.append(...)                    ← build top_procs
+      if sys_cpu >= CPU_WARN and c >= CPU_THROTTLE:
+          to_throttle.append(p)           ← defer; apply after loop
+      elif sys_cpu >= CPU_WARN and c >= CPU_WARN:
+          emit WARN
+
+  _restore_calmed_procs(ram_lock)         ← iterates self.throttled only (0–3 items)
+  for p in to_throttle: p.nice(RENICE_VAL)
+
+_restore_calmed_procs() — called from _collect(), no process scan:
+  for each pid in self.throttled (typically 0–3):
+    c = psutil.Process(pid).cpu_percent() / _ncpu
+    if c < CPU_WARN/2 (35 %):
       if _ram_pressure_lock AND proc is top-3 RAM family:
         → defer nice(0) [CPU-RAM conflict resolution]
       else:
         → nice(0), emit FIX
-  if sys_cpu >= CPU_WARN (70 %):
-    for each process:
-      if cpu >= CPU_THROTTLE (85 %) → nice(10), emit FIX
-      elif cpu >= CPU_WARN (70 %)   → emit WARN
+  (throttle detection handled inline in _collect loop above)
+```
 
 _check_memory() — every 3 s:
   _compute_effective_tier(mem_pct):
@@ -150,7 +191,8 @@ Write    : cache.record() appends to a Python list (no I/O, ≤ 4 KB RAM)
            cache.flush()  executemany() every 60 s — one batch write per minute
 Read     : aggregate-only queries (AVG / COUNT / GROUP BY) — ≤ 10 rows returned
 Prune    : DELETE WHERE ts < now − 90 days, once per day + WAL checkpoint
-Capacity : ~90 days × 86400 rows/day ≈ 7.8 M rows ≈ 350–450 MB max on disk
+Capacity : ~90 days × 8640 rows/day ≈ 777 K rows ≈ 35–45 MB max on disk
+           (1 row per 10 s, not per second — 10× reduction from v1.3.0)
 
 Analysis methods (all run aggregate SQL — zero raw rows loaded into Python):
   app_mem_trend(app, 30d)    → {avg_mem_pct, week1_avg, week2_avg, trend}
