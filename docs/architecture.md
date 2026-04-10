@@ -1,5 +1,47 @@
 # Architecture — MAC Performance Bot
 
+## Design Diagram (Mermaid)
+
+```mermaid
+flowchart TD
+  LA[LaunchAgent\nlogin autostart] --> GUI[performance_gui.py]
+
+  subgraph APP[performance_gui.py Runtime]
+    BE[BotEngine\n1 second tick]
+    HTTP[HTTP Handler\n127.0.0.1:8765]
+    DB[(SQLite Metrics Cache\n90 days)]
+
+    BE -->|snapshot()| HTTP
+    BE -->|cache.record + flush| DB
+    DB -->|aggregates| BE
+  end
+
+  subgraph OS[macOS Signals and Metrics]
+    PS[psutil.process_iter]
+    SYS[sysctl kern.memorystatus]
+    VM[vm_stat]
+    PM[pmset thermal and power]
+  end
+
+  PS --> BE
+  SYS --> BE
+  VM --> BE
+  PM --> BE
+
+  subgraph MMIE[MMIE + PRE]
+    PRE[Predictive Remediation Engine\ncompute effective tier 0 to 4]
+    FG[Genealogy-Guided Freeze\nSIGSTOP and SIGCONT]
+    XG[XPC Respawn Guard\nno-kill blocklist]
+  end
+
+  BE --> PRE
+  PRE --> FG
+  PRE --> XG
+
+  BR[Browser PWA\nChart.js dashboard] -->|GET / and GET /stats| HTTP
+  HTTP -->|JSON metrics| BR
+```
+
 ## Data Flow
 
 ```
@@ -71,13 +113,13 @@ is minimal and brief.
 
 ### Cached values (avoid repeated syscalls)
 
-| Field | Set by | Read by | Syscall saved |
-|---|---|---|---|
-| `self._ncpu` | `__init__` (once) | `_collect`, `_restore_calmed_procs` | `cpu_count()` per tick |
-| `self._last_vm` | `_collect` (1 Hz) | `_check_memory` (0.33 Hz) | `virtual_memory()` every 3 s |
-| `self._last_swap` | `_collect` (1 Hz) | `_check_memory` (0.33 Hz) | `swap_memory()` every 3 s |
-| `self.disk_pct` / `disk_free_gb` | `_check_disk` (0.1 Hz) | `snapshot()` / HTTP handler | `disk_usage()` per request |
-| `self._last_disk_pct` | `_check_disk` (0.1 Hz) | `_collect` cache record | `disk_usage()` per second |
+| Field                            | Set by                 | Read by                             | Syscall saved                |
+| -------------------------------- | ---------------------- | ----------------------------------- | ---------------------------- |
+| `self._ncpu`                     | `__init__` (once)      | `_collect`, `_restore_calmed_procs` | `cpu_count()` per tick       |
+| `self._last_vm`                  | `_collect` (1 Hz)      | `_check_memory` (0.33 Hz)           | `virtual_memory()` every 3 s |
+| `self._last_swap`                | `_collect` (1 Hz)      | `_check_memory` (0.33 Hz)           | `swap_memory()` every 3 s    |
+| `self.disk_pct` / `disk_free_gb` | `_check_disk` (0.1 Hz) | `snapshot()` / HTTP handler         | `disk_usage()` per request   |
+| `self._last_disk_pct`            | `_check_disk` (0.1 Hz) | `_collect` cache record             | `disk_usage()` per second    |
 
 ---
 
@@ -151,30 +193,31 @@ _restore_calmed_procs() — called from _collect(), no process scan:
   (throttle detection handled inline in _collect loop above)
 ```
 
-_check_memory() — every 3 s:
-  _compute_effective_tier(mem_pct):
-    threshold_tier  ← static % lookup (0–4)
-    if TTE ≤ TTE_TIER4_MIN (2 min)  → predictive_tier = 4
-    elif TTE ≤ TTE_TIER3_MIN (5 min) → predictive_tier = 3
-    elif TTE ≤ TTE_TIER2_MIN (10 min) → predictive_tier = 2
-    effective_tier = max(threshold_tier, predictive_tier)
-    _ram_pressure_lock = (effective_tier >= 3)
+\_check_memory() — every 3 s:
+\_compute_effective_tier(mem_pct):
+threshold_tier ← static % lookup (0–4)
+if TTE ≤ TTE_TIER4_MIN (2 min) → predictive_tier = 4
+elif TTE ≤ TTE_TIER3_MIN (5 min) → predictive_tier = 3
+elif TTE ≤ TTE_TIER2_MIN (10 min) → predictive_tier = 2
+effective_tier = max(threshold_tier, predictive_tier)
+\_ram_pressure_lock = (effective_tier >= 3)
 
-  if effective_tier >= 1:   emit ISSUE + consumer report
-  if was predictive:        emit PREDICTIVE ESCALATION event
-  if effective_tier >= 2:   _tiered_memory_remediation(mem_pct, effective_tier)
-  if mem_pct < MEM_WARN-5:  release lock + _thaw_frozen_daemons()
+if effective_tier >= 1: emit ISSUE + consumer report
+if was predictive: emit PREDICTIVE ESCALATION event
+if effective_tier >= 2: \_tiered_memory_remediation(mem_pct, effective_tier)
+if mem_pct < MEM_WARN-5: release lock + \_thaw_frozen_daemons()
 
-_tiered_memory_remediation(mem_pct, effective_tier):
-  Tier 2 (eff ≥ 2): vm_stat parse → purgeable advisory → wired warning → genealogy report
-  Tier 3 (eff ≥ 3): _freeze_background_daemons() — genealogy-guided scoring:
-                       score = family_match×2 + pattern_match×1
-                       sort by (score DESC, rss DESC) → SIGSTOP
-  Tier 4 (eff ≥ 4): _sweep_idle_services() — respects _no_kill blocklist → SIGTERM
+\_tiered_memory_remediation(mem_pct, effective_tier):
+Tier 2 (eff ≥ 2): vm_stat parse → purgeable advisory → wired warning → genealogy report
+Tier 3 (eff ≥ 3): \_freeze_background_daemons() — genealogy-guided scoring:
+score = family_match×2 + pattern_match×1
+sort by (score DESC, rss DESC) → SIGSTOP
+Tier 4 (eff ≥ 4): \_sweep_idle_services() — respects \_no_kill blocklist → SIGTERM
 
-_detect_xpc_respawn() — every 10 s:
-  if terminated_name reappears within XPC_RESPAWN_S (10 s):
-    → _no_kill.add(name), emit XPC RESPAWN GUARD warning
+\_detect_xpc_respawn() — every 10 s:
+if terminated_name reappears within XPC_RESPAWN_S (10 s):
+→ \_no_kill.add(name), emit XPC RESPAWN GUARD warning
+
 ```
 
 ---
@@ -182,23 +225,25 @@ _detect_xpc_respawn() — every 10 s:
 ## Disk Cache Design
 
 ```
-Location : ~/Library/Application Support/performance-bot/metrics.db
-Schema   : metrics(ts INTEGER, cpu_pct REAL, mem_pct REAL, swap_pct REAL,
-                   disk_pct REAL, pressure TEXT, eff_tier INTEGER, tte_min REAL)
-Index    : idx_metrics_ts ON metrics(ts)
 
-Write    : cache.record() appends to a Python list (no I/O, ≤ 4 KB RAM)
-           cache.flush()  executemany() every 60 s — one batch write per minute
-Read     : aggregate-only queries (AVG / COUNT / GROUP BY) — ≤ 10 rows returned
-Prune    : DELETE WHERE ts < now − 90 days, once per day + WAL checkpoint
+Location : ~/Library/Application Support/performance-bot/metrics.db
+Schema : metrics(ts INTEGER, cpu_pct REAL, mem_pct REAL, swap_pct REAL,
+disk_pct REAL, pressure TEXT, eff_tier INTEGER, tte_min REAL)
+Index : idx_metrics_ts ON metrics(ts)
+
+Write : cache.record() appends to a Python list (no I/O, ≤ 4 KB RAM)
+cache.flush() executemany() every 60 s — one batch write per minute
+Read : aggregate-only queries (AVG / COUNT / GROUP BY) — ≤ 10 rows returned
+Prune : DELETE WHERE ts < now − 90 days, once per day + WAL checkpoint
 Capacity : ~90 days × 8640 rows/day ≈ 777 K rows ≈ 35–45 MB max on disk
-           (1 row per 10 s, not per second — 10× reduction from v1.3.0)
+(1 row per 10 s, not per second — 10× reduction from v1.3.0)
 
 Analysis methods (all run aggregate SQL — zero raw rows loaded into Python):
-  app_mem_trend(app, 30d)    → {avg_mem_pct, week1_avg, week2_avg, trend}
-  chronic_pressure_pct(7d)   → float: % of time RAM above MEM_WARN
-  _analyse_app_predictions() → [{app, mb, pct, trend, risk, chronic_pct}]
-                                runs every 24 h; emits APP PREDICTION events
+app_mem_trend(app, 30d) → {avg_mem_pct, week1_avg, week2_avg, trend}
+chronic_pressure_pct(7d) → float: % of time RAM above MEM_WARN
+\_analyse_app_predictions() → [{app, mb, pct, trend, risk, chronic_pct}]
+runs every 24 h; emits APP PREDICTION events
+
 ```
 
 ---
@@ -211,3 +256,4 @@ Analysis methods (all run aggregate SQL — zero raw rows loaded into Python):
 - `_no_kill` blocklist prevents looping SIGTERM on launchd-managed services.
 - Disk cache contains only aggregate metric numbers — no process names, no user data.
 - No credentials, tokens, or secrets anywhere in code, config, or cache.
+```

@@ -130,13 +130,13 @@ Intelligence Engine (MMIE)**, is a software method and system comprising:
    least-squares regression to a sliding window of historical RAM utilisation
    samples to calculate the estimated "Time to Exhaustion" (TTE) — the
    number of minutes until RAM utilisation is projected to reach a critical
-   threshold (95 %) — enabling *predictive* rather than purely *reactive*
+   threshold (95 %) — enabling _predictive_ rather than purely _reactive_
    intervention.
 
 5. **A Predictive Remediation Engine** that compares the TTE estimate
    against tier-specific time thresholds (TTE ≤ 10 min → Tier 2 early,
    TTE ≤ 5 min → Tier 3 early, TTE ≤ 2 min → Tier 4 early) to escalate
-   the effective remediation tier *before* static RAM-percentage thresholds
+   the effective remediation tier _before_ static RAM-percentage thresholds
    are breached, enabling pre-emptive intervention under a rising memory
    trend.
 
@@ -183,6 +183,46 @@ MMIE sub-routines are scheduled at longer intervals with independent
 cooldown timers to prevent excessive CPU consumption by the monitoring
 process itself (the "observer effect").
 
+```mermaid
+flowchart TD
+   LA[LaunchAgent\nlogin autostart] --> GUI[performance_gui.py]
+
+   subgraph APP[performance_gui.py Runtime]
+      BE[BotEngine\n1 second tick]
+      HTTP[HTTP Handler\n127.0.0.1:8765]
+      DB[(SQLite Metrics Cache\n90 days)]
+
+      BE -->|snapshot()| HTTP
+      BE -->|cache.record + flush| DB
+      DB -->|aggregates| BE
+   end
+
+   subgraph OS[macOS Signals and Metrics]
+      PS[psutil.process_iter]
+      SYS[sysctl kern.memorystatus]
+      VM[vm_stat]
+      PM[pmset thermal and power]
+   end
+
+   PS --> BE
+   SYS --> BE
+   VM --> BE
+   PM --> BE
+
+   subgraph MMIE[MMIE + PRE]
+      PRE[Predictive Remediation Engine\ncompute effective tier 0 to 4]
+      FG[Genealogy-Guided Freeze\nSIGSTOP and SIGCONT]
+      XG[XPC Respawn Guard\nno-kill blocklist]
+   end
+
+   BE --> PRE
+   PRE --> FG
+   PRE --> XG
+
+   BR[Browser PWA\nChart.js dashboard] -->|GET / and GET /stats| HTTP
+   HTTP -->|JSON metrics| BR
+```
+
 ```
 ┌────────────────────────────────────────────────────────────┐
 │  BotEngine (background thread, 1 Hz)                       │
@@ -226,7 +266,8 @@ The kernel returns one of three integer values: `1` (Normal), `2` (Warning),
 and `critical`.
 
 This is distinct from and superior to user-space RAM utilisation in that:
-- It reflects the kernel's *actual* ability to satisfy new allocation
+
+- It reflects the kernel's _actual_ ability to satisfy new allocation
   requests, including compressed memory headroom and I/O-bounded swap state.
 - It is updated by the kernel in real time, not sampled at a fixed interval.
 - It accounts for wired memory that cannot be compressed or paged, which
@@ -250,21 +291,21 @@ this invention.
 The parser executes the operating system's `vm_stat` utility and parses its
 output to decompose physical RAM into six semantically meaningful categories:
 
-| Category   | Meaning                                                    |
-|------------|------------------------------------------------------------|
-| Wired      | Kernel-reserved pages; cannot be paged, compressed, or purged |
-| Active     | Pages in active use by running processes                   |
-| Inactive   | Pages no longer actively referenced; reclaimable           |
+| Category   | Meaning                                                          |
+| ---------- | ---------------------------------------------------------------- |
+| Wired      | Kernel-reserved pages; cannot be paged, compressed, or purged    |
+| Active     | Pages in active use by running processes                         |
+| Inactive   | Pages no longer actively referenced; reclaimable                 |
 | Purgeable  | Application-marked pages that can be discarded without data loss |
-| Compressed | Pages compressed in-memory by the OS compressor            |
-| Free       | Immediately available pages                                |
+| Compressed | Pages compressed in-memory by the OS compressor                  |
+| Free       | Immediately available pages                                      |
 
 Page counts are multiplied by the system's page size (16 KB on Apple Silicon,
 4 KB on Intel) to produce values in megabytes.
 
 **Novelty over prior art:** Existing tools present a single "used %"
 figure. The anatomy parser enables the MMIE to distinguish between
-*structurally unavoidable* pressure (high wired memory) and *recoverable*
+_structurally unavoidable_ pressure (high wired memory) and _recoverable_
 pressure (high inactive or purgeable memory), triggering qualitatively
 different advisories and interventions for each.
 
@@ -298,18 +339,19 @@ The Genealogy Engine solves this by:
    providing a ranked list of application ecosystems by memory ownership.
 
 **Output format:**
+
 ```json
 [
   { "app": "Microsoft Edge", "mb": 3474, "pct": 35.1 },
-  { "app": "Code",           "mb": 2579, "pct": 26.0 },
-  { "app": "Slack",          "mb":  299, "pct":  3.0 }
+  { "app": "Code", "mb": 2579, "pct": 26.0 },
+  { "app": "Slack", "mb": 299, "pct": 3.0 }
 ]
 ```
 
 **Cycle prevention:** The walker maintains a `visited` set per traversal
 to prevent infinite loops caused by reparented or malformed process entries.
 
-**Novelty:** The recursive ppid-tree walk for *consumer workstation*
+**Novelty:** The recursive ppid-tree walk for _consumer workstation_
 RAM attribution — as opposed to server-side container/cgroup accounting —
 combined with real-time dashboard presentation, constitutes a novel
 application of process genealogy to consumer memory management.
@@ -343,12 +385,14 @@ TTE (minutes) = TTE (seconds) / 60
 ```
 
 **Interpretation:**
+
 - `TTE = -1` → Memory stable; no predictive alert.
-- `TTE = 0`  → Memory already at or above critical threshold.
-- `TTE > 0`  → System will reach 95 % RAM in approximately `TTE` minutes
+- `TTE = 0` → Memory already at or above critical threshold.
+- `TTE > 0` → System will reach 95 % RAM in approximately `TTE` minutes
   at the current growth rate.
 
 The forecaster is evaluated every 5 seconds. Its output is:
+
 - Displayed in the dashboard as a countdown ("↑ ~12 min to 95%")
 - Optionally used to escalate tier thresholds earlier under a rising trend
 
@@ -388,12 +432,13 @@ executes Tier 3 (SIGSTOP daemons) **before** RAM reaches 87 %, providing
 a 4-minute head start on pressure relief.
 
 When escalation occurs, the engine:
+
 - Sets `effective_tier` in the snapshot (dashboard "Active Tier" row)
 - Sets `_ram_pressure_lock = True` (activates CPU-RAM conflict gate)
 - Emits a `PREDICTIVE ESCALATION: TTE=N.N min → acting at Tier X` event
 - Displays an amber "PREDICTIVE ESCALATION ACTIVE" banner in the PWA
 
-**Novelty:** This constitutes a *Predictive Remediation Engine* — the use
+**Novelty:** This constitutes a _Predictive Remediation Engine_ — the use
 of a linear-regression time-to-exhaustion forecast to escalate a graduated
 remediation cascade earlier than static percentage thresholds would permit,
 enabling predictive rather than purely reactive memory management. This
@@ -408,8 +453,8 @@ When the CPU-throttling subsystem detects that a previously throttled
 process has calmed (CPU usage dropped below `CPU_WARN / 2 = 35 %`), it
 normally restores the process to normal scheduling priority via `nice(0)`.
 
-However, restoring priority to a CPU-calmed process that is also a *top
-RAM owner* would allow it to immediately resume full CPU execution and
+However, restoring priority to a CPU-calmed process that is also a _top
+RAM owner_ would allow it to immediately resume full CPU execution and
 potentially re-expand its memory footprint — negating the Tier 3 freeze
 applied to its daemon siblings.
 
@@ -437,7 +482,7 @@ not implemented in any known consumer tool.
 
 **Method:** `_tiered_memory_remediation(mem_pct: float, effective_tier: int)`
 
-The cascade applies the *minimum necessary intervention* for the observed
+The cascade applies the _minimum necessary intervention_ for the observed
 pressure level, in ascending order of severity. Each tier is strictly
 additive — Tier 3 also performs all Tier 2 actions.
 
@@ -446,6 +491,7 @@ additive — Tier 3 also performs all Tier 2 actions.
 **Trigger:** `psutil.virtual_memory().percent ≥ 80`
 
 **Actions:**
+
 - Log a RAM pressure event to the activity feed.
 - Identify the top-3 RSS consumers by process name and emit individual
   "RAM hog" advisories with a 5-minute cooldown (to prevent log flooding).
@@ -459,19 +505,19 @@ additive — Tier 3 also performs all Tier 2 actions.
 **Actions:**
 
 a. **Purgeable Opportunity Advisory:** If the Memory Anatomy Parser
-   reports purgeable pages exceeding 200 MB, emit an advisory quantifying
-   the reclaimable amount. The kernel will reclaim these pages automatically;
-   the advisory informs the user that relief may arrive without intervention.
+reports purgeable pages exceeding 200 MB, emit an advisory quantifying
+the reclaimable amount. The kernel will reclaim these pages automatically;
+the advisory informs the user that relief may arrive without intervention.
 
 b. **Wired Memory Structural Warning:** If wired memory exceeds 40 % of
-   total RAM (configurable via `WIRED_WARN_PCT`), emit a one-time-per-session
-   structural warning. This is a qualitatively distinct alert because wired
-   memory cannot be reclaimed by any userspace action.
+total RAM (configurable via `WIRED_WARN_PCT`), emit a one-time-per-session
+structural warning. This is a qualitatively distinct alert because wired
+memory cannot be reclaimed by any userspace action.
 
 c. **Memory Genealogy Report:** If more than `MEM_ANCESTRY_COOL_S` seconds
-   (default 120) have elapsed since the last genealogy report, invoke the
-   Memory Genealogy Engine and emit a "top memory families" advisory
-   identifying the 3 largest application ecosystems by combined RSS.
+(default 120) have elapsed since the last genealogy report, invoke the
+Memory Genealogy Engine and emit a "top memory families" advisory
+identifying the 3 largest application ecosystems by combined RSS.
 
 **Reversibility:** Fully reversible (advisory only; no process signals).
 
@@ -488,11 +534,13 @@ Invoke `_freeze_background_daemons()` with **Genealogy-Guided Scoring:**
    families by aggregated RSS).
 
 2. Build a `heavy_families` set from the top 5 families:
+
    ```
    heavy_families = {entry["app"].lower() for entry in ancestry[:5]}
    ```
 
 3. For each candidate process, compute a composite score:
+
    ```
    family_match = 1  if process.name.lower() ∈ heavy_families (or substring match)
                   0  otherwise
@@ -520,6 +568,7 @@ Invoke `_freeze_background_daemons()` with **Genealogy-Guided Scoring:**
 `SIGCONT` is sent to all frozen PIDs automatically.
 
 **Safety guarantees:**
+
 - Root-owned processes are excluded unconditionally.
 - Processes not reaching score ≥ 1 are never targeted.
 - 120-second cooldown between freeze cycles.
@@ -577,7 +626,7 @@ every 10 s:
     if name in running_process_names and (now - ts) ≤ XPC_RESPAWN_S (10 s):
         _no_kill.add(name)
         emit "XPC RESPAWN GUARD: {name} relaunched within 10s — blocklisted"
-  
+
   # prune stale entries (> 60 s old)
   remove entries from _terminated_ts where (now - ts) > XPC_RESPAWN_S × 6
 ```
@@ -600,6 +649,7 @@ enterprise monitoring tool.
 **Method:** Called from `_check_memory()` on every memory check cycle.
 
 **Logic:**
+
 ```python
 if vm.percent < MEM_WARN - 5 and self._frozen_pids:
     self._thaw_frozen_daemons()
@@ -609,6 +659,7 @@ if vm.percent < MEM_WARN - 5 and self._frozen_pids:
 ```
 
 When the condition is met:
+
 1. Iterate `_frozen_pids`.
 2. Send `SIGCONT` to each suspended PID.
 3. Clear `_frozen_pids`.
@@ -624,21 +675,21 @@ All thresholds are defined as named constants at the top of the engine
 module and can be modified by the operator without source code changes to
 business logic:
 
-| Constant              | Default  | Description                                        |
-|-----------------------|----------|----------------------------------------------------|
-| `MEM_WARN`            | 80 %     | Tier 1 activation threshold                        |
-| `MEM_TIER2_PCT`       | 82 %     | Tier 2 static threshold                            |
-| `MEM_TIER3_PCT`       | 87 %     | Tier 3 static threshold                            |
-| `MEM_TIER4_PCT`       | 92 %     | Tier 4 static threshold                            |
-| `TTE_TIER2_MIN`       | 10 min   | TTE value that predictively escalates to Tier 2    |
-| `TTE_TIER3_MIN`       | 5 min    | TTE value that predictively escalates to Tier 3    |
-| `TTE_TIER4_MIN`       | 2 min    | TTE value that predictively escalates to Tier 4    |
-| `TTE_MIN_SAMPLES`     | 20       | Min history samples before TTE drives escalation   |
-| `XPC_RESPAWN_S`       | 10 s     | Respawn detection window for XPC guard             |
-| `WIRED_WARN_PCT`      | 40 %     | Wired structural pressure threshold                |
-| `FREEZE_COOL_S`       | 120 s    | Minimum interval between Tier 3 freeze cycles      |
-| `MEM_ANCESTRY_COOL_S` | 120 s    | Minimum interval between genealogy scans           |
-| `LEAK_RATE_MB_MIN`    | 50 MB/m  | RSS growth rate to flag potential leak             |
+| Constant              | Default | Description                                      |
+| --------------------- | ------- | ------------------------------------------------ |
+| `MEM_WARN`            | 80 %    | Tier 1 activation threshold                      |
+| `MEM_TIER2_PCT`       | 82 %    | Tier 2 static threshold                          |
+| `MEM_TIER3_PCT`       | 87 %    | Tier 3 static threshold                          |
+| `MEM_TIER4_PCT`       | 92 %    | Tier 4 static threshold                          |
+| `TTE_TIER2_MIN`       | 10 min  | TTE value that predictively escalates to Tier 2  |
+| `TTE_TIER3_MIN`       | 5 min   | TTE value that predictively escalates to Tier 3  |
+| `TTE_TIER4_MIN`       | 2 min   | TTE value that predictively escalates to Tier 4  |
+| `TTE_MIN_SAMPLES`     | 20      | Min history samples before TTE drives escalation |
+| `XPC_RESPAWN_S`       | 10 s    | Respawn detection window for XPC guard           |
+| `WIRED_WARN_PCT`      | 40 %    | Wired structural pressure threshold              |
+| `FREEZE_COOL_S`       | 120 s   | Minimum interval between Tier 3 freeze cycles    |
+| `MEM_ANCESTRY_COOL_S` | 120 s   | Minimum interval between genealogy scans         |
+| `LEAK_RATE_MB_MIN`    | 50 MB/m | RSS growth rate to flag potential leak           |
 
 ---
 
@@ -832,18 +883,18 @@ The invention is fully enabled by the reference implementation:
 The complete source code constitutes the enablement disclosure. Key methods
 and their locations in the reference implementation:
 
-| Claim Element                     | Method                          | Module                  |
-|-----------------------------------|---------------------------------|-------------------------|
-| Kernel pressure oracle            | `_get_macos_pressure_level()`   | `app/performance_gui.py`|
-| Memory anatomy parser             | `_parse_vm_stat()`              | `app/performance_gui.py`|
-| Genealogy engine                  | `_build_memory_ancestry()`      | `app/performance_gui.py`|
-| Exhaustion forecaster             | `_compute_mem_forecast()`       | `app/performance_gui.py`|
-| Predictive Remediation Engine     | `_compute_effective_tier()`     | `app/performance_gui.py`|
-| CPU-RAM Conflict Resolution Gate  | `_check_cpu()` (restore branch) | `app/performance_gui.py`|
-| Remediation cascade               | `_tiered_memory_remediation()`  | `app/performance_gui.py`|
-| Genealogy-guided freeze scoring   | `_freeze_background_daemons()`  | `app/performance_gui.py`|
-| XPC Respawn Guard + blocklist     | `_detect_xpc_respawn()`         | `app/performance_gui.py`|
-| Auto-Thaw restoration loop        | `_thaw_frozen_daemons()`        | `app/performance_gui.py`|
+| Claim Element                    | Method                          | Module                   |
+| -------------------------------- | ------------------------------- | ------------------------ |
+| Kernel pressure oracle           | `_get_macos_pressure_level()`   | `app/performance_gui.py` |
+| Memory anatomy parser            | `_parse_vm_stat()`              | `app/performance_gui.py` |
+| Genealogy engine                 | `_build_memory_ancestry()`      | `app/performance_gui.py` |
+| Exhaustion forecaster            | `_compute_mem_forecast()`       | `app/performance_gui.py` |
+| Predictive Remediation Engine    | `_compute_effective_tier()`     | `app/performance_gui.py` |
+| CPU-RAM Conflict Resolution Gate | `_check_cpu()` (restore branch) | `app/performance_gui.py` |
+| Remediation cascade              | `_tiered_memory_remediation()`  | `app/performance_gui.py` |
+| Genealogy-guided freeze scoring  | `_freeze_background_daemons()`  | `app/performance_gui.py` |
+| XPC Respawn Guard + blocklist    | `_detect_xpc_respawn()`         | `app/performance_gui.py` |
+| Auto-Thaw restoration loop       | `_thaw_frozen_daemons()`        | `app/performance_gui.py` |
 
 ---
 
@@ -862,7 +913,7 @@ Before submitting, confirm the following items are ready:
 - [ ] **Filing fee** — current PPA fee: USD 320 (small entity) / USD 160 (micro-entity)
   - Micro-entity: income ≤ 3× U.S. median household income; ≤ 4 prior patents
 - [ ] **Confirmation number** — save the USPTO-issued confirmation and
-  application number; this establishes your **Priority Date**
+      application number; this establishes your **Priority Date**
 
 > **Priority Date Note:** A Provisional Patent Application establishes a
 > priority date but does NOT become a patent. A non-provisional application
@@ -871,7 +922,7 @@ Before submitting, confirm the following items are ready:
 
 ---
 
-*Prepared by: itsmeSugunakar · 2026-04-05*
-*This document is a technical specification for a Provisional Patent
+_Prepared by: itsmeSugunakar · 2026-04-05_
+_This document is a technical specification for a Provisional Patent
 Application. It does not constitute legal advice. For formal patent
-prosecution, consult a registered USPTO patent attorney or agent.*
+prosecution, consult a registered USPTO patent attorney or agent._

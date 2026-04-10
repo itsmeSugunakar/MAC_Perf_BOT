@@ -5,7 +5,7 @@ Opens a live dashboard in your browser. No GUI dependencies needed.
 Backend: Python http.server  |  Frontend: Chart.js (CDN)
 """
 
-import os, sys, time, json, threading, subprocess, webbrowser, sqlite3
+import os, sys, time, json, threading, subprocess, webbrowser, sqlite3, math
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -58,19 +58,25 @@ class MetricsCache:
         disk_pct      REAL,
         pressure      TEXT,
         eff_tier      INTEGER,
-        tte_min       REAL
+        tte_min       REAL,
+        thermal_pct   INTEGER DEFAULT 100
     );
     CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts);
     """
 
     def __init__(self, db_path: Path):
         self._db   = str(db_path)
-        self._buf  = []   # [(ts, cpu, mem, swap, disk, pressure, tier, tte)]
+        self._buf  = []   # [(ts, cpu, mem, swap, disk, pressure, tier, tte, therm)]
         self._last_prune = 0.0
         self._ok   = False
         try:
             with sqlite3.connect(self._db, timeout=5) as cx:
                 cx.executescript(self._SCHEMA)
+                # Migrate existing databases missing the thermal_pct column
+                try:
+                    cx.execute("ALTER TABLE metrics ADD COLUMN thermal_pct INTEGER DEFAULT 100")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
             self._ok = True
         except Exception as e:
             # Cache failure is non-fatal — bot continues without it
@@ -78,10 +84,10 @@ class MetricsCache:
 
     # ── public ────────────────────────────────────────────────────────────────
 
-    def record(self, ts, cpu, mem, swap, disk, pressure, tier, tte):
+    def record(self, ts, cpu, mem, swap, disk, pressure, tier, tte, therm=100):
         """Append one row to the in-memory buffer (no disk I/O)."""
         if self._ok:
-            self._buf.append((int(ts), cpu, mem, swap, disk, pressure, tier, tte))
+            self._buf.append((int(ts), cpu, mem, swap, disk, pressure, tier, tte, therm))
 
     def flush(self):
         """Write buffered rows to SQLite and clear the buffer."""
@@ -91,7 +97,7 @@ class MetricsCache:
         try:
             with sqlite3.connect(self._db, timeout=5) as cx:
                 cx.executemany(
-                    "INSERT INTO metrics VALUES (?,?,?,?,?,?,?,?)", rows
+                    "INSERT INTO metrics VALUES (?,?,?,?,?,?,?,?,?)", rows
                 )
         except Exception as e:
             print(f"[cache] flush failed: {e}", file=sys.stderr)
@@ -247,6 +253,40 @@ TTE_TIER4_MIN    =  2.0   # trigger Tier 4 early when TTE ≤ this
 TTE_MIN_SAMPLES  = 20     # minimum mem_hist samples before TTE can drive escalation
 XPC_RESPAWN_S    = 10     # seconds; services restarting within this window → blocklisted
 
+# ─── MMAF — Multi-Model Adaptive Forecaster ───────────────────────────────────
+MMAF_MIN_SAMPLES = 10     # minimum samples before any model engages
+MMAF_WINDOW      = 30     # rolling window size for model fitting (seconds)
+MMAF_TARGET_PCT  = 95.0   # forecast target RAM %
+
+# ─── CEO — Compression Efficiency Oracle ──────────────────────────────────────
+CPI_TIER2            = 0.50   # CPI ≥ this → compression headroom degrading
+CPI_TIER3            = 0.75   # CPI ≥ this → compressor near exhaustion
+CEO_MIN_COMPRESSED   = 200    # MB; below this CEO signal is noise-floored
+
+# ─── MSCEE — Multi-Signal Consensus Escalation Engine ─────────────────────────
+MSCEE_QUORUM         = 0.55   # weighted vote share required to adopt a tier
+
+# ─── GTS — Graduated Thaw Sequencer ──────────────────────────────────────────
+GTS_WAIT_S           = 2.0    # seconds between successive SIGCONT sends
+GTS_MEM_GATE_PCT     = 5.0    # abort thaw if RAM rises more than this since thaw began
+
+# ─── ATCE — Adaptive Threshold Calibration Engine ─────────────────────────────
+ATCE_PERCENTILE      = 75     # 75th‑pct of historical RAM as Tier 2 calibrated threshold
+ATCE_COOL_S          = 3600   # recalibrate at most once per hour
+ATCE_MIN_ROWS        = 1000   # minimum DB rows before calibration runs
+
+# ─── CMPE — Circadian Memory Pattern Engine ───────────────────────────────────
+CMPE_PRE_FREEZE_SCORE = 70.0  # hour avg ≥ this triggers proactive pre-freeze
+CMPE_COOL_S          = 3600   # circadian check once per hour
+
+# ─── TMCP — Thermal-Memory Coupling Predictor ─────────────────────────────────
+TMCP_LEARN_RATE      = 0.10   # EMA learning rate for thermal→memory coupling
+TMCP_COOL_S          = 3600   # recompute coupling factor once per hour
+TMCP_MIN_SAMPLES     = 5      # minimum thermal-throttled rows before coupling applied
+
+# ─── RVMS — RSS Velocity Momentum Scorer ──────────────────────────────────────
+RVMS_MAX_BOOST       = 2.0    # maximum velocity momentum multiplier
+
 
 # ─── Bot Engine ───────────────────────────────────────────────────────────────
 class BotEngine(threading.Thread):
@@ -254,9 +294,9 @@ class BotEngine(threading.Thread):
         super().__init__(daemon=True, name="bot-engine")
         self._lock            = threading.Lock()
         self.running          = True
-        self.cpu_hist         = []
-        self.mem_hist         = []
-        self.swap_hist        = []
+        self.cpu_hist         = deque(maxlen=HISTORY_LEN)
+        self.mem_hist         = deque(maxlen=HISTORY_LEN)
+        self.swap_hist        = deque(maxlen=HISTORY_LEN)
         self.top_procs        = []
         self.throttled        = {}      # pid → name
         self.events           = deque(maxlen=200)   # O(1) append+bound, no pop(0)
@@ -307,10 +347,36 @@ class BotEngine(threading.Thread):
         # App-level predictions derived from cache; refreshed every 24 h
         self.app_predictions: list = []       # [{app, avg_mb, trend, risk}]
         self._last_app_predict: float = 0.0
+        self._paused: bool = False
+        # ── MMAF: Multi-Model Adaptive Forecaster ────────────────────────────
+        self._last_forecast_model: str = "linear"
+        # ── ATCE: Adaptive Threshold Calibration Engine ───────────────────────
+        self._cal_thresholds: dict = {}
+        self._last_atce: float = 0.0
+        # ── CMPE: Circadian Memory Pattern Engine ─────────────────────────────
+        self._circadian_profile: dict = {}    # hour(int) → avg_mem_pct
+        self._last_circadian: float = 0.0
+        # ── CEO: Compression Efficiency Oracle ────────────────────────────────
+        self._compression_pressure: float = 0.0
+        # ── TMCP: Thermal-Memory Coupling Predictor ───────────────────────────
+        self._thermal_coupling: float = 0.0
+        self._last_tmcp: float = 0.0
+        # ── RVMS: RSS Velocity Momentum Scorer ────────────────────────────────
+        self._rss_velocity: dict = {}         # pid → (ts, rss_mb)
+        # ── Swap velocity ─────────────────────────────────────────────────────
+        self._swap_velocity: float = 0.0
+        self._last_swap_used: float = 0.0
+        self._last_swap_ts: float = 0.0
 
     # ── public ────────────────────────────────────────────────────────────────
     def stop(self):
         self.running = False
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
 
     def snapshot(self):
         with self._lock:
@@ -342,6 +408,14 @@ class BotEngine(threading.Thread):
                 "cache_db_mb":          round(self.cache_db_mb, 2),
                 "cache_rows":           self.cache_rows,
                 "app_predictions":      list(self.app_predictions),
+                "frozen_count":         len(self._frozen_pids),
+                "leak_pids":            len(self._warned_leaks),
+                "forecast_model":       self._last_forecast_model,
+                "compression_pressure": round(self._compression_pressure, 3),
+                "swap_velocity":        round(self._swap_velocity, 1),
+                "cal_thresholds":       dict(self._cal_thresholds),
+                "circadian_profile":    {str(k): v for k, v in self._circadian_profile.items()},
+                "thermal_coupling":     round(self._thermal_coupling, 3),
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
@@ -355,32 +429,36 @@ class BotEngine(threading.Thread):
         self._emit("info", "Performance Bot started — monitoring every second.")
         tick = 0
         while self.running:
-            try:
-                self._collect()                                          # 1 Hz — single process scan
-                if tick % 3  == 0: self._check_memory()                 # 0.33 Hz
-                if tick % 5  == 0: self._update_pressure_and_forecast() # 0.2 Hz — sysctl + vm_stat
-                if tick % 10 == 0: self._check_disk()                   # 0.1 Hz
-                if tick % 30 == 0: self._check_power_mode()             # 0.03 Hz
-                if tick % 30 == 0: self._detect_xpc_respawn()           # 0.03 Hz (was 0.1 Hz)
-                if tick % 60 == 0: self._check_thermal()                # 0.016 Hz — pmset subprocess
-                if tick % 60 == 0: self._check_zombies()
-                if tick % 60 == 0: self._track_memory_leaks()
-                if tick % IDLE_SWEEP_S == 0: self._sweep_idle_services()
-                if tick % 300 == 0 and tick > 0: self._check_caches()
-                if tick % CACHE_WRITE_S == 0:
-                    self._cache.flush()
-                    self._cache.prune()
-                    self.cache_db_mb = self._cache.db_size_mb()
-                    self.cache_rows  = self._cache.row_count()
-                if tick % 3600 == 0 and tick > 0:
-                    self._analyse_app_predictions()
-            except Exception as exc:
-                self._emit("warn", f"Engine error: {exc}")
+            if not self._paused:
+                try:
+                    self._collect(tick)                                      # 1 Hz — single process scan
+                    if tick % 3  == 0: self._check_memory()                 # 0.33 Hz
+                    if tick % 5  == 0: self._update_pressure_and_forecast() # 0.2 Hz — sysctl + vm_stat
+                    if tick % 10 == 0: self._check_disk()                   # 0.1 Hz
+                    if tick % 30 == 0: self._check_power_mode()             # 0.03 Hz
+                    if tick % 30 == 0: self._detect_xpc_respawn()           # 0.03 Hz (was 0.1 Hz)
+                    if tick % 60 == 0: self._check_thermal()                # 0.016 Hz — pmset subprocess
+                    if tick % 60 == 0: self._check_zombies()
+                    if tick % 60 == 0: self._track_memory_leaks()
+                    if tick % IDLE_SWEEP_S == 0: self._sweep_idle_services()
+                    if tick % 60  == 0: self._check_circadian_pressure()
+                    if tick % 300 == 0 and tick > 0: self._check_caches()
+                    if tick % CACHE_WRITE_S == 0:
+                        self._cache.flush()
+                        self._cache.prune()
+                        self.cache_db_mb = self._cache.db_size_mb()
+                        self.cache_rows  = self._cache.row_count()
+                    if tick % 3600 == 0 and tick > 0:
+                        self._analyse_app_predictions()
+                        self._calibrate_thresholds()
+                        self._compute_thermal_coupling()
+                except Exception as exc:
+                    self._emit("warn", f"Engine error: {exc}")
             tick += 1
             time.sleep(1)
         self._emit("info", "Performance Bot stopped.")
 
-    def _collect(self):
+    def _collect(self, tick: int):
         """
         Single process scan per second.
         Collects system metrics AND performs CPU throttle detection in one
@@ -432,24 +510,27 @@ class BotEngine(threading.Thread):
         # Apply new throttles (outside the iteration loop)
         for p, name, pid, c in to_throttle:
             try:
-                p.nice(RENICE_VAL)
+                p.nice(RENICE_VAL)   # syscall — outside lock
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            with self._lock:
                 self.throttled[pid] = name
                 self.actions += 1
                 self.issues  += 1
-                self._emit("fix",
-                    f"AUTO-THROTTLED {name} (PID {pid}): "
-                    f"{c:.0f}% CPU → nice set to {RENICE_VAL}")
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+            self._emit("fix",
+                f"AUTO-THROTTLED {name} (PID {pid}): "
+                f"{c:.0f}% CPU → nice set to {RENICE_VAL}")
 
         swap_pct = swap.percent if swap.total > 0 else 0.0
+
+        # Swap velocity (RVMS input) — computed before acquiring lock
+        now_ts      = time.time()
+        swap_used_mb = swap.used / 1e6
+
         with self._lock:
             self.cpu_hist.append(cpu)
             self.mem_hist.append(vm.percent)
             self.swap_hist.append(swap_pct)
-            if len(self.cpu_hist)  > HISTORY_LEN: self.cpu_hist.pop(0)
-            if len(self.mem_hist)  > HISTORY_LEN: self.mem_hist.pop(0)
-            if len(self.swap_hist) > HISTORY_LEN: self.swap_hist.pop(0)
             self.top_procs = rows[:12]
             # stash vm/swap for _check_memory() — avoids a second virtual_memory() call
             self._last_vm   = vm
@@ -457,13 +538,20 @@ class BotEngine(threading.Thread):
             _tier = self.effective_tier
             _tte  = self.mem_forecast_min
             _pres = self.mem_pressure_level
+            _therm = self.thermal_pct
+            # Swap velocity update
+            if self._last_swap_ts > 0 and now_ts - self._last_swap_ts >= 1:
+                sv = max(0.0, (swap_used_mb - self._last_swap_used) / (now_ts - self._last_swap_ts))
+                self._swap_velocity = sv
+            self._last_swap_ts   = now_ts
+            self._last_swap_used = swap_used_mb
 
         # Cache: record every 10 s (use stored disk_pct — updated by _check_disk())
-        if int(time.time()) % 10 == 0:
+        if tick % 10 == 0:
             self._cache.record(
-                int(time.time()), round(cpu, 1), round(vm.percent, 1),
+                int(now_ts), round(cpu, 1), round(vm.percent, 1),
                 round(swap_pct, 1), round(self._last_disk_pct, 1),
-                _pres, _tier, _tte
+                _pres, _tier, _tte, _therm
             )
 
     def _restore_calmed_procs(self, ram_lock: bool):
@@ -497,13 +585,16 @@ class BotEngine(threading.Thread):
                                 f"{p.name()} (PID {pid}) — top RAM family under "
                                 f"Tier 3+ pressure ({c:.0f}% CPU)")
                             continue
-                    p.nice(0)
-                    name = self.throttled.pop(pid)
-                    self.actions += 1
-                    self._emit("fix",
-                        f"Priority restored: {name} (PID {pid}) — CPU back to {c:.0f}%")
-            except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
-                self.throttled.pop(pid, None)
+                    p.nice(0)   # syscall — outside lock
+                    with self._lock:
+                        name = self.throttled.pop(pid, None)
+                        self.actions += 1
+                    if name:
+                        self._emit("fix",
+                            f"Priority restored: {name} (PID {pid}) — CPU back to {c:.0f}%")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                with self._lock:
+                    self.throttled.pop(pid, None)
 
     def _check_memory(self):
         with self._lock:
@@ -700,7 +791,7 @@ class BotEngine(threading.Thread):
                 if name in self._no_kill: continue
 
                 stat = p.info["status"]
-                cpu  = p.cpu_percent(interval=None) / (psutil.cpu_count(logical=True) or 1)
+                cpu  = p.cpu_percent(interval=None) / self._ncpu
                 rss  = (p.info.get("memory_info") or p.memory_info()).rss / 1e6
 
                 is_idle_service = (
@@ -798,35 +889,84 @@ class BotEngine(threading.Thread):
 
     def _compute_effective_tier(self, mem_pct: float):
         """
-        Determine the effective remediation tier by combining static RAM-% thresholds
-        with the OLS Time-to-Exhaustion forecast. When TTE predicts imminent exhaustion,
-        the effective tier is escalated ABOVE what the raw percentage would trigger —
-        this is the core of the Predictive Remediation Engine patent claim.
+        MSCEE — Multi-Signal Consensus Escalation Engine.
+        Combines 6 independent signals via weighted quorum voting. A tier is
+        adopted only when its cumulative weighted vote share ≥ MSCEE_QUORUM,
+        preventing any single-signal false escalation.
+
+        Signals (weights sum to 1.0):
+          S1 (0.30): Static RAM % with ATCE-calibrated thresholds
+          S2 (0.25): TTE forecast from MMAF
+          S3 (0.20): macOS kernel pressure oracle (sysctl)
+          S4 (0.12): CEO Compression Pressure Index
+          S5 (0.08): Swap velocity (MB/s)
+          S6 (0.05): Circadian hour-of-day pattern (CMPE)
 
         Returns: (effective_tier: int, threshold_tier: int)
-          threshold_tier = tier driven by mem_pct alone (0–4)
-          effective_tier = tier after TTE escalation (may exceed threshold_tier)
         """
-        # ── Threshold tier from static percentages ────────────────────────────
-        if   mem_pct >= MEM_TIER4_PCT: threshold_tier = 4
-        elif mem_pct >= MEM_TIER3_PCT: threshold_tier = 3
-        elif mem_pct >= MEM_TIER2_PCT: threshold_tier = 2
-        elif mem_pct >= MEM_WARN:      threshold_tier = 1
-        else:                          threshold_tier = 0
+        # ── S1: RAM % with ATCE-calibrated thresholds ─────────────────────────
+        cal  = self._cal_thresholds
+        t2   = cal.get("tier2", MEM_TIER2_PCT)
+        t3   = cal.get("tier3", MEM_TIER3_PCT)
+        t4   = cal.get("tier4", MEM_TIER4_PCT)
+        if   mem_pct >= t4: s1 = 4
+        elif mem_pct >= t3: s1 = 3
+        elif mem_pct >= t2: s1 = 2
+        elif mem_pct >= MEM_WARN: s1 = 1
+        else: s1 = 0
+        threshold_tier = s1
 
-        # ── TTE escalation — only when we have enough history ─────────────────
+        # ── S2: TTE from MMAF ─────────────────────────────────────────────────
         with self._lock:
             hist_len = len(self.mem_hist)
             tte      = self.mem_forecast_min
         if hist_len < TTE_MIN_SAMPLES or tte < 0:
-            return threshold_tier, threshold_tier   # stable/declining — no escalation
+            s2 = 0
+        elif tte <= TTE_TIER4_MIN: s2 = 4
+        elif tte <= TTE_TIER3_MIN: s2 = 3
+        elif tte <= TTE_TIER2_MIN: s2 = 2
+        else:                      s2 = 1
 
-        predictive_tier = threshold_tier
-        if   tte <= TTE_TIER4_MIN: predictive_tier = max(predictive_tier, 4)
-        elif tte <= TTE_TIER3_MIN: predictive_tier = max(predictive_tier, 3)
-        elif tte <= TTE_TIER2_MIN: predictive_tier = max(predictive_tier, 2)
+        # ── S3: kernel oracle ─────────────────────────────────────────────────
+        with self._lock:
+            kp = self.mem_pressure_level
+        s3 = {"normal": 0, "warn": 2, "critical": 4}.get(kp, 0)
 
-        return predictive_tier, threshold_tier
+        # ── S4: CEO compression pressure ──────────────────────────────────────
+        with self._lock:
+            cpi = self._compression_pressure
+        if   cpi >= CPI_TIER3: s4 = 3
+        elif cpi >= CPI_TIER2: s4 = 2
+        else:                  s4 = 0
+
+        # ── S5: swap velocity ─────────────────────────────────────────────────
+        with self._lock:
+            sv = self._swap_velocity
+        if   sv >= 100: s5 = 3
+        elif sv >=  50: s5 = 2
+        elif sv >=  20: s5 = 1
+        else:           s5 = 0
+
+        # ── S6: circadian pattern (CMPE) ──────────────────────────────────────
+        hour = datetime.now().hour
+        with self._lock:
+            circ_avg = self._circadian_profile.get(hour, 0.0)
+        if   circ_avg >= CMPE_PRE_FREEZE_SCORE: s6 = 2
+        elif circ_avg >= MEM_WARN:              s6 = 1
+        else:                                   s6 = 0
+
+        # ── Weighted quorum vote (highest-tier-first) ─────────────────────────
+        W = {"s1": 0.30, "s2": 0.25, "s3": 0.20, "s4": 0.12, "s5": 0.08, "s6": 0.05}
+        sigs = {"s1": s1, "s2": s2, "s3": s3, "s4": s4, "s5": s5, "s6": s6}
+
+        effective_tier = threshold_tier
+        for candidate in range(4, 0, -1):
+            vote = sum(w for name, w in W.items() if sigs[name] >= candidate)
+            if vote >= MSCEE_QUORUM:
+                effective_tier = candidate
+                break
+
+        return effective_tier, threshold_tier
 
     def _detect_xpc_respawn(self):
         """
@@ -966,44 +1106,157 @@ class BotEngine(threading.Thread):
 
     def _compute_mem_forecast(self) -> float:
         """
-        Linear regression over the last 30 mem_hist samples to estimate minutes
-        until memory reaches 95%. Returns -1 if stable/declining or data is sparse.
+        MMAF — Multi-Model Adaptive Forecaster.
+        Fits three models (linear OLS, quadratic, exponential) over the last
+        MMAF_WINDOW mem_hist samples and selects the one with minimum residual
+        sum of squares. Returns the winning model's TTE (minutes to 95%) or
+        -1 if stable/declining. Stores winning model name in _last_forecast_model.
         """
         with self._lock:
             hist = list(self.mem_hist)
-        window = hist[-30:] if len(hist) >= 10 else []
-        if len(window) < 10:
+        window = hist[-MMAF_WINDOW:] if len(hist) >= MMAF_MIN_SAMPLES else []
+        if len(window) < MMAF_MIN_SAMPLES:
             return -1.0
-        n = len(window)
+
+        n    = len(window)
+        xs   = list(range(n))
+        last = window[-1]
+
+        best_tte   = -1.0
+        best_model = "linear"
+        best_rss   = float("inf")
+
+        # ── 1. Linear OLS ──────────────────────────────────────────────────────
         mean_x = (n - 1) / 2.0
         mean_y = sum(window) / n
-        num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(window))
-        den = sum((i - mean_x) ** 2 for i in range(n))
-        if den == 0:
-            return -1.0
-        slope = num / den          # % per second (1 sample = 1 s)
-        if slope < 0.005:          # stable or declining
-            return -1.0
-        current = window[-1]
-        target  = 95.0
-        if current >= target:
+        num_l  = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, window))
+        den_l  = sum((x - mean_x) ** 2 for x in xs)
+        if den_l > 0:
+            m_l = num_l / den_l
+            b_l = mean_y - m_l * mean_x
+            rss_l = sum((m_l * x + b_l - y) ** 2 for x, y in zip(xs, window))
+            if m_l >= 0.005 and last < MMAF_TARGET_PCT:
+                tte_l = round((MMAF_TARGET_PCT - last) / m_l / 60, 1)
+            else:
+                tte_l = -1.0
+            if rss_l < best_rss:
+                best_rss, best_tte, best_model = rss_l, tte_l, "linear"
+
+        # ── 2. Quadratic (Vandermonde normal equations, Cramer's rule) ─────────
+        try:
+            sx0=n; sx1=sum(xs); sx2=sum(x**2 for x in xs)
+            sx3=sum(x**3 for x in xs); sx4=sum(x**4 for x in xs)
+            sy0=sum(window)
+            sy1=sum(x*y for x,y in zip(xs,window))
+            sy2=sum(x**2*y for x,y in zip(xs,window))
+            def _det3(M):
+                return (M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1])
+                       -M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0])
+                       +M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]))
+            Mq=[[sx4,sx3,sx2],[sx3,sx2,sx1],[sx2,sx1,sx0]]
+            D=_det3(Mq)
+            if abs(D) > 1e-12:
+                def _cr(col,rhs):
+                    m2=[list(r) for r in Mq]
+                    for i in range(3): m2[i][col]=rhs[i]
+                    return m2
+                R=[sy2,sy1,sy0]
+                qa=_det3(_cr(0,R))/D; qb=_det3(_cr(1,R))/D; qc=_det3(_cr(2,R))/D
+                rss_q=sum((qa*x**2+qb*x+qc-y)**2 for x,y in zip(xs,window))
+                slope_q = 2*qa*(n-1)+qb
+                if slope_q >= 0.005 and last < MMAF_TARGET_PCT:
+                    tte_q=-1.0
+                    for step in range(1, 7200):
+                        if qa*(n-1+step)**2+qb*(n-1+step)+qc >= MMAF_TARGET_PCT:
+                            tte_q=round(step/60,1); break
+                else:
+                    tte_q=-1.0
+                if rss_q < best_rss:
+                    best_rss, best_tte, best_model = rss_q, tte_q, "quadratic"
+        except Exception:
+            pass
+
+        # ── 3. Exponential (log-linearised OLS) ───────────────────────────────
+        try:
+            if min(window) > 0:
+                log_w=[math.log(y) for y in window]
+                mean_ly=sum(log_w)/n
+                num_e=sum((x-mean_x)*(ly-mean_ly) for x,ly in zip(xs,log_w))
+                if den_l > 0 and num_e > 0:
+                    me=num_e/den_l
+                    be=mean_ly - me*mean_x
+                    rss_e=sum((math.exp(be+me*x)-y)**2 for x,y in zip(xs,window))
+                    if last < MMAF_TARGET_PCT:
+                        x_95=(math.log(MMAF_TARGET_PCT)-be)/me
+                        tte_e=round((x_95-(n-1))/60,1) if x_95>(n-1) else 0.0
+                    else:
+                        tte_e=-1.0
+                    if rss_e < best_rss:
+                        best_rss, best_tte, best_model = rss_e, tte_e, "exponential"
+        except Exception:
+            pass
+
+        with self._lock:
+            self._last_forecast_model = best_model
+        return best_tte
+
+    def _compute_compression_pressure(self, vm_bd: dict) -> float:
+        """
+        CEO — Compression Efficiency Oracle.
+        CPI = compressed / (compressed + purgeable). A high CPI means the
+        compressor is nearly out of purgeable headroom; next allocation will
+        hit swap. Returns 0.0 when compressed memory is below noise floor.
+        """
+        compressed = vm_bd.get("compressed", 0)
+        purgeable  = vm_bd.get("purgeable",  0)
+        if compressed < CEO_MIN_COMPRESSED:
             return 0.0
-        return round((target - current) / slope / 60, 1)
+        denom = compressed + purgeable
+        return round(compressed / denom, 3) if denom >= 1 else 0.0
+
+    def _adjust_tte_for_thermal(self, tte: float) -> float:
+        """
+        TMCP — Thermal-Memory Coupling Predictor.
+        Shortens TTE when thermal throttling is active and the historically
+        learned coupling coefficient is positive. Under throttle, apps stall
+        on CPU-bound paths longer, leaking partial allocations — so exhaustion
+        arrives sooner than raw OLS predicts.
+        """
+        if tte <= 0 or self._thermal_coupling <= 0:
+            return tte
+        with self._lock:
+            therm = self.thermal_pct
+        if therm >= 100:
+            return tte
+        throttle_fraction = (100 - therm) / 100.0
+        adjustment = max(1.0 - self._thermal_coupling * throttle_fraction, 0.5)
+        return round(tte * adjustment, 1)
 
     def _update_pressure_and_forecast(self):
-        """Refresh kernel pressure level, vm_stat breakdown, and forecast every 5 s."""
+        """Refresh kernel pressure level, vm_stat breakdown, CEO CPI, and forecast every 5 s."""
         level    = self._get_macos_pressure_level()
         forecast = self._compute_mem_forecast()
+        forecast = self._adjust_tte_for_thermal(forecast)
         vm_bd    = self._parse_vm_stat()
+        cpi      = self._compute_compression_pressure(vm_bd)
         with self._lock:
-            self.mem_pressure_level = level
-            self.mem_forecast_min   = forecast
-            self.vm_breakdown       = vm_bd
+            self.mem_pressure_level    = level
+            self.mem_forecast_min      = forecast
+            self.vm_breakdown          = vm_bd
+            self._compression_pressure = cpi
         if level == "critical":
             vm = psutil.virtual_memory()
             self._emit("issue",
                 f"Kernel memory pressure: CRITICAL — system at {vm.percent:.0f}% RAM")
-        # Ancestry is expensive; refresh every 30 s outside of pressure events
+        if cpi >= CPI_TIER3:
+            self._emit("warn",
+                f"CEO: Compression near exhaustion (CPI={cpi:.2f}) — "
+                f"purgeable headroom depleted, swap imminent")
+        elif cpi >= CPI_TIER2:
+            self._emit("issue",
+                f"CEO: Compression efficiency degrading (CPI={cpi:.2f}) — "
+                f"purgeable headroom running low")
+        # Ancestry is expensive; refresh at most every MEM_ANCESTRY_COOL_S
         now = time.time()
         if now - self._last_ancestry >= MEM_ANCESTRY_COOL_S:
             self._last_ancestry = now
@@ -1065,26 +1318,47 @@ class BotEngine(threading.Thread):
         if effective_tier >= 4:
             self._sweep_idle_services()
 
+    def _get_process_velocity(self, pid: int, rss_mb: float) -> float:
+        """
+        RVMS — RSS Velocity Momentum Scorer.
+        Returns a multiplier [1.0, RVMS_MAX_BOOST] proportional to how fast
+        this process's RSS has grown since the last observation. A rapidly
+        growing process is prioritised as a freeze candidate — velocity is a
+        leading indicator of imminent pressure amplification.
+        """
+        now  = time.time()
+        prev = self._rss_velocity.get(pid)
+        self._rss_velocity[pid] = (now, rss_mb)
+        if prev is None:
+            return 1.0
+        prev_ts, prev_rss = prev
+        elapsed = now - prev_ts
+        if elapsed < 1:
+            return 1.0
+        growth = rss_mb - prev_rss
+        if growth <= 0:
+            return 1.0
+        rate  = growth / elapsed           # MB/s
+        boost = min(1.0 + rate / 10.0, RVMS_MAX_BOOST)
+        return round(boost, 2)
+
     def _freeze_background_daemons(self):
         """
-        Genealogy-guided SIGSTOP: score background daemon candidates using two signals:
+        Genealogy-guided SIGSTOP with RVMS velocity boost:
           family_match (weight 2): process belongs to a top-RSS application family
-                                   identified by the ppid-tree genealogy walk
-          pattern_match (weight 1): name matches the known-safe FREEZE_PATTERNS list
-        Candidates are sorted by (score DESC, rss DESC) so that daemons belonging to
-        the heaviest RAM-owning families are frozen first — maximally targeted pressure
-        relief rather than arbitrary pattern matching.
+          pattern_match (weight 1): name matches FREEZE_PATTERNS safe list
+          velocity_boost (RVMS):    multiplier [1.0, 2.0] based on RSS growth rate
+        composite = (family_match*2 + pattern_match) * velocity_boost
+        Sorted by composite DESC then RSS DESC — heaviest, fastest-growing
+        daemons frozen first.
         """
         self._last_freeze = time.time()
 
-        # Snapshot ancestry for genealogy scoring
         with self._lock:
-            ancestry_snap = list(self.mem_ancestry)  # [{app, mb, pct}]
+            ancestry_snap = list(self.mem_ancestry)
 
-        # Build set of root-app names that own significant RAM (top 5 families)
         heavy_families = {entry["app"].lower() for entry in ancestry_snap[:5]}
 
-        # ── Score all candidate processes ─────────────────────────────────────
         candidates = []
         for p in psutil.process_iter(["pid", "name", "ppid", "status",
                                        "username", "memory_info"]):
@@ -1101,25 +1375,26 @@ class BotEngine(threading.Thread):
 
                 rss = (p.info.get("memory_info") or p.memory_info()).rss / 1e6
 
-                # Scoring: genealogy match outweighs pattern match
                 pattern_match = int(any(pat in name for pat in FREEZE_PATTERNS))
                 name_lower    = name.lower()
                 family_match  = int(any(fam in name_lower or name_lower in fam
                                         for fam in heavy_families))
-                score = family_match * 2 + pattern_match
+                base_score = family_match * 2 + pattern_match
+                if base_score == 0:
+                    continue
 
-                if score == 0:
-                    continue   # not a freeze candidate at all
+                # RVMS: multiply composite score by velocity momentum
+                vboost = self._get_process_velocity(p.pid, rss)
+                score  = base_score * vboost
 
-                candidates.append((score, rss, p.pid, name, p))
+                candidates.append((score, rss, p.pid, name, p, vboost))
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-        # Sort: highest score first, then highest RSS
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
         frozen, freed_mb = 0, 0.0
-        for score, rss, pid, name, p in candidates:
+        for score, rss, pid, name, p, vboost in candidates:
             try:
                 p.send_signal(19)  # SIGSTOP — reversible suspension
                 self._frozen_pids[pid] = (name, time.time(), rss)
@@ -1127,7 +1402,6 @@ class BotEngine(threading.Thread):
                 frozen   += 1
                 self.actions += 1
 
-                # Emit genealogy attribution when family-matched
                 with self._lock:
                     ancestry_snap2 = list(self.mem_ancestry)
                 family_info = next(
@@ -1136,14 +1410,15 @@ class BotEngine(threading.Thread):
                      if e["app"].lower() in name.lower() or name.lower() in e["app"].lower()),
                     None
                 )
+                boost_tag = f", RVMS×{vboost:.1f}" if vboost > 1.05 else ""
                 if family_info:
                     self._emit("fix",
-                        f"GENEALOGY FREEZE: {name} (PID {pid}, {rss:.0f}MB) "
+                        f"GENEALOGY FREEZE: {name} (PID {pid}, {rss:.0f}MB{boost_tag}) "
                         f"← {family_info} — SIGSTOP applied")
                 else:
                     self._emit("fix",
-                        f"PATTERN FREEZE: {name} (PID {pid}, {rss:.0f}MB) "
-                        f"— SIGSTOP applied (score={score})")
+                        f"PATTERN FREEZE: {name} (PID {pid}, {rss:.0f}MB{boost_tag}) "
+                        f"— SIGSTOP applied (score={score:.1f})")
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
@@ -1155,11 +1430,20 @@ class BotEngine(threading.Thread):
 
     def _thaw_frozen_daemons(self):
         """
-        Send SIGCONT to all frozen daemons when system memory pressure eases.
-        Called automatically from _check_memory when usage drops below threshold.
+        GTS — Graduated Thaw Sequencer.
+        Sends SIGCONT in ascending RSS order (smallest first) with GTS_WAIT_S
+        inter-signal gap. After each thaw, checks whether RAM has risen above
+        the baseline + GTS_MEM_GATE_PCT threshold — if so, aborts to prevent
+        the thundering-herd spike that bulk-SIGCONT can cause.
         """
-        to_thaw = list(self._frozen_pids.items())
+        to_thaw = sorted(
+            self._frozen_pids.items(), key=lambda kv: kv[1][2]   # sort by rss_mb asc
+        )
+        with self._lock:
+            baseline_mem = self._last_vm.percent
+
         thawed  = []
+        aborted = False
         for pid, (name, _ts, _rss) in to_thaw:
             try:
                 psutil.Process(pid).send_signal(18)  # SIGCONT — resume
@@ -1167,10 +1451,159 @@ class BotEngine(threading.Thread):
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
             self._frozen_pids.pop(pid, None)
+            time.sleep(GTS_WAIT_S)
+            current_mem = psutil.virtual_memory().percent
+            if current_mem > baseline_mem + GTS_MEM_GATE_PCT:
+                aborted = True
+                remaining = len(to_thaw) - len(thawed)
+                self._emit("warn",
+                    f"GTS abort: RAM rose {current_mem - baseline_mem:.1f}% "
+                    f"during graduated thaw — {remaining} daemon(s) remain frozen")
+                break
+
         if thawed:
+            suffix = " (partial — memory gate triggered)" if aborted else ""
             self._emit("fix",
-                f"Pressure normalised — thawed {len(thawed)} daemons: "
+                f"GTS: graduated-thaw of {len(thawed)} daemon(s){suffix}: "
                 + ", ".join(thawed[:4]))
+
+    # ── ATCE: Adaptive Threshold Calibration Engine ───────────────────────────
+
+    def _calibrate_thresholds(self):
+        """
+        ATCE — Adaptive Threshold Calibration Engine.
+        Reads the last 30 days of mem_pct from the 90-day cache and sets
+        Tier 2/3/4 thresholds to the 75th/85th/93rd historical percentiles.
+        Self-tunes the bot's response thresholds to each machine's real usage
+        patterns rather than using fixed global defaults. Runs once per hour;
+        requires ATCE_MIN_ROWS rows in the cache.
+        """
+        now = time.time()
+        if now - self._last_atce < ATCE_COOL_S:
+            return
+        self._last_atce = now
+        if not self._cache._ok:
+            return
+        try:
+            with sqlite3.connect(self._cache._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT mem_pct FROM metrics WHERE ts >= ? ORDER BY mem_pct",
+                    (int(now - 30 * 86400),)
+                ).fetchall()
+            if len(rows) < ATCE_MIN_ROWS:
+                return
+            vals = [r[0] for r in rows if r[0] is not None]
+            n    = len(vals)
+            def pct(p):
+                return vals[max(0, min(int(p / 100 * n), n - 1))]
+            p75, p85, p93 = pct(ATCE_PERCENTILE), pct(85), pct(93)
+            if 60 <= p75 <= 92 and p75 < p85 < p93:
+                with self._lock:
+                    self._cal_thresholds = {
+                        "tier2": round(p75, 1),
+                        "tier3": round(p85, 1),
+                        "tier4": round(p93, 1),
+                    }
+                self._emit("info",
+                    f"ATCE: thresholds calibrated from {n} samples — "
+                    f"T2={p75:.0f}% T3={p85:.0f}% T4={p93:.0f}%")
+        except Exception:
+            pass
+
+    # ── CMPE: Circadian Memory Pattern Engine ─────────────────────────────────
+
+    def _check_circadian_pressure(self):
+        """
+        CMPE — Circadian Memory Pattern Engine.
+        Refreshes the hour-of-day profile and, if the current hour historically
+        averages ≥ CMPE_PRE_FREEZE_SCORE and current RAM ≥ MEM_WARN, triggers
+        a proactive pre-freeze before static thresholds would engage.
+        """
+        now = time.time()
+        if now - self._last_circadian < CMPE_COOL_S:
+            return
+        self._last_circadian = now
+        self._build_circadian_profile()
+
+        hour = datetime.now().hour
+        with self._lock:
+            circ_avg = self._circadian_profile.get(hour, 0.0)
+            mem_pct  = self._last_vm.percent
+
+        if circ_avg >= CMPE_PRE_FREEZE_SCORE and mem_pct >= MEM_WARN:
+            self._emit("warn",
+                f"CMPE: hour {hour:02d}:xx historically averages {circ_avg:.0f}% RAM "
+                f"— proactive freeze eligible (current: {mem_pct:.0f}%)")
+            if (not self._frozen_pids and
+                    mem_pct < MEM_TIER3_PCT and
+                    now - self._last_freeze >= FREEZE_COOL_S):
+                self._freeze_background_daemons()
+
+    def _build_circadian_profile(self):
+        """
+        Build {hour: avg_mem_pct} from last 30 days of cache data using a single
+        aggregate SQL query. Only 24 rows are returned to Python — zero raw data.
+        """
+        if not self._cache._ok:
+            return
+        try:
+            cutoff = int(time.time() - 30 * 86400)
+            with sqlite3.connect(self._cache._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT CAST(ts/3600 % 24 AS INTEGER) AS hr, AVG(mem_pct) "
+                    "FROM metrics WHERE ts >= ? GROUP BY hr",
+                    (cutoff,)
+                ).fetchall()
+            profile = {int(r[0]): round(r[1], 1) for r in rows if r[1] is not None}
+            with self._lock:
+                self._circadian_profile = profile
+        except Exception:
+            pass
+
+    # ── TMCP: Thermal-Memory Coupling Predictor ───────────────────────────────
+
+    def _compute_thermal_coupling(self):
+        """
+        TMCP learning step.
+        Queries throttled rows (thermal_pct < 100) from the last 30 days and
+        measures the correlation between thermal throttle depth and memory %.
+        Updates self._thermal_coupling via EMA — used by _adjust_tte_for_thermal()
+        to shorten TTE predictions during thermal events.
+        """
+        now = time.time()
+        if now - self._last_tmcp < TMCP_COOL_S:
+            return
+        self._last_tmcp = now
+        if not self._cache._ok:
+            return
+        try:
+            cutoff = int(now - 30 * 86400)
+            with sqlite3.connect(self._cache._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT thermal_pct, mem_pct FROM metrics "
+                    "WHERE ts >= ? AND thermal_pct IS NOT NULL AND thermal_pct < 100",
+                    (cutoff,)
+                ).fetchall()
+            if len(rows) < TMCP_MIN_SAMPLES:
+                return
+            tv = [r[0] for r in rows]
+            mv = [r[1] for r in rows]
+            n  = len(tv)
+            mt, mm = sum(tv)/n, sum(mv)/n
+            cov   = sum((t-mt)*(m-mm) for t,m in zip(tv,mv)) / n
+            var_t = sum((t-mt)**2 for t in tv) / n
+            if var_t < 1e-6:
+                return
+            coupling = min(abs(cov / var_t) / 100.0, 1.0)
+            self._thermal_coupling = (
+                TMCP_LEARN_RATE * coupling +
+                (1 - TMCP_LEARN_RATE) * self._thermal_coupling
+            )
+            self._emit("info",
+                f"TMCP: thermal coupling={self._thermal_coupling:.3f} "
+                f"(from {n} throttled samples)")
+        except Exception:
+            pass
 
     def _check_disk(self):
         try:
@@ -1672,10 +2105,40 @@ HTML = r"""<!DOCTYPE html>
           <span class="vmkey">XPC Blocked</span>
           <span class="vmval" id="vsXpcBlocked">—</span>
         </div>
+        <div class="vmrow">
+          <span class="vmkey">Frozen Daemons</span>
+          <span class="vmval" id="vsFrozen">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">Leak Alerts</span>
+          <span class="vmval" id="vsLeaks">—</span>
+        </div>
+        <div class="vmrow" style="border-top:1px solid var(--border);margin-top:3px;padding-top:4px">
+          <span class="vmkey">Forecast Model</span>
+          <span class="vmval" id="vsFcModel" style="color:var(--muted)">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">CPI (Compression)</span>
+          <span class="vmval" id="vsCpi">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">Swap Velocity</span>
+          <span class="vmval" id="vsSwapVel">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">Thermal Coupling</span>
+          <span class="vmval" id="vsThermalCoupling" style="color:var(--muted)">—</span>
+        </div>
         <div class="vmrow" style="border-top:1px solid var(--border);margin-top:3px;padding-top:4px">
           <span class="vmkey">Cache (90d)</span>
           <span class="vmval" id="vsCacheSize" style="color:var(--muted)">—</span>
         </div>
+      </div>
+
+      <!-- Memory Events mini-feed -->
+      <div class="vmrow-section" style="flex-shrink:0;max-height:140px;overflow-y:auto">
+        <div class="section-title" style="margin-bottom:4px;position:sticky;top:0;background:var(--surface);padding-bottom:3px;z-index:1">Memory Events</div>
+        <div id="memEvFeed"><div style="color:var(--muted);font-size:9px">Waiting for memory events…</div></div>
       </div>
 
       <!-- App Predictions (from 90-day disk cache) -->
@@ -1979,6 +2442,43 @@ async function poll() {
       if (xpcN>0) { xpcEl.textContent=xpcN+' blocked'; xpcEl.style.color='var(--yellow)'; }
       else        { xpcEl.textContent='None';           xpcEl.style.color='var(--muted)';  }
 
+      const frozenEl = document.getElementById('vsFrozen');
+      const frozenN = d.frozen_count||0;
+      if (frozenN>0) { frozenEl.textContent=frozenN+' paused (SIGSTOP)'; frozenEl.style.color='var(--orange)'; }
+      else           { frozenEl.textContent='None';                       frozenEl.style.color='var(--muted)';  }
+
+      const leakEl = document.getElementById('vsLeaks');
+      const leakN = d.leak_pids||0;
+      if (leakN>0) { leakEl.textContent=leakN+' process'+(leakN>1?'es':'')+' flagged'; leakEl.style.color='var(--red)'; }
+      else         { leakEl.textContent='None';                                          leakEl.style.color='var(--muted)'; }
+
+      // Forecast model (MMAF)
+      const fmEl = document.getElementById('vsFcModel');
+      const fm = d.forecast_model||'linear';
+      fmEl.textContent = fm;
+      fmEl.style.color = fm==='exponential'?'var(--red)':fm==='quadratic'?'var(--yellow)':'var(--muted)';
+
+      // CEO Compression Pressure Index
+      const cpiEl = document.getElementById('vsCpi');
+      const cpi = d.compression_pressure||0;
+      if (cpi >= 0.75)      { cpiEl.textContent=cpi.toFixed(2)+' (critical)'; cpiEl.style.color='var(--red)'; }
+      else if (cpi >= 0.50) { cpiEl.textContent=cpi.toFixed(2)+' (degrading)'; cpiEl.style.color='var(--yellow)'; }
+      else if (cpi > 0)     { cpiEl.textContent=cpi.toFixed(2)+' (ok)'; cpiEl.style.color='var(--green)'; }
+      else                  { cpiEl.textContent='—'; cpiEl.style.color='var(--muted)'; }
+
+      // Swap velocity
+      const svEl = document.getElementById('vsSwapVel');
+      const sv = d.swap_velocity||0;
+      if (sv >= 50)      { svEl.textContent=sv.toFixed(0)+' MB/s'; svEl.style.color='var(--red)'; }
+      else if (sv >= 10) { svEl.textContent=sv.toFixed(1)+' MB/s'; svEl.style.color='var(--yellow)'; }
+      else if (sv > 0)   { svEl.textContent=sv.toFixed(1)+' MB/s'; svEl.style.color='var(--muted)'; }
+      else               { svEl.textContent='0 (stable)'; svEl.style.color='var(--green)'; }
+
+      // TMCP thermal coupling
+      const tcEl = document.getElementById('vsThermalCoupling');
+      const tc = d.thermal_coupling||0;
+      tcEl.textContent = tc > 0 ? tc.toFixed(3) : 'Learning…';
+
       // Cache stats
       const cacheEl = document.getElementById('vsCacheSize');
       const cMb = d.cache_db_mb||0, cRows = d.cache_rows||0;
@@ -2039,6 +2539,27 @@ async function poll() {
       document.getElementById('lastUpdate').textContent='Last update: '+new Date().toLocaleTimeString();
     }
     (d.events||[]).forEach(ev=>addEvent(ev));
+
+    // Memory Events mini-feed — filter relevant events from the full log
+    const MEM_KW = ['RAM','pressure','Memory','memory','Tier','TIER','FREEZE','THAW',
+                    'ESCALATION','purgeable','wired','Wired','genealogy','GENEALOGY',
+                    'leak','Swap','swap','TRIAGE','forecast','ancestry','Kernel','frozen',
+                    'CEO','CPI','CMPE','TMCP','ATCE','MSCEE','GTS','velocity','compression',
+                    'Compression','circadian','coupling','calibrated'];
+    const memEvs = (d.events||[])
+      .filter(ev => MEM_KW.some(k => ev.msg.includes(k)))
+      .slice(-10).reverse();
+    const memFeed = document.getElementById('memEvFeed');
+    if (memEvs.length) {
+      const kc = {fix:'var(--green)',warn:'var(--yellow)',issue:'var(--red)',info:'var(--blue)'};
+      memFeed.innerHTML = memEvs.map(ev =>
+        `<div style="padding:2px 0;border-bottom:1px solid var(--border);line-height:1.45">` +
+        `<span style="color:var(--muted2);font-family:'SF Mono',monospace;font-size:9px">${ev.ts}</span> ` +
+        `<span style="color:${kc[ev.kind]||'var(--muted)'};font-size:9px;font-weight:700">${ev.kind.toUpperCase()}</span> ` +
+        `<span style="color:var(--text);font-family:'SF Mono',monospace;font-size:9px">${ev.msg}</span>` +
+        `</div>`
+      ).join('');
+    }
   } catch(e) {}
 }
 setInterval(poll, 1000);
@@ -2084,7 +2605,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(snap).encode())
         elif path == "/pause":
             if "state=1" in q:
-                _engine.stop()
+                _engine.pause()
+            else:
+                _engine.resume()
             self._send(200, "application/json", b'{"ok":true}')
         else:
             self._send(404, "text/plain", b"Not found")

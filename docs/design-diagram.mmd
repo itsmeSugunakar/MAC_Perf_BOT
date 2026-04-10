@@ -1,0 +1,37 @@
+flowchart TD
+  LA[LaunchAgent\nlogin autostart] --> GUI[performance_gui.py]
+
+  subgraph APP[performance_gui.py Runtime]
+    BE[BotEngine\n1 second tick]
+    HTTP[HTTP Handler\n127.0.0.1:8765]
+    DB[(SQLite Metrics Cache\n90 days)]
+
+    BE -->|snapshot| HTTP
+    BE -->|cache record and flush| DB
+    DB -->|aggregates| BE
+  end
+
+  subgraph OS[macOS Signals and Metrics]
+    PS[psutil.process_iter]
+    SYS[sysctl kern.memorystatus]
+    VM[vm_stat]
+    PM[pmset thermal and power]
+  end
+
+  PS --> BE
+  SYS --> BE
+  VM --> BE
+  PM --> BE
+
+  subgraph MMIE[MMIE + PRE]
+    PRE[Predictive Remediation Engine\ncompute effective tier 0 to 4]
+    FG[Genealogy-Guided Freeze\nSIGSTOP and SIGCONT]
+    XG[XPC Respawn Guard\nno-kill blocklist]
+  end
+
+  BE --> PRE
+  PRE --> FG
+  PRE --> XG
+
+  BR[Browser PWA\nChart.js dashboard] -->|GET root and stats| HTTP
+  HTTP -->|JSON response| BR
