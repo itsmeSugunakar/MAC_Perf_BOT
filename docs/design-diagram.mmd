@@ -7,7 +7,7 @@ flowchart TD
     DB[(SQLite Metrics Cache\n90 days)]
 
     BE -->|snapshot| HTTP
-    BE -->|cache record and flush| DB
+    BE -->|cache.record + flush| DB
     DB -->|aggregates| BE
   end
 
@@ -23,15 +23,31 @@ flowchart TD
   VM --> BE
   PM --> BE
 
-  subgraph MMIE[MMIE + PRE]
-    PRE[Predictive Remediation Engine\ncompute effective tier 0 to 4]
-    FG[Genealogy-Guided Freeze\nSIGSTOP and SIGCONT]
+  subgraph ENGINES[Inference and Remediation Engines]
+    MMAF[MMAF\n3-model adaptive forecaster\nlinear + quadratic + exponential]
+    CEO[CEO\nCompression Efficiency Oracle\nCPI signal]
+    MSCEE[MSCEE\n6-signal weighted quorum\neffective tier 0 to 4]
+    ATCE[ATCE\nAdaptive Threshold Calibration\nhourly self-tuning]
+    CMPE[CMPE\nCircadian Pattern Engine\nhour-of-day pre-freeze]
+    TMCP[TMCP\nThermal-Memory Coupling\nEMA-learned TTE adjustment]
+    RVMS[RVMS\nRSS Velocity Scorer\nfreeze boost 1x to 2x]
+    GTS[GTS\nGraduated Thaw Sequencer\nRSS-ascending SIGCONT]
     XG[XPC Respawn Guard\nno-kill blocklist]
   end
 
-  BE --> PRE
-  PRE --> FG
-  PRE --> XG
+  BE --> MMAF
+  BE --> CEO
+  MMAF --> MSCEE
+  CEO --> MSCEE
+  ATCE --> MSCEE
+  CMPE --> MSCEE
+  TMCP --> MMAF
+  MSCEE -->|tier 3| RVMS
+  RVMS --> GTS
+  MSCEE --> XG
+  DB -->|30-day percentiles| ATCE
+  DB -->|hour-of-day avgs| CMPE
+  DB -->|throttled rows| TMCP
 
-  BR[Browser PWA\nChart.js dashboard] -->|GET root and stats| HTTP
-  HTTP -->|JSON response| BR
+  BR[Browser PWA\nChart.js dashboard] -->|GET / and GET /stats| HTTP
+  HTTP -->|JSON metrics| BR

@@ -2,6 +2,8 @@
 
 ## Design Diagram (Mermaid)
 
+> Standalone diagram files: [`design-diagram.mmd`](design-diagram.mmd) · [`design-diagram.png`](design-diagram.png)
+
 ```mermaid
 flowchart TD
   LA[LaunchAgent\nlogin autostart] --> GUI[performance_gui.py]
@@ -11,7 +13,7 @@ flowchart TD
     HTTP[HTTP Handler\n127.0.0.1:8765]
     DB[(SQLite Metrics Cache\n90 days)]
 
-    BE -->|snapshot()| HTTP
+    BE -->|snapshot| HTTP
     BE -->|cache.record + flush| DB
     DB -->|aggregates| BE
   end
