@@ -163,12 +163,15 @@ MAC_Perf_BOT/
 | `CPU_WARN`       | 70 %    | Log a warning when a process hits this           |
 | `CPU_THROTTLE`   | 85 %    | Renice the process to `nice=10`                  |
 | `MEM_WARN`       | 80 %    | Emit a RAM pressure issue event (Tier 1)         |
-| `DISK_WARN`      | 90 %    | Emit a low-disk issue event                      |
-| `SWAP_WARN`      | 50 %    | Warn once when swap exceeds this                 |
+| `DISK_WARN`      | 90 %    | Emit a low-disk **issue** event; 80 % emits a warning |
+| `SWAP_WARN`      | 50 %    | Warn once when swap exceeds this; reset at 30 %  |
 | `RENICE_VALUE`   | 10      | Nice increment applied to throttled processes    |
 | `HISTORY_LEN`    | 90      | Seconds of CPU/RAM history shown in charts       |
 | `CHECK_INTERVAL` | 1 s     | Polling cadence of `BotEngine`                   |
 | `HTTP_PORT`      | 8765    | Localhost port for the web dashboard             |
+| `CONSUMER_COOL_S`| 300 s   | Min seconds between top-RSS consumer reports     |
+| `IDLE_MB_FLOOR`  | 15 MB   | Minimum RSS for a service to be Tier-4 eligible  |
+| `IDLE_SWEEP_S`   | 30 s    | Frequency of `_sweep_idle_services()` calls      |
 
 ### MMIE thresholds
 | Parameter             | Default  | Description                                              |
@@ -217,6 +220,17 @@ MAC_Perf_BOT/
 | Parameter        | Default | Description                                              |
 |------------------|---------|----------------------------------------------------------|
 | `MSCEE_QUORUM`   | 0.55    | Weighted vote share required to adopt a candidate tier   |
+
+**S5 swap velocity tier thresholds (hard-coded in `_compute_effective_tier`):**
+
+| Swap velocity  | S5 vote |
+|----------------|---------|
+| ≥ 100 MB/s     | tier 3  |
+| ≥ 50 MB/s      | tier 2  |
+| ≥ 20 MB/s      | tier 1  |
+| < 20 MB/s      | tier 0  |
+
+**MSCEE fallback:** If no candidate tier 1–4 achieves quorum, `effective_tier` falls back to `threshold_tier` (S1 / RAM-% signal alone), not to 0. S1 is always applied as a floor.
 
 ### GTS — Graduated Thaw Sequencer constants
 | Parameter          | Default | Description                                            |
@@ -378,6 +392,8 @@ Dashboard server listens on `http://127.0.0.1:8765`.
       "chronic_pct": float           // % of last 7 days RAM above MEM_WARN
     }
   ],
+  "frozen_count":         int,       // number of processes currently SIGSTOP'd by Tier 3
+  "leak_pids":            int,       // number of PIDs flagged as potential memory leaks this session
   "forecast_model":       str,       // MMAF winner: "linear"|"quadratic"|"exponential"|"none"
   "compression_pressure": float,     // CEO CPI: compressed/(compressed+purgeable); 0.0–1.0
   "swap_velocity":        float,     // MB/s swap growth rate (negative = shrinking)
@@ -459,7 +475,7 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 
 - Listens on **loopback only** (`127.0.0.1`) — not accessible from the network.
 - Uses `nice()` and `SIGSTOP`/`SIGCONT` only — cannot crash or delete processes.
-- `PROTECTED` and `NEVER_TERMINATE` sets prevent touching system processes and the bot itself.
+- `PROTECTED` set prevents touching system processes and the bot itself (includes `kernel_task`, `launchd`, `WindowServer`, `loginwindow`, `Finder`, `Dock`, `SystemUIServer`, `coreaudiod`, `cfprefsd`, `mds*`, `performance_bot`, `performance_gui`, `Python`, `python3`, `python`). `NEVER_TERMINATE` additionally guards authentication and Keychain services.
 - `FREEZE_PATTERNS` list restricts SIGSTOP to known-safe background daemons only.
 - `_no_kill` blocklist (XPC Respawn Guard) prevents repeated SIGTERM to launchd-managed services.
 - No credentials, tokens, or secrets in code or config.
@@ -485,6 +501,9 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 | ATCE cold start | `_calibrate_thresholds()` requires `ATCE_MIN_ROWS` (1 000) cache rows before self-tuning activates. Static defaults remain in effect until then. |
 | GTS thaw latency | Graduated Thaw Sequencing introduces a `GTS_WAIT_S` (2 s) delay per daemon. Thawing 5 frozen daemons takes up to 10 s. |
 | CMPE circadian cold start | `_build_circadian_profile()` needs at least 24 h (ideally 30 days) of cache data to produce meaningful hour-of-day averages. Proactive pre-freeze is suppressed during this period. |
+| CMPE UTC vs local time | `_build_circadian_profile()` groups rows by `ts/3600 % 24` (Unix epoch hours = UTC). On systems more than a few hours from UTC the hour-of-day profile will be offset from the user's perceived local clock. |
+| ATCE sanity guard | `_calibrate_thresholds()` rejects a calibration result unless `60 ≤ tier2 ≤ 92` and `tier2 < tier3 < tier4`. If the 30-day distribution is too flat or inverted, static defaults remain in effect. |
+| `_check_disk` 80 % warning | Disk usage emits an ISSUE at ≥ 90 % and a WARN at ≥ 80 %. Only the 90 % threshold is user-configurable (`DISK_WARN`). |
 
 ---
 

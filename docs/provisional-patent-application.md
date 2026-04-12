@@ -502,11 +502,23 @@ own thresholds (e.g., S1 votes tier from static % lookup; S2 votes from
 TTE thresholds; S3 maps kernel level; S4 from CPI tiers; S5 from MB/s
 threshold; S6 from hour profile score).
 
+**S5 swap velocity tier thresholds:**
+
+| Swap velocity | S5 vote tier |
+|---------------|-------------|
+| ≥ 100 MB/s    | 3           |
+| ≥ 50 MB/s     | 2           |
+| ≥ 20 MB/s     | 1           |
+| < 20 MB/s     | 0           |
+
+**Fallback:** If no candidate tier 1–4 achieves quorum, `effective_tier` falls back to `threshold_tier` (the RAM-percentage signal S1 alone). S1 is always applied as an unconditional floor — the quorum only determines whether additional tier escalation is warranted.
+
 **Example:** RAM at 79 % (S1→tier 0), TTE = 4.2 min (S2→tier 3),
 kernel=warn (S3→tier 2), CPI=0.6 (S4→tier 2), swap stable (S5→tier 0),
 circadian peak (S6→tier 2).
 At candidate_tier=3: vote = 0.25 (S2 only) < 0.55; no adoption.
 At candidate_tier=2: vote = 0.25+0.20+0.12+0.05 = 0.62 ≥ 0.55; effective_tier=2.
+Fallback would be threshold_tier = 0 (S1 alone, since RAM is 79 % < all static thresholds).
 
 When escalation occurs, the engine:
 
@@ -903,6 +915,10 @@ tier4 = rows[int(n × 0.93)]    # 93rd percentile
 _cal_thresholds = {"tier2": tier2, "tier3": tier3, "tier4": tier4}
 ```
 
+**Sanity guard:** A calibration result is rejected unless `60 ≤ tier2 ≤ 92`
+and `tier2 < tier3 < tier4`. If the historical distribution is too flat,
+constant, or inverted, the calibration is skipped and static defaults remain.
+
 The calibrated thresholds are used by `_compute_effective_tier()` in place
 of the static defaults once `_cal_thresholds` is populated. They are
 surfaced in the `/stats` JSON as `cal_thresholds` and displayed on the dashboard.
@@ -944,6 +960,12 @@ if current_hour_avg >= CMPE_PRE_FREEZE_SCORE (70 %)
 
 The circadian hour score is also fed as Signal S6 into the MSCEE quorum
 (weight 0.05) to bias escalation during predictable high-pressure periods.
+
+**Implementation note:** The current reference implementation groups rows
+by `ts/3600 % 24` (Unix epoch seconds / 3600 mod 24), which produces UTC
+hours. On machines in non-UTC time zones the learned profile is offset from
+the user's perceived local time by the UTC offset. A production deployment
+should normalise timestamps to local time before grouping.
 
 **Novelty:** Learning per-hour-of-day memory pressure profiles from historical
 cache data and using them to trigger proactive process suspension before a

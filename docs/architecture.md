@@ -100,6 +100,7 @@ BotEngine (background thread, 1 Hz)
                ├── _build_circadian_profile()   → CMPE GROUP BY hour (all rows)
                └── _compute_thermal_coupling()  → TMCP regression (throttled rows)
                     │
+               snapshot() also exposes: frozen_count (int), leak_pids (int)
                     ▼ snapshot() called by HTTP handler
       HTTP Handler (main thread)
             │
@@ -180,6 +181,7 @@ Every 5 s   → _update_pressure_and_forecast()
 Every 10 s  → _check_disk()
                Single psutil.disk_usage("/") call; stores disk_pct / disk_free_gb
                for snapshot(). No per-request disk reads in Handler.
+               Emits ISSUE at ≥ 90 % used; WARN at ≥ 80 % used.
 
 Every 30 s  → _check_power_mode()   (pmset -g ps subprocess)
 Every 30 s  → _detect_xpc_respawn() (process name set scan)
@@ -236,19 +238,19 @@ _restore_calmed_procs() — called from _collect(), no process scan:
 \_compute_effective_tier(mem_pct)  **[MSCEE — Multi-Signal Consensus Escalation Engine]**:
 ```
 Six weighted signals:
-  S1 = RAM %            weight 0.30 → vote for threshold_tier
-  S2 = TTE              weight 0.25 → vote for predictive_tier (MMAF output)
-  S3 = kernel oracle    weight 0.20 → vote for pressure_tier (normal/warn/critical)
-  S4 = CPI              weight 0.12 → vote for cpi_tier (CEO output)
-  S5 = swap velocity    weight 0.08 → vote for swap_tier
-  S6 = circadian hour   weight 0.05 → vote based on CMPE profile
+  S1 = RAM %            weight 0.30 → threshold_tier via ATCE-calibrated %
+  S2 = TTE              weight 0.25 → predictive_tier from MMAF
+  S3 = kernel oracle    weight 0.20 → pressure_tier (normal→0, warn→2, critical→4)
+  S4 = CPI              weight 0.12 → cpi_tier (≥CPI_TIER3→3, ≥CPI_TIER2→2)
+  S5 = swap velocity    weight 0.08 → swap_tier (≥100 MB/s→3, ≥50→2, ≥20→1)
+  S6 = circadian hour   weight 0.05 → circ_tier (≥CMPE_PRE_FREEZE→2, ≥MEM_WARN→1)
 
+effective_tier = threshold_tier   ← S1 floor; always at minimum equals RAM tier
 For candidate_tier in [4, 3, 2, 1]:
   weighted_vote = sum(signal_weight for each signal voting ≥ candidate_tier)
   if weighted_vote >= MSCEE_QUORUM (0.55):
     effective_tier = candidate_tier; break
-else:
-  effective_tier = 0
+(if no quorum reached, effective_tier remains threshold_tier — S1 is always the floor)
 
 _ram_pressure_lock = (effective_tier >= 3)
 ```
