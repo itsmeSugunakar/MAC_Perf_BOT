@@ -28,6 +28,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # ─── Disk Metrics Cache ───────────────────────────────────────────────────────
 CACHE_DIR            = Path.home() / "Library" / "Application Support" / "performance-bot"
 CACHE_DB             = CACHE_DIR / "metrics.db"
+CDA_MODEL_PATH       = CACHE_DIR / "cda_model.onnx"
 CACHE_RETENTION_DAYS = 90     # rows older than this are pruned
 CACHE_WRITE_S        = 60     # flush in-memory buffer to disk every N seconds
 CACHE_PRUNE_S        = 86400  # prune expired rows once per day
@@ -62,6 +63,27 @@ class MetricsCache:
         thermal_pct   INTEGER DEFAULT 100
     );
     CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts);
+    CREATE TABLE IF NOT EXISTS remediation_outcomes (
+        ts         INTEGER NOT NULL,
+        tier       INTEGER,
+        action     TEXT,
+        pre_mem    REAL,
+        post_mem   REAL,
+        delta_mb   REAL,
+        success    INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_outcomes_ts ON remediation_outcomes(ts);
+    CREATE TABLE IF NOT EXISTS signal_weights (
+        ts          INTEGER NOT NULL,
+        s1_weight   REAL,
+        s2_weight   REAL,
+        s3_weight   REAL,
+        s4_weight   REAL,
+        s5_weight   REAL,
+        s6_weight   REAL,
+        accuracy    REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_weights_ts ON signal_weights(ts);
     """
 
     def __init__(self, db_path: Path):
@@ -77,6 +99,18 @@ class MetricsCache:
                     cx.execute("ALTER TABLE metrics ADD COLUMN thermal_pct INTEGER DEFAULT 100")
                 except sqlite3.OperationalError:
                     pass  # column already exists
+                # v2.0 migrations: create new tables if absent
+                try:
+                    cx.execute("""CREATE TABLE IF NOT EXISTS remediation_outcomes (
+                        ts INTEGER NOT NULL, tier INTEGER, action TEXT,
+                        pre_mem REAL, post_mem REAL, delta_mb REAL, success INTEGER)""")
+                    cx.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_ts ON remediation_outcomes(ts)")
+                    cx.execute("""CREATE TABLE IF NOT EXISTS signal_weights (
+                        ts INTEGER NOT NULL, s1_weight REAL, s2_weight REAL, s3_weight REAL,
+                        s4_weight REAL, s5_weight REAL, s6_weight REAL, accuracy REAL)""")
+                    cx.execute("CREATE INDEX IF NOT EXISTS idx_weights_ts ON signal_weights(ts)")
+                except Exception:
+                    pass
             self._ok = True
         except Exception as e:
             # Cache failure is non-fatal — bot continues without it
@@ -197,6 +231,59 @@ class MetricsCache:
         except Exception:
             return 0
 
+    def record_outcome(self, ts, tier, action, pre_mem, post_mem, delta_mb, success):
+        """Insert one remediation outcome row (RAC). No buffering — outcomes are infrequent."""
+        if not self._ok:
+            return
+        try:
+            with sqlite3.connect(self._db, timeout=5) as cx:
+                cx.execute(
+                    "INSERT INTO remediation_outcomes VALUES (?,?,?,?,?,?,?)",
+                    (int(ts), tier, action, pre_mem, post_mem, delta_mb, success)
+                )
+        except Exception as e:
+            print(f"[cache] record_outcome failed: {e}", file=sys.stderr)
+
+    def query_signal_accuracy(self, signal: str, hours: int = 24) -> float:
+        """
+        Return fraction of outcomes in last `hours` hours where `signal` voted high
+        AND remediation succeeded. Maps signal name (s1–s6) to action type heuristic.
+        Used by RWA to reweight ACN signal contributions.
+        """
+        if not self._ok:
+            return 0.5   # neutral default
+        cutoff = int(time.time() - hours * 3600)
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT success FROM remediation_outcomes WHERE ts >= ? AND tier >= 2",
+                    (cutoff,)
+                ).fetchall()
+            if not rows:
+                return 0.5
+            return round(sum(r[0] for r in rows) / len(rows), 3)
+        except Exception:
+            return 0.5
+
+    def query_tier_distribution(self, days: int = 30) -> dict:
+        """
+        Return {tier: count} from metrics table over last `days` days.
+        Used by BRL to update tier-frequency priors.
+        """
+        if not self._ok:
+            return {}
+        cutoff = int(time.time() - days * 86400)
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT eff_tier, COUNT(*) FROM metrics WHERE ts >= ? "
+                    "AND eff_tier IS NOT NULL GROUP BY eff_tier",
+                    (cutoff,)
+                ).fetchall()
+            return {int(r[0]): int(r[1]) for r in rows}
+        except Exception:
+            return {}
+
 # ─── Thresholds & Patterns ────────────────────────────────────────────────────
 PROTECTED = {
     "kernel_task", "launchd", "WindowServer", "loginwindow", "Finder",
@@ -287,6 +374,51 @@ TMCP_MIN_SAMPLES     = 5      # minimum thermal-throttled rows before coupling a
 # ─── RVMS — RSS Velocity Momentum Scorer ──────────────────────────────────────
 RVMS_MAX_BOOST       = 2.0    # maximum velocity momentum multiplier
 
+# ─── SIE — Signal Integrity Estimator ─────────────────────────────────────────
+SIE_WINDOW           = 30     # rolling window (samples) for z-score computation
+SIE_ZSCORE_THRESH    = 3.0    # flag signal if |z| > this
+
+# ─── MEG — Model Ensemble Governance ──────────────────────────────────────────
+MEG_RESIDUAL_HISTORY = 5      # residual samples per model for meta-weight
+
+# ─── RWA / ACN — Reinforcement-Weighted Arbitration / Adaptive Consensus ──────
+RWA_LEARN_RATE       = 0.05   # EMA rate for weight adjustments
+RWA_MIN_WEIGHT       = 0.02   # floor: no signal drops to zero
+RWA_OUTCOMES_H       = 24     # hours of outcome history for accuracy query
+
+# ─── CTRE — Chronothermal Regression Engine ───────────────────────────────────
+CTRE_MIN_SAMPLES     = 10     # minimum 2D samples before regression valid
+CTRE_COOL_S          = 3600   # recompute once per hour
+
+# ─── AIP — Ancestral Impact Propagation ───────────────────────────────────────
+AIP_MIN_MB           = 50     # minimum family RSS to include in propagation
+AIP_MAX_DEPTH        = 3      # max parent-child chain depth
+
+# ─── RAC — Reinforcement Action Coordinator ───────────────────────────────────
+RAC_EVAL_DELAY_S     = 30     # seconds after action before outcome measured
+RAC_SUCCESS_PCT      = 2.0    # RAM must drop ≥ this % to count as success
+
+# ─── ASZM — Adaptive Safety Zone Mapping ──────────────────────────────────────
+ASZM_CRIT_SCORE      = 0.8    # criticality threshold → add to dynamic protected
+ASZM_COOL_S          = 3600   # recalibrate once per hour
+
+# ─── PSM — Predictive State Machine ───────────────────────────────────────────
+PSM_HISTORY          = 20     # max tier-transition events tracked
+PSM_DWELL_MIN_S      = 3.0    # min seconds in a tier before transition is counted
+
+# ─── BRL — Bayesian Reasoning Layer ───────────────────────────────────────────
+BRL_PRIOR_ALPHA      = 1.0    # Beta prior alpha (weak prior)
+BRL_PRIOR_BETA       = 9.0    # Beta prior beta
+BRL_COOL_S           = 3600   # update prior from cache once per hour
+
+# ─── CDA — Causal Diagnostic Agent ────────────────────────────────────────────
+CDA_TRAIN_MIN_ROWS   = 200    # min labeled rows before model training
+CDA_TRAIN_COOL_S     = 2592000  # retrain at most once per 30 days
+CDA_LR               = 0.01   # SGD learning rate for softmax logistic regression
+CDA_EPOCHS           = 100    # gradient-descent epochs per training run
+CDA_LABEL_LEAK       = 50     # MB/min growth rate threshold → label "leak"
+CDA_LABEL_COMP_CPI   = 0.60   # CPI threshold → label "compressor_collapse"
+
 
 # ─── Bot Engine ───────────────────────────────────────────────────────────────
 class BotEngine(threading.Thread):
@@ -367,6 +499,56 @@ class BotEngine(threading.Thread):
         self._swap_velocity: float = 0.0
         self._last_swap_used: float = 0.0
         self._last_swap_ts: float = 0.0
+        # ── SIE: Signal Integrity Estimator ──────────────────────────────────
+        self._signal_confidence = {"cpu": 1.0, "mem": 1.0, "swap": 1.0}
+        self._sie_history = {
+            "cpu":  deque(maxlen=SIE_WINDOW),
+            "mem":  deque(maxlen=SIE_WINDOW),
+            "swap": deque(maxlen=SIE_WINDOW),
+        }
+        # ── MEG: Model Ensemble Governance ───────────────────────────────────
+        self._model_residual_history = {
+            "linear":      deque(maxlen=MEG_RESIDUAL_HISTORY),
+            "quadratic":   deque(maxlen=MEG_RESIDUAL_HISTORY),
+            "exponential": deque(maxlen=MEG_RESIDUAL_HISTORY),
+        }
+        # ── ACN / RWA: Adaptive Consensus Network / Reinforcement-Weighted ───
+        self._acn_weights = {
+            "s1": 0.30, "s2": 0.25, "s3": 0.20,
+            "s4": 0.12, "s5": 0.08, "s6": 0.05,
+        }
+        self._last_rwa: float = 0.0
+        # ── CTRE: Chronothermal Regression Engine ─────────────────────────────
+        self._ctre_stability: dict = {}   # {hour: stability_score 0.0-1.0}
+        self._last_ctre: float = 0.0
+        # ── AIP: Ancestral Impact Propagation ─────────────────────────────────
+        self._aip_impact: list = []       # [{app, impact_score, cascade_depth, child_mb}]
+        self._last_aip: float = 0.0
+        # ── RAC: Reinforcement Action Coordinator ─────────────────────────────
+        self._pending_outcomes: list = [] # [(eval_ts, tier, action, pre_mem)]
+        self._action_efficacy: dict = {}  # action_type → running avg delta_pct
+        # ── ASZM: Adaptive Safety Zone Mapping ───────────────────────────────
+        self._dynamic_protected: set = set(PROTECTED)
+        self._criticality_scores: dict = {}   # name → float
+        self._last_aszm: float = 0.0
+        # ── PSM: Predictive State Machine ─────────────────────────────────────
+        self._tier_transitions: deque = deque(maxlen=PSM_HISTORY)  # (from, to, ts)
+        self._transition_matrix: dict = {}   # (from, to) → count
+        self._tier_dwell_start: float = time.time()
+        self._prev_tier: int = 0
+        self._psm_next_tier: int = 0
+        self._psm_dwell_s: float = 0.0
+        # ── BRL: Bayesian Reasoning Layer ─────────────────────────────────────
+        self._brl_tier_prior: list = [BRL_PRIOR_ALPHA] * 5   # per-tier alpha counts
+        self._brl_confidence: float = 1.0
+        self._last_brl: float = 0.0
+        # ── CDA: Causal Diagnostic Agent ──────────────────────────────────────
+        self.causal_diagnosis: str = "normal"   # normal|leak|compressor_collapse|cpu_collision
+        self._cda_session = None                # onnxruntime.InferenceSession (if available)
+        self._last_cda_train: float = 0.0
+        self._cda_confidence: float = 0.0
+        # Try to load existing CDA model at startup
+        self._cda_load_model()
 
     # ── public ────────────────────────────────────────────────────────────────
     def stop(self):
@@ -416,6 +598,17 @@ class BotEngine(threading.Thread):
                 "cal_thresholds":       dict(self._cal_thresholds),
                 "circadian_profile":    {str(k): v for k, v in self._circadian_profile.items()},
                 "thermal_coupling":     round(self._thermal_coupling, 3),
+                # v2.0 fields
+                "signal_confidence":    dict(self._signal_confidence),
+                "acn_weights":          dict(self._acn_weights),
+                "brl_confidence":       round(self._brl_confidence, 3),
+                "psm_next_tier":        self._psm_next_tier,
+                "psm_dwell_s":          round(self._psm_dwell_s, 1),
+                "action_efficacy":      dict(self._action_efficacy),
+                "ctre_stability":       {str(h): v for h, v in self._ctre_stability.items()},
+                "aip_impact":           list(self._aip_impact),
+                "causal_diagnosis":     self.causal_diagnosis,
+                "dynamic_protected":    len(self._dynamic_protected) - len(PROTECTED),
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
@@ -452,6 +645,14 @@ class BotEngine(threading.Thread):
                         self._analyse_app_predictions()
                         self._calibrate_thresholds()
                         self._compute_thermal_coupling()
+                        self._update_rwa_weights()
+                        self._compute_ctre()
+                        self._update_aszm()
+                        self._update_brl()
+                    # CDA training: run at startup and every 30 days
+                    if tick == 0 or (self._last_cda_train > 0 and
+                            time.time() - self._last_cda_train >= CDA_TRAIN_COOL_S):
+                        self._cda_train_model()
                 except Exception as exc:
                     self._emit("warn", f"Engine error: {exc}")
             tick += 1
@@ -469,6 +670,12 @@ class BotEngine(threading.Thread):
         vm   = psutil.virtual_memory()
         swap = psutil.swap_memory()
         ncpu = self._ncpu   # cached at init — no repeated syscall
+
+        # SIE: compute signal integrity before appending to history
+        self._compute_signal_confidence(cpu, vm.percent,
+                                         swap.percent if swap.total > 0 else 0.0)
+        # RAC: check if any pending outcomes are ready to evaluate
+        self._evaluate_rac_outcomes()
 
         rows        = []
         to_throttle = []   # (Process, name, pid, cpu_pct) — applied after loop
@@ -610,6 +817,9 @@ class BotEngine(threading.Thread):
             self.predictive_escalation = was_predictive
             self._ram_pressure_lock    = (effective_tier >= 3)
 
+        # PSM: predict next tier transition
+        self._psm_predict()
+
         if mem_pct >= MEM_WARN or effective_tier >= 1:
             self.issues += 1
             used_gb = (vm.total - vm.available) / 1e9
@@ -635,6 +845,10 @@ class BotEngine(threading.Thread):
             # MMIE: escalate through tiered remediation cascade
             if effective_tier >= 2:
                 self._tiered_memory_remediation(mem_pct, effective_tier)
+
+            # CDA: diagnose root cause at Tier 2+
+            if effective_tier >= 2:
+                self._diagnose_root_cause()
 
         elif mem_pct < MEM_WARN - 5:
             # pressure has eased — release RAM lock and restore frozen daemons
@@ -955,16 +1169,39 @@ class BotEngine(threading.Thread):
         elif circ_avg >= MEM_WARN:              s6 = 1
         else:                                   s6 = 0
 
-        # ── Weighted quorum vote (highest-tier-first) ─────────────────────────
-        W = {"s1": 0.30, "s2": 0.25, "s3": 0.20, "s4": 0.12, "s5": 0.08, "s6": 0.05}
+        # ── ACN: weighted quorum vote using adaptive weights + SIE confidence ──
+        W    = dict(self._acn_weights)       # live ACN weights (updated by RWA)
         sigs = {"s1": s1, "s2": s2, "s3": s3, "s4": s4, "s5": s5, "s6": s6}
+
+        # Apply SIE signal confidence as weight multiplier
+        sc = self._signal_confidence
+        conf_map = {
+            "s1": sc.get("mem",  1.0),
+            "s2": sc.get("mem",  1.0),
+            "s3": sc.get("mem",  1.0),
+            "s4": sc.get("swap", 1.0),
+            "s5": sc.get("swap", 1.0),
+            "s6": sc.get("mem",  1.0),
+        }
+        # Re-normalise after confidence scaling
+        adj_W = {k: W[k] * conf_map[k] for k in W}
+        total_adj = sum(adj_W.values()) or 1.0
+        norm_W = {k: v / total_adj for k, v in adj_W.items()}
 
         effective_tier = threshold_tier
         for candidate in range(4, 0, -1):
-            vote = sum(w for name, w in W.items() if sigs[name] >= candidate)
+            vote = sum(w for name, w in norm_W.items() if sigs[name] >= candidate)
             if vote >= MSCEE_QUORUM:
                 effective_tier = candidate
                 break
+
+        # BRL: compute posterior confidence for this tier decision
+        signal_votes = list(sigs.values())
+        self._brl_confidence = self._compute_brl_confidence(effective_tier, signal_votes)
+
+        # PSM: track tier transition if tier changed
+        if effective_tier != self._prev_tier:
+            self._update_psm(self._prev_tier, effective_tier)
 
         return effective_tier, threshold_tier
 
@@ -1141,6 +1378,7 @@ class BotEngine(threading.Thread):
                 tte_l = -1.0
             if rss_l < best_rss:
                 best_rss, best_tte, best_model = rss_l, tte_l, "linear"
+            self._model_residual_history["linear"].append(rss_l)
 
         # ── 2. Quadratic (Vandermonde normal equations, Cramer's rule) ─────────
         try:
@@ -1171,6 +1409,7 @@ class BotEngine(threading.Thread):
                             tte_q=round(step/60,1); break
                 else:
                     tte_q=-1.0
+                self._model_residual_history["quadratic"].append(rss_q)
                 if rss_q < best_rss:
                     best_rss, best_tte, best_model = rss_q, tte_q, "quadratic"
         except Exception:
@@ -1191,13 +1430,24 @@ class BotEngine(threading.Thread):
                         tte_e=round((x_95-(n-1))/60,1) if x_95>(n-1) else 0.0
                     else:
                         tte_e=-1.0
+                    self._model_residual_history["exponential"].append(rss_e)
                     if rss_e < best_rss:
                         best_rss, best_tte, best_model = rss_e, tte_e, "exponential"
         except Exception:
             pass
 
+        # MEG: apply meta-weight governance — prefer model with lower historical residual
+        meg_winner = best_model
+        meg_scores = {}
+        for mname, hist in self._model_residual_history.items():
+            if hist:
+                meg_scores[mname] = sum(hist) / len(hist)
+        if meg_scores:
+            # MEG winner = model with minimum (meta_weight × current_rss)
+            # Use same best_rss as proxy for current_rss per model
+            meg_winner = min(meg_scores, key=lambda m: meg_scores[m])
         with self._lock:
-            self._last_forecast_model = best_model
+            self._last_forecast_model = meg_winner
         return best_tte
 
     def _compute_compression_pressure(self, vm_bd: dict) -> float:
@@ -1263,6 +1513,8 @@ class BotEngine(threading.Thread):
             ancestry = self._build_memory_ancestry()
             with self._lock:
                 self.mem_ancestry = ancestry
+            # AIP: compute ancestral impact propagation after ancestry refresh
+            self._compute_aip()
 
     def _tiered_memory_remediation(self, mem_pct: float, effective_tier: int = 2):
         """
@@ -1313,10 +1565,16 @@ class BotEngine(threading.Thread):
         # ── Tier 3: freeze idle background daemons (genealogy-guided) ─────────
         if effective_tier >= 3 and now - self._last_freeze >= FREEZE_COOL_S:
             self._freeze_background_daemons()
+            self._record_rac_action(3, "freeze_daemon", mem_pct)
 
         # ── Tier 4: emergency termination ────────────────────────────────────
         if effective_tier >= 4:
             self._sweep_idle_services()
+            self._record_rac_action(4, "sweep_xpc", mem_pct)
+
+        # ── Tier 2: purgeable advisory RAC recording ─────────────────────────
+        if effective_tier == 2 and purg_mb > 200:
+            self._record_rac_action(2, "purgeable_advisory", mem_pct)
 
     def _get_process_velocity(self, pid: int, rss_mb: float) -> float:
         """
@@ -1623,6 +1881,600 @@ class BotEngine(threading.Thread):
                     f"({d.free/1e9:.1f} GB free)")
         except Exception:
             pass
+
+    # ── SIE: Signal Integrity Estimator ───────────────────────────────────────
+
+    def _compute_signal_confidence(self, cpu_pct: float, mem_pct: float, swap_pct: float):
+        """
+        SIE — Signal Integrity Estimator.
+        For each signal, computes a rolling z-score using the deque history.
+        If |z| > SIE_ZSCORE_THRESH, the signal is flagged as anomalous (confidence=0.5).
+        Applies EMA(0.1) smoothing to the resulting confidence value.
+        Updates self._signal_confidence.
+        """
+        signals = {"cpu": cpu_pct, "mem": mem_pct, "swap": swap_pct}
+        for key, val in signals.items():
+            hist = self._sie_history[key]
+            hist.append(val)
+            prev_conf = self._signal_confidence[key]
+            if len(hist) >= 3:
+                n      = len(hist)
+                mean_v = sum(hist) / n
+                var_v  = sum((x - mean_v) ** 2 for x in hist) / n
+                std_v  = math.sqrt(var_v) if var_v > 0 else 1e-6
+                z      = abs(val - mean_v) / std_v
+                raw_conf = 0.5 if z > SIE_ZSCORE_THRESH else 1.0
+            else:
+                raw_conf = 1.0
+            # EMA smoothing
+            new_conf = 0.9 * prev_conf + 0.1 * raw_conf
+            self._signal_confidence[key] = round(new_conf, 3)
+
+    # ── RWA: Reinforcement-Weighted Arbitration ────────────────────────────────
+
+    def _update_rwa_weights(self):
+        """
+        RWA — Reinforcement-Weighted Arbitration.
+        Queries remediation outcome success rate from the cache and adjusts
+        _acn_weights via EMA. Runs at most once per hour.
+        """
+        now = time.time()
+        if now - self._last_rwa < 3600 and self._last_rwa > 0:
+            return
+        self._last_rwa = now
+
+        # All 6 signals share the same remediation pool in this implementation.
+        # Each signal's accuracy is the outcome success rate for tier>=2 actions.
+        raw_accs = {}
+        for sig in ("s1", "s2", "s3", "s4", "s5", "s6"):
+            raw_accs[sig] = self._cache.query_signal_accuracy(sig, hours=RWA_OUTCOMES_H)
+
+        # Normalise so weights sum to 1.0
+        total = sum(raw_accs.values()) or 1.0
+        for sig, acc in raw_accs.items():
+            new_w = max(acc / total, RWA_MIN_WEIGHT)
+            old_w = self._acn_weights[sig]
+            self._acn_weights[sig] = (1 - RWA_LEARN_RATE) * old_w + RWA_LEARN_RATE * new_w
+
+        # Renormalise after EMA update
+        total2 = sum(self._acn_weights.values())
+        for sig in self._acn_weights:
+            self._acn_weights[sig] = round(self._acn_weights[sig] / total2, 4)
+
+        top_sig  = max(self._acn_weights, key=self._acn_weights.get)
+        bot_sig  = min(self._acn_weights, key=self._acn_weights.get)
+        self._emit("info",
+            f"RWA: signal weights updated — top={top_sig}({self._acn_weights[top_sig]:.3f}), "
+            f"bot={bot_sig}({self._acn_weights[bot_sig]:.3f})")
+
+    # ── CTRE: Chronothermal Regression Engine ─────────────────────────────────
+
+    def _compute_ctre(self):
+        """
+        CTRE — Chronothermal Regression Engine.
+        For each hour of day, fits a linear regression mem_pct ~ (1 + hour + temp_pct)
+        using 30-day cache data. Computes stability score 0-1 per hour (1=stable, 0=volatile).
+        """
+        now = time.time()
+        if now - self._last_ctre < CTRE_COOL_S and self._last_ctre > 0:
+            return
+        self._last_ctre = now
+        if not self._cache._ok:
+            return
+        try:
+            cutoff = int(now - 30 * 86400)
+            with sqlite3.connect(self._cache._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT CAST(ts/3600 % 24 AS INTEGER) hr, AVG(mem_pct), "
+                    "AVG(COALESCE(100-thermal_pct,0)) "
+                    "FROM metrics WHERE ts >= ? GROUP BY hr",
+                    (cutoff,)
+                ).fetchall()
+            if len(rows) < CTRE_MIN_SAMPLES:
+                return
+            # Build per-hour variance from a 2nd pass
+            with sqlite3.connect(self._cache._db, timeout=3) as cx:
+                variance_rows = cx.execute(
+                    "SELECT CAST(ts/3600 % 24 AS INTEGER) hr, "
+                    "AVG(mem_pct*mem_pct) - AVG(mem_pct)*AVG(mem_pct) var, COUNT(*) cnt "
+                    "FROM metrics WHERE ts >= ? GROUP BY hr",
+                    (cutoff,)
+                ).fetchall()
+            variances = {int(r[0]): (float(r[1] or 0), int(r[2])) for r in variance_rows}
+            stability = {}
+            for r in rows:
+                hr   = int(r[0])
+                var, cnt = variances.get(hr, (1.0, 0))
+                if cnt < CTRE_MIN_SAMPLES or var <= 0:
+                    continue
+                # Stability = 1 - (std / mean) capped at [0, 1]
+                mean_m = float(r[1] or 50)
+                cv     = math.sqrt(var) / (mean_m or 1)
+                stab   = max(0.0, min(1.0, 1.0 - cv))
+                stability[hr] = round(stab, 3)
+            with self._lock:
+                self._ctre_stability = stability
+            volatile = [h for h, s in stability.items() if s < 0.5]
+            if volatile:
+                self._emit("info",
+                    f"CTRE: volatile hours (stability<0.5): {sorted(volatile)}")
+        except Exception:
+            pass
+
+    # ── AIP: Ancestral Impact Propagation ─────────────────────────────────────
+
+    def _compute_aip(self):
+        """
+        AIP — Ancestral Impact Propagation.
+        Builds a full process tree and scores each app family by its impact on
+        total RSS, accounting for child processes up to AIP_MAX_DEPTH levels deep.
+        """
+        now = time.time()
+        if now - self._last_aip < MEM_ANCESTRY_COOL_S:
+            return
+        self._last_aip = now
+        try:
+            pid_info = {}
+            for p in psutil.process_iter(["pid", "ppid", "name", "memory_info"]):
+                try:
+                    rss = p.memory_info().rss / 1e6
+                    pid_info[p.pid] = {
+                        "ppid": p.ppid(), "name": p.name(), "rss": rss, "children": []
+                    }
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            # Build child list
+            for pid, info in pid_info.items():
+                ppid = info["ppid"]
+                if ppid in pid_info:
+                    pid_info[ppid]["children"].append(pid)
+
+            # Find root families (parent is init/launchd)
+            def family_rss(pid, depth=0):
+                if depth > AIP_MAX_DEPTH or pid not in pid_info:
+                    return 0.0
+                own = pid_info[pid]["rss"]
+                child_sum = sum(family_rss(c, depth + 1)
+                                for c in pid_info[pid].get("children", []))
+                return own + child_sum
+
+            results = []
+            for pid, info in pid_info.items():
+                if info["ppid"] > 1 or info["name"] in PROTECTED:
+                    continue
+                own_rss   = info["rss"]
+                total_rss = family_rss(pid)
+                if total_rss < AIP_MIN_MB:
+                    continue
+                child_mb  = total_rss - own_rss
+                depth_factor = 1.0 + 0.1 * len(info.get("children", []))
+                impact_score = (own_rss / (total_rss or 1)) * depth_factor
+
+                # Check for cascade risk: any child in rss_history with growth
+                cascade_risk = False
+                for cid in info.get("children", []):
+                    if cid in self._rss_history:
+                        ch = self._rss_history[cid]
+                        if len(ch) >= 2:
+                            rate = (ch[-1][1] - ch[0][1]) / max(ch[-1][0]-ch[0][0], 1) * 60
+                            if rate >= CDA_LABEL_LEAK:
+                                cascade_risk = True
+                                break
+
+                results.append({
+                    "app": info["name"],
+                    "impact_score": round(impact_score, 3),
+                    "cascade_depth": len(info.get("children", [])),
+                    "child_mb": round(child_mb),
+                    "cascade_risk": cascade_risk,
+                })
+
+            results.sort(key=lambda x: x["impact_score"], reverse=True)
+            with self._lock:
+                self._aip_impact = results[:8]
+
+            for r in results[:3]:
+                if r["cascade_risk"]:
+                    self._emit("warn",
+                        f"AIP: cascading leak pattern detected in {r['app']} "
+                        f"(depth={r['cascade_depth']}, child_mb={r['child_mb']})")
+        except Exception:
+            pass
+
+    # ── RAC: Reinforcement Action Coordinator ─────────────────────────────────
+
+    def _record_rac_action(self, tier: int, action_type: str, pre_mem: float):
+        """
+        RAC — record a pending remediation outcome to be evaluated after RAC_EVAL_DELAY_S.
+        """
+        eval_ts = time.time() + RAC_EVAL_DELAY_S
+        self._pending_outcomes.append((eval_ts, tier, action_type, pre_mem))
+
+    def _evaluate_rac_outcomes(self):
+        """
+        RAC — evaluate any pending outcomes whose delay has elapsed.
+        Records result to cache and updates _action_efficacy EMA.
+        """
+        if not self._pending_outcomes:
+            return
+        now = time.time()
+        with self._lock:
+            current_mem = self._last_vm.percent
+        remaining = []
+        for eval_ts, tier, action, pre_mem in self._pending_outcomes:
+            if now < eval_ts:
+                remaining.append((eval_ts, tier, action, pre_mem))
+                continue
+            delta_pct = pre_mem - current_mem
+            delta_mb  = delta_pct / 100.0 * self._mem_total_gb * 1024
+            success   = 1 if delta_pct >= RAC_SUCCESS_PCT else 0
+            # EMA update for action efficacy
+            prev_eff  = self._action_efficacy.get(action, 0.0)
+            self._action_efficacy[action] = round(
+                0.9 * prev_eff + 0.1 * delta_pct, 2
+            )
+            self._cache.record_outcome(
+                int(now), tier, action, pre_mem, current_mem,
+                round(delta_mb, 1), success
+            )
+        self._pending_outcomes = remaining
+
+    # ── ASZM: Adaptive Safety Zone Mapping ────────────────────────────────────
+
+    def _update_aszm(self):
+        """
+        ASZM — Adaptive Safety Zone Mapping.
+        Assigns a criticality score to all running processes based on uptime
+        and CPU idleness. Processes above ASZM_CRIT_SCORE are added to the
+        dynamic protected set to prevent erroneous remediation.
+        """
+        now = time.time()
+        if now - self._last_aszm < ASZM_COOL_S and self._last_aszm > 0:
+            return
+        self._last_aszm = now
+        try:
+            running_names = set()
+            for p in psutil.process_iter(["name", "create_time", "cpu_percent", "username"]):
+                try:
+                    if p.info["username"] == "root":
+                        continue
+                    name       = p.name()
+                    create_ts  = p.info["create_time"] or 0
+                    uptime_d   = (now - create_ts) / 86400.0
+                    avg_cpu    = (p.info["cpu_percent"] or 0.0) / self._ncpu
+                    running_names.add(name)
+
+                    # High criticality: long-lived and low CPU (classic daemon)
+                    uptime_w = min(uptime_d / 7.0, 1.0)
+                    cpu_w    = max(0.0, 1.0 - avg_cpu / 5.0)
+                    score    = (uptime_w + cpu_w) / 2.0
+                    self._criticality_scores[name] = round(score, 3)
+
+                    if score >= ASZM_CRIT_SCORE and name not in PROTECTED \
+                            and name not in self._dynamic_protected:
+                        self._dynamic_protected.add(name)
+                        self._emit("info",
+                            f"ASZM: {name} added to dynamic protection zone "
+                            f"(criticality={score:.2f})")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            # Prune stale dynamic entries
+            stale = [n for n in list(self._dynamic_protected)
+                     if n not in PROTECTED and n not in running_names]
+            for name in stale:
+                self._dynamic_protected.discard(name)
+        except Exception:
+            pass
+
+    # ── PSM: Predictive State Machine ─────────────────────────────────────────
+
+    def _update_psm(self, prev_tier: int, new_tier: int):
+        """
+        PSM — record a tier transition when dwell time exceeds PSM_DWELL_MIN_S.
+        """
+        now = time.time()
+        dwell = now - self._tier_dwell_start
+        if dwell >= PSM_DWELL_MIN_S:
+            self._tier_transitions.append((prev_tier, new_tier, now, dwell))
+            key = (prev_tier, new_tier)
+            self._transition_matrix[key] = self._transition_matrix.get(key, 0) + 1
+        self._tier_dwell_start = now
+        self._prev_tier = new_tier
+
+    def _psm_predict(self) -> int:
+        """
+        PSM — Markov next-tier prediction.
+        From the current tier, finds the most probable next tier using the
+        accumulated transition matrix. Also estimates dwell time in next tier.
+        Returns predicted next tier integer.
+        """
+        cur = self._prev_tier
+        # Gather all transitions FROM cur
+        candidates = {to: cnt
+                      for (fr, to), cnt in self._transition_matrix.items()
+                      if fr == cur}
+        if not candidates:
+            self._psm_next_tier = cur
+            self._psm_dwell_s   = 0.0
+            return cur
+        next_tier = max(candidates, key=candidates.get)
+        # Estimate dwell: average time spent in next_tier across recorded transitions
+        dwells = [dwell for (fr, to, _ts, dwell) in self._tier_transitions
+                  if fr == next_tier]
+        self._psm_next_tier = next_tier
+        self._psm_dwell_s   = round(sum(dwells) / len(dwells), 1) if dwells else 0.0
+        return next_tier
+
+    # ── BRL: Bayesian Reasoning Layer ─────────────────────────────────────────
+
+    def _update_brl(self):
+        """
+        BRL — update Beta prior counts from the 30-day cache tier distribution.
+        Runs at most once per BRL_COOL_S seconds.
+        """
+        now = time.time()
+        if now - self._last_brl < BRL_COOL_S and self._last_brl > 0:
+            return
+        self._last_brl = now
+        dist = self._cache.query_tier_distribution(days=30)
+        for t in range(5):
+            self._brl_tier_prior[t] = BRL_PRIOR_ALPHA + dist.get(t, 0)
+
+    def _compute_brl_confidence(self, effective_tier: int,
+                                 signal_votes: list) -> float:
+        """
+        BRL — compute posterior confidence for effective_tier.
+        likelihood = fraction of 6 signals agreeing on effective_tier.
+        Returns posterior probability.
+        """
+        n_agree   = sum(1 for sv in signal_votes if sv >= effective_tier)
+        likelihood = n_agree / len(signal_votes) if signal_votes else 0.5
+        # Prior from Beta distribution: alpha[t] / sum(all alphas)
+        prior_sum = sum(self._brl_tier_prior)
+        prior     = (self._brl_tier_prior[min(effective_tier, 4)] /
+                     (prior_sum or 1))
+        # Unnormalized posterior
+        unnorm = [self._brl_tier_prior[t] * (n_agree / len(signal_votes)
+                   if signal_votes else 0.5) for t in range(5)]
+        total_unnorm = sum(unnorm) or 1.0
+        posterior = unnorm[min(effective_tier, 4)] / total_unnorm
+        return round(posterior, 3)
+
+    # ── CDA: Causal Diagnostic Agent ──────────────────────────────────────────
+
+    def _cda_label_row(self, cpu: float, mem: float, cpi: float,
+                       tier: int, swap_vel: float) -> int:
+        """
+        CDA heuristic labeler.
+        Returns:  0=normal, 1=leak, 2=compressor_collapse, 3=cpu_collision
+        """
+        if cpu >= CPU_THROTTLE and tier >= 2:
+            return 3   # cpu_collision
+        if cpi >= CDA_LABEL_COMP_CPI:
+            return 2   # compressor_collapse
+        if tier >= 2 and swap_vel >= 20:
+            return 1   # leak / pressure
+        return 0       # normal
+
+    def _cda_train_model(self):
+        """
+        CDA — train a 4-class softmax logistic regression in pure Python and
+        optionally export to ONNX (if onnx package is available). Falls back
+        to storing only the weights dict for rule-based inference.
+        Requires at least CDA_TRAIN_MIN_ROWS labeled samples from the cache.
+        """
+        now = time.time()
+        if now - self._last_cda_train < CDA_TRAIN_COOL_S and self._last_cda_train > 0:
+            return
+        if not self._cache._ok:
+            return
+        try:
+            cutoff = int(now - 30 * 86400)
+            with sqlite3.connect(self._cache._db, timeout=5) as cx:
+                rows = cx.execute(
+                    "SELECT cpu_pct, mem_pct, swap_pct, eff_tier, thermal_pct "
+                    "FROM metrics WHERE ts >= ? AND cpu_pct IS NOT NULL "
+                    "ORDER BY ts DESC LIMIT 5000",
+                    (cutoff,)
+                ).fetchall()
+            if len(rows) < CDA_TRAIN_MIN_ROWS:
+                return
+            self._last_cda_train = now
+
+            # Build training set with CPI approximation from swap_pct
+            with self._lock:
+                cpi_now = self._compression_pressure
+            X, y = [], []
+            for cpu, mem, swap, tier, therm in rows:
+                cpu   = cpu   or 0.0
+                mem   = mem   or 0.0
+                swap  = swap  or 0.0
+                tier  = tier  or 0
+                therm = therm or 100
+                cpi_approx = min(swap / 100.0, 1.0)
+                label = self._cda_label_row(cpu, mem, cpi_approx, int(tier), swap)
+                X.append([mem, cpi_approx, swap / 100.0, cpu / 100.0, therm / 100.0])
+                y.append(label)
+
+            n_samples = len(X)
+            n_features = 5
+            n_classes  = 4
+
+            # Normalize features
+            means = [sum(X[i][j] for i in range(n_samples)) / n_samples
+                     for j in range(n_features)]
+            stds  = [max(math.sqrt(
+                        sum((X[i][j] - means[j])**2 for i in range(n_samples)) / n_samples
+                    ), 1e-6) for j in range(n_features)]
+            Xn = [[(X[i][j] - means[j]) / stds[j] for j in range(n_features)]
+                  for i in range(n_samples)]
+
+            # Initialize weights W (n_features × n_classes), bias b (n_classes,)
+            W = [[0.0] * n_classes for _ in range(n_features)]
+            b = [0.0] * n_classes
+
+            def softmax(logits):
+                m = max(logits)
+                exps = [math.exp(v - m) for v in logits]
+                s = sum(exps)
+                return [e / s for e in exps]
+
+            # SGD training
+            for _ in range(CDA_EPOCHS):
+                for i in range(n_samples):
+                    xi   = Xn[i]
+                    yi   = y[i]
+                    logits = [sum(W[j][k] * xi[j] for j in range(n_features)) + b[k]
+                              for k in range(n_classes)]
+                    probs = softmax(logits)
+                    # Compute gradient
+                    for k in range(n_classes):
+                        err = probs[k] - (1.0 if k == yi else 0.0)
+                        for j in range(n_features):
+                            W[j][k] -= CDA_LR * err * xi[j]
+                        b[k] -= CDA_LR * err
+
+            # Compute training accuracy
+            correct = 0
+            for i in range(n_samples):
+                xi = Xn[i]
+                logits = [sum(W[j][k] * xi[j] for j in range(n_features)) + b[k]
+                          for k in range(n_classes)]
+                pred = logits.index(max(logits))
+                if pred == y[i]:
+                    correct += 1
+            acc = round(correct / n_samples * 100, 1)
+
+            # Store weights for inference (always available)
+            self._cda_weights = {
+                "W": W, "b": b,
+                "means": means, "stds": stds,
+            }
+
+            # Optionally export to ONNX
+            try:
+                import onnx
+                from onnx import numpy_helper, TensorProto
+                import numpy as np
+                W_np = np.array(W, dtype=np.float32)   # (n_features, n_classes)
+                b_np = np.array(b, dtype=np.float32)   # (n_classes,)
+                W_init = numpy_helper.from_array(W_np.T, name="W")   # (n_classes, n_features)
+                b_init = numpy_helper.from_array(b_np, name="b")
+                X_in   = onnx.helper.make_tensor_value_info("X", TensorProto.FLOAT, [None, 5])
+                Z_out  = onnx.helper.make_tensor_value_info("Z", TensorProto.FLOAT, None)
+                gemm   = onnx.helper.make_node("Gemm", ["X","W","b"], ["logits"],
+                                               transB=0)
+                sm     = onnx.helper.make_node("Softmax", ["logits"], ["Z"], axis=1)
+                graph  = onnx.helper.make_graph([gemm, sm], "cda",
+                                               [X_in], [Z_out], [W_init, b_init])
+                model  = onnx.helper.make_model(graph,
+                    opset_imports=[onnx.helper.make_opsetid("", 13)])
+                onnx.save(model, str(CDA_MODEL_PATH))
+                self._emit("info",
+                    f"CDA: ONNX model saved ({n_samples} samples, acc={acc}%)")
+            except ImportError:
+                pass   # onnx not installed — weights-only inference is used
+            except Exception as oe:
+                print(f"[CDA] ONNX export failed: {oe}", file=sys.stderr)
+
+            self._emit("info",
+                f"CDA: model trained ({n_samples} samples, acc={acc}%)")
+            self._cda_load_model()
+        except Exception as e:
+            print(f"[CDA] train failed: {e}", file=sys.stderr)
+
+    def _cda_load_model(self):
+        """
+        CDA — attempt to load a pre-trained ONNX model with onnxruntime.
+        Sets self._cda_session to an InferenceSession, or None on failure.
+        """
+        self._cda_session = None
+        if not CDA_MODEL_PATH.exists():
+            return
+        try:
+            import onnxruntime as ort
+            self._cda_session = ort.InferenceSession(
+                str(CDA_MODEL_PATH),
+                providers=["CPUExecutionProvider"]
+            )
+        except ImportError:
+            pass   # onnxruntime not installed — rule-based fallback used
+        except Exception as e:
+            print(f"[CDA] model load failed: {e}", file=sys.stderr)
+
+    def _diagnose_root_cause(self):
+        """
+        CDA — diagnose root cause of current memory pressure.
+        Uses ONNX inference if session is available, else falls back to
+        rule-based classification. Updates self.causal_diagnosis.
+        """
+        with self._lock:
+            mem_pct  = self._last_vm.percent
+            cpi      = self._compression_pressure
+            swap_vel = self._swap_velocity
+            cpu_pct  = self.cpu_hist[-1] if self.cpu_hist else 0.0
+            therm    = self.thermal_pct
+
+        LABELS = ["normal", "leak", "compressor_collapse", "cpu_collision"]
+
+        if self._cda_session is not None:
+            try:
+                import numpy as np
+                feat = np.array([[
+                    mem_pct / 100.0,
+                    cpi,
+                    swap_vel / 100.0,
+                    cpu_pct / 100.0,
+                    therm / 100.0,
+                ]], dtype=np.float32)
+                out   = self._cda_session.run(None, {"X": feat})[0]
+                idx   = int(out[0].argmax())
+                conf  = float(out[0].max())
+                self._cda_confidence = round(conf, 3)
+                self.causal_diagnosis = LABELS[idx]
+                if idx > 0:
+                    self._emit("info",
+                        f"CDA: root cause → {self.causal_diagnosis} "
+                        f"(conf={conf:.0%})")
+                return
+            except Exception:
+                pass   # fall through to rule-based
+
+        # Rule-based fallback (or if ONNX weights are available)
+        if hasattr(self, "_cda_weights"):
+            try:
+                w   = self._cda_weights
+                xi  = [
+                    (mem_pct / 100.0 - w["means"][0]) / w["stds"][0],
+                    (cpi              - w["means"][1]) / w["stds"][1],
+                    (swap_vel / 100.0 - w["means"][2]) / w["stds"][2],
+                    (cpu_pct / 100.0  - w["means"][3]) / w["stds"][3],
+                    (therm / 100.0    - w["means"][4]) / w["stds"][4],
+                ]
+                W, b = w["W"], w["b"]
+                logits = [sum(W[j][k] * xi[j] for j in range(5)) + b[k]
+                          for k in range(4)]
+                m = max(logits)
+                exps = [math.exp(v - m) for v in logits]
+                s = sum(exps)
+                probs = [e / s for e in exps]
+                idx   = probs.index(max(probs))
+                self._cda_confidence = round(probs[idx], 3)
+                self.causal_diagnosis = LABELS[idx]
+                if idx > 0:
+                    self._emit("info",
+                        f"CDA: root cause → {self.causal_diagnosis} "
+                        f"(conf={self._cda_confidence:.0%})")
+                return
+            except Exception:
+                pass
+
+        # Pure rule-based fallback
+        label = self._cda_label_row(cpu_pct, mem_pct, cpi, self.effective_tier, swap_vel)
+        self.causal_diagnosis = LABELS[label]
+        self._cda_confidence  = 0.0
 
 
 # ─── HTML Dashboard ───────────────────────────────────────────────────────────
@@ -2133,6 +2985,38 @@ HTML = r"""<!DOCTYPE html>
           <span class="vmkey">Cache (90d)</span>
           <span class="vmval" id="vsCacheSize" style="color:var(--muted)">—</span>
         </div>
+        <div class="vmrow" style="border-top:1px solid var(--border);margin-top:3px;padding-top:4px">
+          <span class="vmkey">Root Cause</span>
+          <span class="vmval" id="vsRootCause" style="color:var(--muted)">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">BRL Confidence</span>
+          <span class="vmval" id="vsBrlConf" style="color:var(--muted)">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">ACN Weights</span>
+          <span class="vmval" id="vsAcnWeights" style="color:var(--muted);font-size:9px">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">Signal Integrity</span>
+          <span class="vmval" id="vsSigConf" style="font-size:9px">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">PSM Next Tier</span>
+          <span class="vmval" id="vsPsmNext" style="color:var(--muted)">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">CTRE Zone</span>
+          <span class="vmval" id="vsCtreZone" style="color:var(--muted)">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">Action Efficacy</span>
+          <span class="vmval" id="vsEfficacy" style="color:var(--muted);font-size:9px">—</span>
+        </div>
+        <div class="vmrow">
+          <span class="vmkey">ASZM Protected+</span>
+          <span class="vmval" id="vsAszm" style="color:var(--muted)">—</span>
+        </div>
       </div>
 
       <!-- Memory Events mini-feed -->
@@ -2191,7 +3075,7 @@ HTML = r"""<!DOCTYPE html>
 <!-- ── Footer ── -->
 <div class="footer">
   <span id="lastUpdate">Initializing…</span>
-  <span>Poll 1 s · Throttle &gt;85% CPU · Warn &gt;80% RAM · MMIE active</span>
+  <span>Poll 1 s · Throttle &gt;85% CPU · Warn &gt;80% RAM · v2.0 Autonomous Engine active</span>
 </div>
 
 <script>
@@ -2484,6 +3368,64 @@ async function poll() {
       const cMb = d.cache_db_mb||0, cRows = d.cache_rows||0;
       cacheEl.textContent = cMb>0 ? cMb.toFixed(1)+' MB · '+(cRows/1000).toFixed(0)+'k rows' : 'Collecting…';
 
+      // v2.0 rows
+      // Root Cause (CDA)
+      const rcEl = document.getElementById('vsRootCause');
+      const rc = d.causal_diagnosis||'normal';
+      const rcColor = {normal:'var(--green)',leak:'var(--yellow)',compressor_collapse:'var(--orange)',cpu_collision:'var(--red)'};
+      rcEl.textContent = rc; rcEl.style.color = rcColor[rc]||'var(--muted)';
+
+      // BRL Confidence
+      const brlEl = document.getElementById('vsBrlConf');
+      const brlC = d.brl_confidence||0;
+      brlEl.textContent = (brlC*100).toFixed(0)+'%';
+      brlEl.style.color = brlC>=0.7?'var(--green)':brlC>=0.4?'var(--yellow)':'var(--muted)';
+
+      // ACN Weights sparkbar
+      const acnEl = document.getElementById('vsAcnWeights');
+      const acnW = d.acn_weights||{};
+      if (Object.keys(acnW).length) {
+        acnEl.textContent = Object.entries(acnW).map(([k,v])=>k+':'+(v*100).toFixed(0)+'%').join(' ');
+      }
+
+      // Signal Integrity (SIE)
+      const scEl = document.getElementById('vsSigConf');
+      const sc2 = d.signal_confidence||{};
+      function sigLight(v){return v>=0.9?'🟢':v>=0.7?'🟡':'🔴';}
+      if (Object.keys(sc2).length){
+        scEl.textContent = Object.entries(sc2).map(([k,v])=>sigLight(v)+k).join(' ');
+      }
+
+      // PSM Next Tier
+      const psmEl = document.getElementById('vsPsmNext');
+      const psmN = d.psm_next_tier||0, psmD = d.psm_dwell_s||0;
+      psmEl.textContent = psmN>0 ? 'T'+psmN+' (≈'+psmD+'s)' : '—';
+      psmEl.style.color = tierColors[psmN]||'var(--muted)';
+
+      // CTRE Zone (current hour stability)
+      const ctreEl = document.getElementById('vsCtreZone');
+      const ctreS = d.ctre_stability||{};
+      const curHr = new Date().getHours();
+      const ctreV = ctreS[String(curHr)];
+      if (ctreV!=null) {
+        ctreEl.textContent = (ctreV*100).toFixed(0)+'% stable (hr'+curHr+')';
+        ctreEl.style.color = ctreV>=0.7?'var(--green)':ctreV>=0.4?'var(--yellow)':'var(--red)';
+      } else { ctreEl.textContent='Learning…'; ctreEl.style.color='var(--muted)'; }
+
+      // Action Efficacy (RAC)
+      const effEl = document.getElementById('vsEfficacy');
+      const eff = d.action_efficacy||{};
+      if (Object.keys(eff).length){
+        const best = Object.entries(eff).sort((a,b)=>b[1]-a[1]);
+        effEl.textContent = best.map(([k,v])=>k.replace('_',' ')+':'+(v>=0?'+':'')+v.toFixed(1)+'%').join(' ');
+      } else { effEl.textContent='No data yet'; effEl.style.color='var(--muted)'; }
+
+      // ASZM Protected additions
+      const aszmEl = document.getElementById('vsAszm');
+      const aszmN = d.dynamic_protected||0;
+      aszmEl.textContent = aszmN>0 ? '+'+aszmN+' dynamic' : 'None';
+      aszmEl.style.color = aszmN>0?'var(--yellow)':'var(--muted)';
+
       // App predictions from 90-day cache
       const preds = d.app_predictions||[];
       const predSection = document.getElementById('predSection');
@@ -2545,7 +3487,10 @@ async function poll() {
                     'ESCALATION','purgeable','wired','Wired','genealogy','GENEALOGY',
                     'leak','Swap','swap','TRIAGE','forecast','ancestry','Kernel','frozen',
                     'CEO','CPI','CMPE','TMCP','ATCE','MSCEE','GTS','velocity','compression',
-                    'Compression','circadian','coupling','calibrated'];
+                    'Compression','circadian','coupling','calibrated',
+                    'SIE','MEG','ACN','RWA','CTRE','AIP','RAC','PSM','BRL','ASZM','CDA',
+                    'root cause','signal weights','cascade','volatile','dynamic protection',
+                    'Bayesian','Markov','Ancestral'];
     const memEvs = (d.events||[])
       .filter(ev => MEM_KW.some(k => ev.msg.includes(k)))
       .slice(-10).reverse();

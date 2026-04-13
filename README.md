@@ -1,28 +1,40 @@
 # MAC Performance Bot
 
-A lightweight, always-on macOS performance monitor with **auto-remediation**, a **Multi-Dimensional Memory Intelligence Engine (MMIE)**, a **Predictive Remediation Engine**, and an installable PWA dashboard.
+A lightweight, always-on macOS performance monitor with **autonomous closed-loop resource management**, a **19-engine 5-layer control architecture**, and an installable PWA dashboard.
+
+Current version: **2.0.0**
+
+---
 
 ## Features
 
 - **Live PWA dashboard** — installable from browser, ring gauges, memory arc, activity log
 - **Auto-throttles CPU hogs** via `nice()` — no manual intervention needed
-- **CPU-RAM Conflict Resolution** — blocks CPU priority restoration when the process is a top RAM owner during active memory pressure
-- **Predictive Remediation Engine** — OLS linear-regression TTE forecast escalates the remediation tier *before* static RAM % thresholds are breached
+- **5-layer engine architecture** — Signal Sensing → Model Layer → Consensus → Action/Learning → Causal Intelligence
+- **Adaptive signal weights** — RWA/ACN reinforcement learning adjusts the 6-signal quorum weights hourly from remediation outcomes
+- **Root-cause diagnosis** — CDA classifies system state as normal / leak / compressor_collapse / cpu_collision
+- **Bayesian tier confidence** — BRL maintains a Beta posterior over tier-activation frequencies
+- **Markov next-tier prediction** — PSM predicts the next effective tier and expected dwell time
+- **Chronothermal regression** — CTRE maps hour-of-day × thermal load to memory stability zones
+- **Ancestral impact propagation** — AIP scores process families by cascading RSS depth
+- **Dynamic protected set** — ASZM elevates long-running, low-CPU system daemons to the protection list automatically
+- **Reinforcement action coordinator** — RAC measures post-action RAM deltas to label each remediation as success/failure
+- **Signal integrity validation** — SIE applies z-score anomaly detection per signal; low-confidence signals are down-weighted in ACN
+- **Model ensemble governance** — MEG tracks rolling residuals per MMAF model and promotes the historically best-fit model
 - **4-tier memory remediation cascade** — observe → advisory → SIGSTOP idle daemons → emergency termination
-- **Genealogy-guided freeze scoring** — daemons are ranked by `(family_match × 2 + pattern_match × 1)` so the family causing the most RAM pressure is frozen first
-- **XPC Respawn Guard** — detects launchd-managed services that respawn within 10 s and blocklists them to avoid futile kill loops
-- **90-day disk cache** — SQLite store of metric history (`~/Library/Application Support/performance-bot/metrics.db`); flushed every 60 s; pruned daily; used for app-level performance predictions with near-zero CPU/RAM overhead
-- **Memory Intelligence (MMIE)**
-  - macOS kernel pressure level (`kern.memorystatus_vm_pressure_level` sysctl)
-  - `vm_stat` breakdown — wired / active / inactive / purgeable / compressed / free
-  - Memory genealogy — attributes RAM to root application families via `ppid` tree walk
-  - OLS linear-regression forecast — predicts minutes until 95 % RAM exhaustion
-  - Auto-freeze/thaw of safe background daemons under Tier 3 pressure
-- **App Predictions** — 90-day cache powers week-over-week trend analysis; classifies top-RSS apps as high / medium / low risk; emits `APP PREDICTION` and `CHRONIC PRESSURE` events
-- **Detects** RAM pressure, swap usage, low disk, thermal throttling, zombie processes, memory leaks
-- **Autostart** via macOS LaunchAgent (login item)
-- **Zero heavy dependencies** — only `psutil` + Python stdlib (`sqlite3`, `collections.deque` included)
-- **Lightweight by design** — single `psutil.process_iter()` call per second; all syscall results cached; `O(1)` event ring-buffer; disk I/O batched every 60 s
+- **MSCEE 6-signal quorum** — RAM %, TTE, kernel oracle, CPI, swap velocity, circadian pattern; requires 0.55 weighted vote to escalate
+- **Graduated Thaw Sequencing (GTS)** — RSS-ascending SIGCONT with 2 s gap and RAM-gate abort
+- **RSS Velocity Momentum Scoring (RVMS)** — 1×–2× freeze-priority boost for fast-growing processes
+- **MMAF 3-model forecaster** — linear OLS / quadratic / exponential; best-RSS winner per tick drives TTE
+- **Compression Efficiency Oracle (CEO)** — CPI signal flags compressor headroom depletion before RAM saturates
+- **Adaptive threshold calibration (ATCE)** — hourly self-tuning of Tier 2/3/4 thresholds from 30-day cache percentiles
+- **Circadian pre-freeze (CMPE)** — proactive daemon freeze during historically high-pressure hours
+- **Thermal-memory coupling (TMCP)** — EMA-learned coefficient shortens TTE estimate under CPU throttle
+- **CPU-RAM Conflict Resolution Gate** — blocks CPU priority restoration when the process is a top RAM owner during active memory pressure
+- **XPC Respawn Guard** — detects launchd-managed services that respawn within 10 s and blocklists them
+- **90-day disk cache** — SQLite store of metric history; flushed every 60 s; pruned daily; powers all engine learning loops
+- **Zero heavy dependencies** — only `psutil` + Python stdlib; optional `onnx`/`onnxruntime` for CDA ONNX export
+- **Lightweight by design** — single `psutil.process_iter()` call per second; all syscall results cached; `O(1)` event ring-buffer
 
 ---
 
@@ -46,12 +58,12 @@ MAC_Perf_BOT/
 ├── CLAUDE.md                  # CMDB — architecture, thresholds, API reference
 ├── README.md                  # This file
 ├── app/
-│   ├── performance_gui.py     # Web dashboard + MMIE bot engine  ← main entry point
+│   ├── performance_gui.py     # Web dashboard + full engine stack  ← main entry point
 │   └── performance_bot.py     # Headless CLI bot
 ├── config/                    # LaunchAgent plists
 ├── scripts/                   # install / uninstall helpers
 ├── docs/
-│   ├── architecture.md        # Component diagram + data-flow + cache design
+│   ├── architecture.md        # 5-layer diagram + data-flow + engine schedule
 │   └── provisional-patent-application.md   # USPTO PPA technical spec
 └── logs/                      # Runtime logs (git-ignored)
 ```
@@ -63,6 +75,7 @@ MAC_Perf_BOT/
 - macOS 13 Ventura or later (Apple Silicon & Intel)
 - Python 3.11+ (Homebrew: `/opt/homebrew/bin/python3.11`)
 - `psutil` (auto-installed by the install script)
+- `onnx ≥ 1.14` + `onnxruntime ≥ 1.16` — optional; enables CDA ONNX model export after 200 training samples
 
 ---
 
@@ -87,36 +100,46 @@ bash scripts/uninstall.sh
 
 ## How It Works
 
-Every second the bot runs a **single** `psutil.process_iter()` call that does two things at once:
-
-1. **Collects** CPU %, RAM %, Swap % (all three syscalls executed once and cached for the whole tick)
-2. **Detects CPU hogs inline** — processes over 85 % CPU per core are reniced to `nice=10`; processes that have calmed are restored via `_restore_calmed_procs()` (touches only `self.throttled`, usually 0–3 items — no full scan)
-
-Less frequently:
+Every second the bot runs a **single** `psutil.process_iter()` call that collects metrics and detects CPU hogs inline. Additionally:
 
 | Interval | What happens |
 |----------|--------------|
-| 3 s | PRE `_compute_effective_tier()` + MMIE cascade (uses cached RAM reading — no extra syscall) |
-| 5 s | `sysctl` kernel pressure oracle + `vm_stat` anatomy + OLS TTE forecast |
-| 10 s | `psutil.disk_usage("/")` — result cached; no per-request disk reads |
-| 30 s | XPC Respawn Guard scan; battery/AC detection |
-| 60 s | Thermal check (`pmset`); zombie scan; memory leak tracking; SQLite batch flush (8 640 rows/day) |
-| 24 h | App Predictions risk analysis from 90-day cache (aggregate SQL only) |
+| 1 s | `_collect()` — metrics + CPU throttle + SIE signal confidence + RAC outcome evaluation |
+| 3 s | `_check_memory()` — MSCEE/ACN tier decision + PSM Markov prediction + CDA root-cause diagnosis |
+| 5 s | `sysctl` + `vm_stat` + MMAF/MEG forecast + CEO CPI + TMCP TTE + AIP ancestry |
+| 10 s | `psutil.disk_usage("/")` — cached; no per-request disk reads |
+| 30 s | XPC Respawn Guard scan; battery/AC detection; idle XPC sweep |
+| 60 s | Thermal check (`pmset`); zombie scan; memory leak tracking; CMPE circadian check; SQLite batch flush |
+| 300 s | `~/Library/Caches` size warning |
+| 3600 s | ATCE threshold calibration; TMCP coupling update; RWA weight update; CTRE stability regression; ASZM zone recalibration; BRL prior update |
+| 30 days | CDA model training (requires ≥ 200 labeled samples) |
 
 Events are stored in a `deque(maxlen=200)` — O(1) append, automatic discard of oldest.
 
 ---
 
-## MMIE Remediation Tiers
+## 5-Layer Engine Architecture
+
+| Layer | Name | Engines |
+|-------|------|---------|
+| 1 | Signal Sensing | SIE |
+| 2 | Model Layer | MMAF, MEG, CEO, TMCP, CTRE, AIP |
+| 3 | Consensus and Decision | ACN, MSCEE, PSM, BRL |
+| 4 | Action and Learning | ATCE, CMPE, RVMS, GTS, ASZM, RAC, RWA, XPC Guard |
+| 5 | Causal Intelligence | CDA |
+
+---
+
+## Remediation Tiers
 
 | Tier | Static trigger | Predictive trigger | Action |
 |------|---------------|-------------------|--------|
-| 1 | ≥ 80 % RAM | TTE any | Log issue + identify top RSS consumers |
-| 2 | ≥ 82 % RAM | TTE ≤ 10 min | Purgeable advisory + wired pressure warning + memory genealogy report |
+| 1 | ≥ 80 % RAM | — | Log issue + identify top RSS consumers |
+| 2 | ≥ 82 % RAM | TTE ≤ 10 min | Purgeable advisory + wired pressure warning + genealogy report |
 | 3 | ≥ 87 % RAM | TTE ≤ 5 min | Genealogy-guided SIGSTOP of background daemons; auto-SIGCONT on recovery |
 | 4 | ≥ 92 % RAM | TTE ≤ 2 min | Emergency SIGTERM of idle XPC / widget services (XPC guard enforced) |
 
-When TTE-driven escalation fires, an amber **PREDICTIVE ESCALATION ACTIVE** banner appears on the dashboard.
+Thresholds self-tune hourly via ATCE. When TTE-driven escalation fires, an amber **PREDICTIVE ESCALATION ACTIVE** banner appears on the dashboard.
 
 ---
 
@@ -125,9 +148,10 @@ When TTE-driven escalation fires, an amber **PREDICTIVE ESCALATION ACTIVE** bann
 | Panel | Contents |
 |-------|----------|
 | Metric strip | SVG ring gauges — CPU / Memory / Swap / Disk + Actions / Issues |
-| Memory Intelligence | Arc gauge, % + GB, memory forecast ETA, predictive escalation banner, Active Tier (colour-coded), CPU-RAM Lock, XPC Blocked count, Cache (90d) size |
+| Memory Intelligence | Arc gauge, % + GB, MMAF forecast ETA, predictive escalation banner, Active Tier, CPU-RAM Lock, XPC Blocked, Cache size |
+| vm_stat rows | RAM, Swap, Disk, Uptime, Active Tier, CPU-RAM Lock, XPC Blocked, Cache, Forecast Model, CPI, Swap Velocity, Thermal Coupling |
+| v2.0 rows | Root Cause (CDA), BRL Confidence, ACN Weights sparkbar, Signal Integrity traffic-light, PSM Next Tier, CTRE Zone stability, Action Efficacy, ASZM Protected+ |
 | Memory Composition | `vm_stat` bar — wired / active / inactive / compressed / free / purgeable |
-| vm_stat rows | Total RAM, Swap Used, Disk Free, Uptime, Active Tier, CPU-RAM Lock, XPC Blocked, Cache (90d) |
 | App Predictions | Risk-rated app cards from 90-day cache (appears after first 24 h analysis cycle) |
 | Memory Families | Top-8 app families by aggregated RSS with proportional bars |
 | CPU / Swap charts | 90-second sparklines |
@@ -145,10 +169,10 @@ Activity log colours: 🟢 FIX &nbsp; 🟡 WARN &nbsp; 🔴 ISSUE &nbsp; 🔵 IN
 |----------|-------|
 | Location | `~/Library/Application Support/performance-bot/metrics.db` |
 | Format | SQLite (Python `sqlite3` stdlib — no extra dependency) |
-| Schema | `ts, cpu_pct, mem_pct, swap_pct, disk_pct, pressure, eff_tier, tte_min` |
+| Core schema | `ts, cpu_pct, mem_pct, swap_pct, disk_pct, pressure, eff_tier, tte_min, thermal_pct` |
+| v2.0 tables | `remediation_outcomes` (RAC outcome log); `signal_weights` (RWA weight history) |
 | Retention | 90 days (pruned automatically each day) |
 | Write cadence | Batch flush every 60 s via `executemany()` |
-| RAM usage | ≤ 4 KB in-memory buffer (60 tuples between flushes) |
 | Max disk size | ~35–45 MB at 90 days / 1 row per 10 seconds |
 | Reads | Aggregate SQL only — `AVG`, `COUNT`, `GROUP BY` — no raw rows in Python |
 

@@ -30,31 +30,66 @@ flowchart TD
   VM --> BE
   PM --> BE
 
-  subgraph ENGINES[Inference and Remediation Engines]
+  subgraph L1[Layer 1 — Signal Sensing]
+    SIE[SIE\nSignal Integrity Estimator\nz-score confidence per signal]
+  end
+  subgraph L2[Layer 2 — Model Layer]
     MMAF[MMAF\n3-model adaptive forecaster\nlinear + quadratic + exponential]
+    MEG[MEG\nModel Ensemble Governance\nmeta-weight historical residuals]
     CEO[CEO\nCompression Efficiency Oracle\nCPI signal]
+    TMCP[TMCP\nThermal-Memory Coupling\nEMA-learned TTE adjustment]
+    CTRE[CTRE\nChronothermal Regression\nhour × thermal stability]
+    AIP[AIP\nAncestral Impact Propagation\nfamily tree RSS scoring]
+  end
+  subgraph L3[Layer 3 — Consensus and Decision]
+    ACN[ACN\nAdaptive Consensus Network\nRWA-driven adaptive weights]
     MSCEE[MSCEE\n6-signal weighted quorum\neffective tier 0 to 4]
+    PSM[PSM\nPredictive State Machine\nMarkov next-tier prediction]
+    BRL[BRL\nBayesian Reasoning Layer\nposterior tier confidence]
+  end
+  subgraph L4[Layer 4 — Action and Learning]
     ATCE[ATCE\nAdaptive Threshold Calibration\nhourly self-tuning]
     CMPE[CMPE\nCircadian Pattern Engine\nhour-of-day pre-freeze]
-    TMCP[TMCP\nThermal-Memory Coupling\nEMA-learned TTE adjustment]
     RVMS[RVMS\nRSS Velocity Scorer\nfreeze boost 1x to 2x]
     GTS[GTS\nGraduated Thaw Sequencer\nRSS-ascending SIGCONT]
+    ASZM[ASZM\nAdaptive Safety Zone Mapping\ndynamic PROTECTED set]
+    RAC[RAC\nReinforcement Action Coordinator\noutcome recording]
+    RWA[RWA\nReinforcement-Weighted Arbitration\nweight updates from outcomes]
     XG[XPC Respawn Guard\nno-kill blocklist]
   end
+  subgraph L5[Layer 5 — Causal Intelligence]
+    CDA[CDA\nCausal Diagnostic Agent\nrule-based or ONNX softmax\nnormal|leak|compressor|cpu]
+  end
 
+  BE --> SIE
+  SIE --> ACN
   BE --> MMAF
   BE --> CEO
-  MMAF --> MSCEE
-  CEO --> MSCEE
+  MMAF --> MEG
+  MEG --> ACN
+  CEO --> ACN
+  TMCP --> MMAF
+  CTRE --> ACN
+  AIP --> ACN
+  ACN --> MSCEE
   ATCE --> MSCEE
   CMPE --> MSCEE
-  TMCP --> MMAF
+  MSCEE --> PSM
+  MSCEE --> BRL
   MSCEE -->|tier 3| RVMS
   RVMS --> GTS
+  MSCEE --> ASZM
+  MSCEE --> RAC
+  RAC --> RWA
+  RWA --> ACN
   MSCEE --> XG
+  MSCEE --> CDA
   DB -->|30-day percentiles| ATCE
   DB -->|hour-of-day avgs| CMPE
   DB -->|throttled rows| TMCP
+  DB -->|tier distribution| BRL
+  DB -->|outcome history| RWA
+  DB -->|training data| CDA
 
   BR[Browser PWA\nChart.js dashboard] -->|GET / and GET /stats| HTTP
   HTTP -->|JSON metrics| BR
@@ -73,22 +108,41 @@ BotEngine (background thread, 1 Hz)
       ├── throttled{}                           ← pid → name map
       ├── events[]                              ← deque(maxlen=200), O(1)
       │
-      ├── MMIE / Engine state
+      ├── MMIE / Engine state (v1.5)
       │   ├── mem_pressure_level                ← kernel sysctl oracle
       │   ├── vm_breakdown{}                    ← vm_stat anatomy
       │   ├── mem_forecast_min                  ← MMAF TTE (minutes)
-      │   ├── _last_forecast_model              ← "linear"|"quadratic"|"exponential"
+      │   ├── _last_forecast_model              ← MEG winner: "linear"|"quadratic"|"exponential"
       │   ├── _compression_pressure             ← CEO CPI (0.0–1.0)
       │   ├── _swap_velocity                    ← MB/s swap growth rate
       │   ├── _thermal_coupling                 ← TMCP EMA coefficient
       │   ├── _circadian_profile{}              ← CMPE hour→avg RAM %
       │   ├── _cal_thresholds{}                 ← ATCE live tier thresholds
       │   ├── mem_ancestry[]                    ← ppid-tree RSS families
-      │   ├── effective_tier                    ← MSCEE output (0–4)
+      │   ├── effective_tier                    ← MSCEE/ACN output (0–4)
       │   ├── predictive_escalation             ← TTE drove tier up
       │   ├── _ram_pressure_lock                ← CPU-RAM conflict gate
       │   ├── _frozen_pids{}                    ← SIGSTOP'd daemons
       │   └── _no_kill                          ← XPC respawn blocklist
+      │
+      ├── v2.0 Engine state
+      │   ├── _signal_confidence{}              ← SIE: {cpu, mem, swap} ∈ [0.5, 1.0]
+      │   ├── _sie_history{}                    ← SIE: rolling 30-sample deques per signal
+      │   ├── _model_residual_history{}         ← MEG: 5-sample residual deques per MMAF model
+      │   ├── _acn_weights{}                    ← ACN/RWA: adaptive {s1..s6} weights (sum=1)
+      │   ├── _brl_confidence                   ← BRL: posterior tier confidence (0.0–1.0)
+      │   ├── _brl_tier_prior[]                 ← BRL: Beta alpha counts per tier [0..4]
+      │   ├── _psm_next_tier                    ← PSM: Markov-predicted next effective_tier
+      │   ├── _psm_dwell_s                      ← PSM: predicted dwell time in next tier (s)
+      │   ├── _tier_transitions                 ← PSM: deque(maxlen=20) of (from, to, ts)
+      │   ├── _transition_matrix{}              ← PSM: {(from,to): count} for Markov weights
+      │   ├── _ctre_stability{}                 ← CTRE: {hour: stability_score 0.0–1.0}
+      │   ├── _aip_impact[]                     ← AIP: top-8 [{app, impact_score, cascade_depth, child_mb}]
+      │   ├── _pending_outcomes[]               ← RAC: [(eval_ts, tier, action, pre_mem)]
+      │   ├── _action_efficacy{}                ← RAC/RWA: action_type → avg RAM-drop %
+      │   ├── _dynamic_protected                ← ASZM: set(PROTECTED) + elevated daemons
+      │   ├── _criticality_scores{}             ← ASZM: process name → criticality float
+      │   └── causal_diagnosis                  ← CDA: "normal"|"leak"|"compressor_collapse"|"cpu_collision"
       │
       └── MetricsCache (disk)
           └── ~/Library/Application Support/performance-bot/metrics.db
@@ -118,7 +172,10 @@ BotEngine (background thread, 1 Hz)
             ├── Memory Intelligence panel — arc gauge, vm_stat breakdown,
             │   Active Tier row, predictive escalation banner, CPU-RAM Lock,
             │   XPC Blocked, Cache (90d) size, Forecast Model, CPI,
-            │   Swap Velocity, Thermal Coupling, App Predictions panel
+            │   Swap Velocity, Thermal Coupling, App Predictions panel,
+            │   Root Cause (CDA), BRL Confidence, ACN Weights sparkbar,
+            │   Signal Integrity traffic-light, PSM Next Tier,
+            │   CTRE Zone stability, Action Efficacy, ASZM Protected+
             ├── CPU / Swap sparklines (90 s canvas charts)
             ├── Bot Status cards  — Throttled / Actions / Issues / RAM Freed
             ├── Activity log      — FIX / WARN / ISSUE / INFO events
@@ -200,7 +257,22 @@ Every 300 s → _check_caches()        ~/Library/Caches du scan
 Every 3600 s→ _analyse_app_predictions()    guarded by 86400 s internal cooldown
 Every 3600 s→ _calibrate_thresholds()       [ATCE: recalibrate Tier 2/3/4 from 30-day cache]
 Every 3600 s→ _compute_thermal_coupling()   [TMCP: update EMA coefficient from throttled rows]
+Every 3600 s→ _update_rwa_weights()         [RWA: EMA update of ACN signal weights from outcomes]
+Every 3600 s→ _compute_ctre()               [CTRE: hour×thermal stability from 30-day cache]
+Every 3600 s→ _update_aszm()                [ASZM: recalibrate dynamic PROTECTED set]
+Every 3600 s→ _update_brl()                 [BRL: update Beta tier-frequency priors from cache]
+On startup / every 30 days → _cda_train_model()  [CDA: train/retrain ONNX softmax model]
 ```
+
+## Layer Model (v2.0)
+
+| Layer | Name                        | Engines                      | Purpose                                      |
+|-------|-----------------------------|------------------------------|----------------------------------------------|
+| 1     | Signal Sensing              | SIE                          | z-score integrity validation of raw signals  |
+| 2     | Model Layer                 | MMAF, MEG, CEO, TMCP, CTRE, AIP | Multi-model forecasting + context enrichment |
+| 3     | Consensus and Decision      | ACN, MSCEE, PSM, BRL         | Adaptive quorum + Bayesian tier decision      |
+| 4     | Action and Learning         | ATCE, CMPE, RVMS, GTS, ASZM, RAC, RWA, XPC Guard | Remediation + reinforcement learning |
+| 5     | Causal Intelligence         | CDA                          | Root-cause classification                    |
 
 ---
 
@@ -376,14 +448,25 @@ Prune    : DELETE WHERE ts < now − 90 days, once per day + WAL checkpoint
 Capacity : ~90 days × 8640 rows/day ≈ 777 K rows ≈ 35–45 MB max on disk
            (1 row per 10 s, not per second — 10× reduction from v1.3.0)
 
+Additional v2.0 tables:
+  remediation_outcomes(ts, tier, action, pre_mem, post_mem, delta_mb, success)
+    ← written by RAC after each remediation action; evaluated after RAC_EVAL_DELAY_S
+  signal_weights(ts, s1_weight..s6_weight, accuracy)
+    ← reserved for future federated weight logging; created but not yet filled
+
 Analysis methods (all run aggregate SQL — zero raw rows loaded into Python):
   app_mem_trend(app, 30d)        → {avg_mem_pct, week1_avg, week2_avg, trend}
   chronic_pressure_pct(7d)       → float: % of time RAM above MEM_WARN
+  record_outcome(...)            → RAC outcome INSERT
+  query_signal_accuracy(sig, 24h)→ float success rate for RWA
+  query_tier_distribution(30d)   → {tier: count} for BRL
   _analyse_app_predictions()     → [{app, mb, pct, trend, risk, chronic_pct}]
                                     runs every 24 h; emits APP PREDICTION events
   _calibrate_thresholds()        → ATCE: 75th/85th/93rd percentile of mem_pct (30d)
   _build_circadian_profile()     → CMPE: AVG(mem_pct) GROUP BY ts/3600 % 24
   _compute_thermal_coupling()    → TMCP: OLS regression on throttled-state rows
+  _compute_ctre()                → CTRE: per-hour variance from 30-day cache
+  _update_brl()                  → BRL: tier count distribution for Beta priors
 ```
 
 ---

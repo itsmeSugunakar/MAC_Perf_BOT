@@ -51,19 +51,19 @@ echo "→ LaunchAgent loaded — GUI will auto-start at every login."
 
 # ── 6. Launch immediately ─────────────────────────────────────────────────────
 echo "→ Opening Performance Bot GUI …"
-open -a Terminal "$SCRIPT_DIR/performance_gui.py" 2>/dev/null || \
-    nohup "$PY_PATH" "$SCRIPT_DIR/performance_gui.py" &
+open -a Terminal "$REPO_ROOT/app/performance_gui.py" 2>/dev/null || \
+    nohup "$PY_PATH" "$REPO_ROOT/app/performance_gui.py" &
 sleep 1   # give python a moment to start
 
 echo ""
 echo "✓ All done!"
 echo ""
-echo "  App script : $SCRIPT_DIR/performance_gui.py"
+echo "  App script : $REPO_ROOT/app/performance_gui.py"
 echo "  Auto-start : $PLIST_DST"
 echo "  Logs       : $LOG_DIR/"
 echo ""
 echo "  Manual controls:"
-echo "    Open     → python3 $SCRIPT_DIR/performance_gui.py"
+echo "    Open     → python3 $REPO_ROOT/app/performance_gui.py"
 echo "    Stop bot → launchctl unload $PLIST_DST"
 echo "    Start bot→ launchctl load -w $PLIST_DST"
 echo "    Remove   → bash $SCRIPT_DIR/uninstall.sh"

@@ -2,20 +2,25 @@ flowchart TD
   LA[LaunchAgent\nlogin autostart] --> GUI[performance_gui.py]
 
   subgraph APP[performance_gui.py Runtime]
-    BE[BotEngine\n1 second tick]
+    BE[BotEngine\n1 s tick]
     HTTP[HTTP Handler\n127.0.0.1:8765]
-    DB[(SQLite Metrics Cache\n90 days)]
+
+    subgraph STORE[SQLite — 90-day Disk Cache]
+      DM[(metrics\n1 row per 10 s)]
+      DRO[(remediation_outcomes)]
+      DSW[(signal_weights)]
+    end
 
     BE -->|snapshot| HTTP
-    BE -->|cache.record + flush| DB
-    DB -->|aggregates| BE
+    BE -->|cache.record + flush| DM
+    DM -->|aggregates| BE
   end
 
   subgraph OS[macOS Signals and Metrics]
-    PS[psutil.process_iter]
-    SYS[sysctl kern.memorystatus]
-    VM[vm_stat]
-    PM[pmset thermal and power]
+    PS[psutil.process_iter\n1 scan per second]
+    SYS[sysctl\nkern.memorystatus — 5 s]
+    VM[vm_stat\n5 s]
+    PM[pmset thermal / power\n30–60 s]
   end
 
   PS --> BE
@@ -23,31 +28,79 @@ flowchart TD
   VM --> BE
   PM --> BE
 
-  subgraph ENGINES[Inference and Remediation Engines]
-    MMAF[MMAF\n3-model adaptive forecaster\nlinear + quadratic + exponential]
-    CEO[CEO\nCompression Efficiency Oracle\nCPI signal]
-    MSCEE[MSCEE\n6-signal weighted quorum\neffective tier 0 to 4]
-    ATCE[ATCE\nAdaptive Threshold Calibration\nhourly self-tuning]
-    CMPE[CMPE\nCircadian Pattern Engine\nhour-of-day pre-freeze]
-    TMCP[TMCP\nThermal-Memory Coupling\nEMA-learned TTE adjustment]
-    RVMS[RVMS\nRSS Velocity Scorer\nfreeze boost 1x to 2x]
-    GTS[GTS\nGraduated Thaw Sequencer\nRSS-ascending SIGCONT]
-    XG[XPC Respawn Guard\nno-kill blocklist]
+  subgraph L1[Signal Processing Layer]
+    SIE[SIE — Signal Integrity Estimator\nz-score anomaly confidence per signal]
+    MEG[MEG — Model Ensemble Governance\nmeta-weight historical residuals over MMAF models]
   end
 
+  subgraph L2[Forecasting and Pressure]
+    MMAF[MMAF — Multi-Model Adaptive Forecaster\nlinear + quadratic + exponential\nbest-RSS model wins — TTE to 95%]
+    CEO[CEO — Compression Efficiency Oracle\nCPI = compressed / compressed+purgeable]
+    TMCP[TMCP — Thermal-Memory Coupling Predictor\nEMA-learned thermal coeff — shortens TTE under throttle]
+    AIP[AIP — Ancestral Impact Propagation\nrecursive RSS depth scoring — cascade risk detection]
+  end
+
+  subgraph L3[Tier Decision Layer]
+    ACN[ACN / MSCEE — Adaptive Consensus Network\n6-signal RWA-weighted quorum — effective tier 0–4\nquorum threshold 0.55]
+    RWA[RWA — Reinforcement-Weighted Arbitration\nhourly EMA weight update from remediation_outcomes]
+    BRL[BRL — Bayesian Reasoning Layer\nBeta prior + likelihood posterior — tier confidence 0–1]
+    PSM[PSM — Predictive State Machine\nMarkov chain over tier transitions — next tier + dwell]
+  end
+
+  subgraph L4[Calibration Layer]
+    ATCE[ATCE — Adaptive Threshold Calibration Engine\nhourly self-tuning from 30-day cache percentiles\n75th → T2  85th → T3  93rd → T4]
+    CMPE[CMPE — Circadian Memory Pattern Engine\nhour-of-day SQL aggregate — proactive pre-freeze]
+    CTRE[CTRE — Chronothermal Regression Engine\nper-hour OLS variance stability score 0–1]
+  end
+
+  subgraph L5[Remediation and Safety Layer]
+    RVMS[RVMS — RSS Velocity Momentum Scorer\nvelocity boost 1×–2× on freeze composite score]
+    GTS[GTS — Graduated Thaw Sequencer\nRSS-ascending SIGCONT — 2 s gap — RAM gate abort]
+    XG[XPC Respawn Guard\nno-kill blocklist for launchd-managed services]
+    ASZM[ASZM — Adaptive Safety Zone Mapping\ncriticality scoring — dynamic PROTECTED set]
+    RAC[RAC — Reinforcement Action Coordinator\n30 s delayed outcome evaluation — success / failure]
+  end
+
+  subgraph L6[Diagnostics Layer]
+    CDA[CDA — Causal Diagnostic Agent\nrule-based + optional ONNX softmax\nnormal / leak / compressor_collapse / cpu_collision]
+  end
+
+  BE --> SIE
   BE --> MMAF
   BE --> CEO
-  MMAF --> MSCEE
-  CEO --> MSCEE
-  ATCE --> MSCEE
-  CMPE --> MSCEE
-  TMCP --> MMAF
-  MSCEE -->|tier 3| RVMS
-  RVMS --> GTS
-  MSCEE --> XG
-  DB -->|30-day percentiles| ATCE
-  DB -->|hour-of-day avgs| CMPE
-  DB -->|throttled rows| TMCP
+  BE --> AIP
+  BE --> CDA
 
-  BR[Browser PWA\nChart.js dashboard] -->|GET / and GET /stats| HTTP
-  HTTP -->|JSON metrics| BR
+  MEG --> MMAF
+  TMCP --> MMAF
+
+  SIE -->|signal confidence| ACN
+  MMAF -->|TTE signal S2| ACN
+  CEO -->|CPI signal S4| ACN
+  RWA -->|adaptive weights| ACN
+  ATCE -->|calibrated thresholds| ACN
+  CMPE -->|circadian signal S6| ACN
+  CTRE -->|stability score| ACN
+  ASZM -->|dynamic PROTECTED set| ACN
+
+  ACN -->|tier 3 freeze| RVMS
+  RVMS --> GTS
+  ACN --> XG
+  ACN --> PSM
+  ACN --> BRL
+  ACN -->|action taken| RAC
+
+  RAC -->|outcome record| DRO
+  DRO -->|accuracy history| RWA
+  DSW <-->|persist / restore| RWA
+
+  DM -->|30-day percentiles| ATCE
+  DM -->|hour-of-day avgs| CMPE
+  DM -->|throttled rows| TMCP
+  DM -->|hour × thermal rows| CTRE
+  DM -->|tier frequency| BRL
+  DM -->|uptime + CPU rows| ASZM
+  DM -->|MMAF residuals| MEG
+
+  BR[Browser PWA\nChart.js — polls /stats every 1 s\nRoot Cause · BRL Confidence · ACN Weights\nSignal Integrity · PSM Next Tier · CTRE Zone\nAction Efficacy · ASZM Protected+] -->|GET /  GET /stats| HTTP
+  HTTP -->|JSON snapshot| BR
