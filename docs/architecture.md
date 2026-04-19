@@ -58,7 +58,7 @@ flowchart TD
     XG[XPC Respawn Guard\nno-kill blocklist]
   end
   subgraph L5[Layer 5 — Causal Intelligence]
-    CDA[CDA\nCausal Diagnostic Agent\nrule-based or ONNX softmax\nnormal|leak|compressor|cpu]
+    CDA[CDA\nCausal Diagnostic Agent\nrule-based or ONNX softmax\nnormal, leak, compressor_collapse, cpu_collision]
   end
 
   BE --> SIE
