@@ -62,7 +62,7 @@ flowchart TD
   end
 
   subgraph L6[Diagnostics Layer]
-    CDA[CDA — Causal Diagnostic Agent\nrule-based + optional ONNX softmax\nnormal / leak / compressor_collapse / cpu_collision]
+    CDA[CDA — Causal Diagnostic Agent\nrule-based + optional ONNX softmax\nnormal, leak, compressor_collapse, cpu_collision]
   end
 
   BE --> SIE
@@ -102,5 +102,6 @@ flowchart TD
   DM -->|uptime + CPU rows| ASZM
   DM -->|MMAF residuals| MEG
 
-  BR[Browser PWA\nChart.js — polls /stats every 1 s\nRoot Cause · BRL Confidence · ACN Weights\nSignal Integrity · PSM Next Tier · CTRE Zone\nAction Efficacy · ASZM Protected+] -->|GET /  GET /stats| HTTP
-  HTTP -->|JSON snapshot| BR
+  BR[Browser PWA v2.1\nChart.js — polls /stats every 1 s\nPerformance Score 0-100 · Tier labels user language\nRoot Cause Banner · RAM Recommendation\nSimple/Expert toggle · Activity Log filter\n7-Day History tab via /history] -->|GET / GET /stats GET /history| HTTP
+  HTTP -->|JSON snapshot + history| BR
+  MB[macOS Menu Bar\nrumps optional\ntier icon + RAM percent\nupdates every 3 s] --> BE

@@ -13,7 +13,7 @@
 |--------------------|-----------------------------------------------------|
 | **App Name**       | MAC Performance Bot                                 |
 | **Short Name**     | mac-perf-bot                                        |
-| **Version**        | 2.0.0                                               |
+| **Version**        | 2.1.0                                               |
 | **Owner**          | itsmeSugunakar                                      |
 | **Contact**        | sugun.sr@gmail.com                                  |
 | **Repository**     | https://github.com/itsmeSugunakar/MAC_Perf_BOT      |
@@ -434,7 +434,8 @@ Dashboard server listens on `http://127.0.0.1:8765`.
 | Endpoint         | Method | Returns                        | Description                    |
 |------------------|--------|--------------------------------|--------------------------------|
 | `/`              | GET    | `text/html`                    | Full PWA dashboard page        |
-| `/stats`         | GET    | `application/json`             | Full snapshot: metrics + MMIE  |
+| `/stats`         | GET    | `application/json`             | Full snapshot: metrics + MMIE + product metrics |
+| `/history`       | GET    | `application/json`             | 7-day hourly aggregates `[{hour, mem, cpu, swap}]` |
 | `/manifest.json` | GET    | `application/manifest+json`    | PWA web app manifest           |
 | `/icon.svg`      | GET    | `image/svg+xml`                | PWA app icon                   |
 | `/pause?state=1` | GET    | `{"ok":true}`                  | Pause the bot engine           |
@@ -520,7 +521,12 @@ Dashboard server listens on `http://127.0.0.1:8765`.
     }
   ],
   "causal_diagnosis":     str,       // CDA root cause: normal|leak|compressor_collapse|cpu_collision
-  "dynamic_protected":    int        // ASZM net additions to PROTECTED set (not in base set)
+  "dynamic_protected":    int,       // ASZM net additions to PROTECTED set (not in base set)
+  // ── v2.1 product metrics ───────────────────────────────────────────────────
+  "performance_score":    int,       // 0–100 daily score; -1 = warming up (<10 min data)
+                                     // formula: 100 − (0.5×avg_mem + 0.3×avg_cpu + 0.2×avg_swap) 24h
+  "longterm_avg_mem":     float,     // 30-day average RAM %; >80% triggers upgrade recommendation
+  "leak_pids_list":       [int]      // PIDs currently flagged as memory leaks
 }
 ```
 
@@ -611,6 +617,8 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 | Swap-warn fires once per session | Intentional — avoids log spam. |
 | MMIE genealogy scan cost | `_build_memory_ancestry()` iterates all processes; runs every 120 s max. |
 | SIGSTOP requires user ownership | MMIE Tier 3 freeze only works on processes owned by the current user. |
+| SIGSTOP ≠ memory freed | SIGSTOP suspends a process but does NOT release its RSS. The "Memory Paused" counter shows MB suspended (v2.1 corrected label — was "RAM Freed"). Memory is only reclaimed when the process is SIGCONT'd and the OS reclaims its pages over time. |
+| Menu bar requires `rumps` | `_start_menubar()` silently no-ops if `rumps` is not installed. Install with `pip install rumps`. On macOS 14+, the process may need `LSUIElement=1` in the plist to suppress a Dock icon. |
 | `memory_pressure` sysctl | `kern.memorystatus_vm_pressure_level` may require SIP adjustments on some configurations. Falls back to percent-derived level automatically. |
 | App Predictions cold start | The `_analyse_app_predictions()` panel is empty for the first 24 h. After the first full day the cache has enough data to show risk ratings. |
 | Cache disk size | At 1 row/10 s for 90 days the database reaches ~35–45 MB — acceptable on all Macs. Reduce `CACHE_RETENTION_DAYS` only if storage is extremely limited. |
@@ -652,6 +660,7 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 | 2026-04-05 | 1.3.0   | itsmeSugunakar | 90-day SQLite disk cache (`MetricsCache`): batch writes every 60 s, daily prune, aggregate-only reads; `_analyse_app_predictions()` for app-level risk classification; `app_mem_trend()` and `chronic_pressure_pct()` queries; dashboard App Predictions panel + Cache (90d) vmrow; `/stats` extended with `effective_tier`, `predictive_escalation`, `cpu_ram_lock`, `xpc_blocked`, `cache_db_mb`, `cache_rows`, `app_predictions` |
 | 2026-04-05 | 1.4.0   | itsmeSugunakar | Lightweight engine: merged `_check_cpu` throttle-detection into `_collect` (single `process_iter` per second); `_check_cpu` → `_restore_calmed_procs` (no process scan); `psutil.cpu_count` cached as `self._ncpu`; `virtual_memory`/`swap_memory` fetched once per tick, shared via `_last_vm`/`_last_swap`; `disk_usage` moved to `_check_disk` (10 s), cached in `disk_pct`/`disk_free_gb`; handler no longer calls `disk_usage` per request; `events` list → `deque(maxlen=200)` (O(1)); cache record rate 1/s → 1/10 s; `_detect_xpc_respawn` 10 s → 30 s |
 | 2026-04-10 | 1.5.0   | itsmeSugunakar | 8 patent-level engine innovations: **MMAF** — 3-model adaptive forecaster (linear/quadratic/exponential, best-RSS selection); **CEO** — Compression Efficiency Oracle (CPI signal); **MSCEE** — 6-signal weighted quorum replaces 2-signal `max()` (signals: RAM %, TTE, kernel oracle, CPI, swap velocity, circadian); **GTS** — Graduated Thaw Sequencing (RSS-ascending SIGCONT, 2 s gap, RAM gate); **RVMS** — RSS Velocity Momentum Scorer (1×–2× freeze boost); **ATCE** — Adaptive Threshold Calibration Engine (hourly self-tuning from 30-day cache percentiles); **CMPE** — Circadian Memory Pattern Engine (hour-of-day SQL profile, proactive pre-freeze); **TMCP** — Thermal-Memory Coupling Predictor (EMA-learned TTE shortening under thermal throttle); `MetricsCache` schema extended with `thermal_pct` column (auto-migrates); 4 new dashboard vmrows (Forecast Model, CPI, Swap Velocity, Thermal Coupling); `/stats` extended with 6 new fields |
+| 2026-04-18 | 2.1.0   | itsmeSugunakar | **Product UX Layer** — 10 user-outcome improvements on top of the v2.0 engine: **Performance Score** (0–100 daily, `daily_performance_score()` from 24h SQLite); **Memory Paused** (accurate label for SIGSTOP — was "RAM Freed"); **Tier labels** renamed to user language (All Good / Watching / Intervening / Rescue Mode / Emergency); **Root Cause Banner** (plain-English, prominent, hidden when normal); **Simple/Expert mode** toggle (10 engine-telemetry rows hidden by default, `localStorage` persisted); **Activity Log filter** (`category="bot"` on calibration `_emit()` calls, "Bot Logs" toggle in titlebar); **7-Day History tab** (`hourly_history()` MetricsCache method, `/history` HTTP endpoint, Chart.js multi-line chart); **RAM Recommendation** (`longterm_avg_mem()` 30d query, advisory card when avg > 80%); **Leak hints** in process table (LEAK badge + 💡 Restart? for leak-flagged processes); **macOS Menu Bar** (`_start_menubar()` via `rumps`, daemon thread, optional); LaunchAgent path updated to `~/Documents/performance-bot/` |
 | 2026-04-12 | 2.0.0   | itsmeSugunakar | **Autonomous Dynamic Resource Management Agent** — 11 new cognitive engines across a 5-layer governed control model: **SIE** — Signal Integrity Estimator (z-score anomaly confidence per signal); **MEG** — Model Ensemble Governance (meta-weight historical residuals over MMAF models); **ACN** — Adaptive Consensus Network (RWA-driven adaptive weights replace static MSCEE weights); **RWA** — Reinforcement-Weighted Arbitration (hourly EMA weight update from `remediation_outcomes` table); **CTRE** — Chronothermal Regression Engine (per-hour variance stability from 30-day cache); **AIP** — Ancestral Impact Propagation (family-tree RSS depth scoring + cascade risk detection); **RAC** — Reinforcement Action Coordinator (records and evaluates remediation outcomes via new SQLite table); **PSM** — Predictive State Machine (Markov next-tier prediction + dwell estimation); **BRL** — Bayesian Reasoning Layer (Beta prior tier-frequency + likelihood posterior confidence); **ASZM** — Adaptive Safety Zone Mapping (criticality scoring → dynamic `_dynamic_protected` set); **CDA** — Causal Diagnostic Agent (pure-Python softmax LR + optional ONNX export: normal \| leak \| compressor_collapse \| cpu_collision); new SQLite tables `remediation_outcomes` + `signal_weights` (auto-migrates existing DB); 8 new dashboard vmrows (Root Cause, BRL Confidence, ACN Weights, Signal Integrity, PSM Next Tier, CTRE Zone, Action Efficacy, ASZM Protected+); `/stats` extended with 10 new fields |
 
 ---

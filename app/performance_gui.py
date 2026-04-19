@@ -214,6 +214,69 @@ class MetricsCache:
         except Exception:
             return 0.0
 
+    def daily_performance_score(self, lookback_hours: int = 24) -> int:
+        """
+        Compute a 0–100 Performance Score from the last lookback_hours of data.
+        Higher = better. Returns -1 when there is insufficient data.
+        Formula: 100 - (0.5*avg_mem + 0.3*avg_cpu + 0.2*avg_swap), clamped 0–100.
+        """
+        if not self._ok:
+            return -1
+        cutoff = int(time.time() - lookback_hours * 3600)
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                row = cx.execute(
+                    "SELECT AVG(mem_pct), AVG(cpu_pct), AVG(swap_pct), COUNT(*) "
+                    "FROM metrics WHERE ts >= ?",
+                    (cutoff,)
+                ).fetchone()
+            if not row or row[3] < 60:   # need at least 10 min of data
+                return -1
+            avg_mem = row[0] or 0.0
+            avg_cpu = row[1] or 0.0
+            avg_swap = row[2] or 0.0
+            score = 100.0 - (0.5 * avg_mem + 0.3 * avg_cpu + 0.2 * avg_swap)
+            return max(0, min(100, round(score)))
+        except Exception:
+            return -1
+
+    def longterm_avg_mem(self, days: int = 30) -> float:
+        """Return the average RAM % over the last `days` days. 0.0 if no data."""
+        if not self._ok:
+            return 0.0
+        cutoff = int(time.time() - days * 86400)
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                row = cx.execute(
+                    "SELECT AVG(mem_pct), COUNT(*) FROM metrics WHERE ts >= ?",
+                    (cutoff,)
+                ).fetchone()
+            return round(row[0], 1) if row and row[0] and row[1] >= 100 else 0.0
+        except Exception:
+            return 0.0
+
+    def hourly_history(self, days: int = 7) -> list:
+        """
+        Return hourly-bucketed averages of mem_pct, cpu_pct, swap_pct for the
+        last `days` days. Each entry: {hour (unix ts), mem, cpu, swap}.
+        """
+        if not self._ok:
+            return []
+        cutoff = int(time.time() - days * 86400)
+        try:
+            with sqlite3.connect(self._db, timeout=5) as cx:
+                rows = cx.execute(
+                    "SELECT CAST(ts/3600 AS INTEGER)*3600 AS hour, "
+                    "AVG(mem_pct), AVG(cpu_pct), AVG(swap_pct) "
+                    "FROM metrics WHERE ts >= ? "
+                    "GROUP BY hour ORDER BY hour",
+                    (cutoff,)
+                ).fetchall()
+            return [{"hour": r[0], "mem": round(r[1], 1),
+                     "cpu": round(r[2], 1), "swap": round(r[3], 1)} for r in rows]
+        except Exception:
+            return []
+
     def db_size_mb(self) -> float:
         """Return the on-disk size of the cache database in MB."""
         try:
@@ -443,6 +506,9 @@ class BotEngine(threading.Thread):
         self._rss_history     = {}     # pid → [(ts, rss_mb), ...]
         self._warned_leaks    = set()  # pids already flagged this session
         self._cache_warned    = False
+        self.performance_score: int  = -1    # 0–100 daily score; -1 = warming up
+        self.longterm_avg_mem: float = 0.0   # 30-day avg RAM %
+        self._leak_pids: set         = set() # PIDs currently flagged as leaks
         self.disk_pct         = 0.0
         self.disk_free_gb     = 0.0
         self._last_consumer   = 0.0    # timestamp of last consumer report
@@ -609,11 +675,15 @@ class BotEngine(threading.Thread):
                 "aip_impact":           list(self._aip_impact),
                 "causal_diagnosis":     self.causal_diagnosis,
                 "dynamic_protected":    len(self._dynamic_protected) - len(PROTECTED),
+                # product metrics
+                "performance_score":    self.performance_score,
+                "longterm_avg_mem":     round(self.longterm_avg_mem, 1),
+                "leak_pids_list":       list(self._leak_pids),
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
-    def _emit(self, kind, msg):
-        ev = {"kind": kind, "msg": msg,
+    def _emit(self, kind: str, msg: str, category: str = "user"):
+        ev = {"kind": kind, "msg": msg, "category": category,
               "ts": datetime.now().strftime("%H:%M:%S")}
         with self._lock:
             self.events.append(ev)   # deque(maxlen=200) auto-discards oldest
@@ -641,6 +711,9 @@ class BotEngine(threading.Thread):
                         self._cache.prune()
                         self.cache_db_mb = self._cache.db_size_mb()
                         self.cache_rows  = self._cache.row_count()
+                        if tick % 300 == 0:   # refresh score every 5 min
+                            self.performance_score = self._cache.daily_performance_score()
+                            self.longterm_avg_mem  = self._cache.longterm_avg_mem()
                     if tick % 3600 == 0 and tick > 0:
                         self._analyse_app_predictions()
                         self._calibrate_thresholds()
@@ -649,6 +722,8 @@ class BotEngine(threading.Thread):
                         self._compute_ctre()
                         self._update_aszm()
                         self._update_brl()
+                        self.performance_score = self._cache.daily_performance_score()
+                        self.longterm_avg_mem  = self._cache.longterm_avg_mem()
                     # CDA training: run at startup and every 30 days
                     if tick == 0 or (self._last_cda_train > 0 and
                             time.time() - self._last_cda_train >= CDA_TRAIN_COOL_S):
@@ -920,6 +995,7 @@ class BotEngine(threading.Thread):
                         rate = growth / elapsed * 60  # MB/min
                         if rate >= LEAK_RATE_MB_MIN and rss >= LEAK_MIN_RSS_MB:
                             self._warned_leaks.add(pid)
+                            self._leak_pids.add(pid)
                             self.issues += 1
                             self._emit("warn",
                                 f"Memory growth: {p.name()} (PID {pid}) "
@@ -927,6 +1003,7 @@ class BotEngine(threading.Thread):
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 self._rss_history.pop(p.pid, None)
                 self._warned_leaks.discard(p.pid)
+                self._leak_pids.discard(p.pid)
 
     def _check_thermal(self):
         """Detect CPU thermal throttling via pmset -g therm."""
@@ -1033,7 +1110,7 @@ class BotEngine(threading.Thread):
             total = sum(r for _, _, r in swept)
             self._emit("fix",
                 f"Idle sweep: {len(swept)} services cleared, "
-                f"~{total:.0f} MB freed (session total: {self.freed_mb:.0f} MB)")
+                f"~{total:.0f} MB paused (session total: {self.freed_mb:.0f} MB)")
 
     # ── Predictive Remediation Engine ─────────────────────────────────────────
 
@@ -1764,7 +1841,7 @@ class BotEngine(threading.Thread):
                     }
                 self._emit("info",
                     f"ATCE: thresholds calibrated from {n} samples — "
-                    f"T2={p75:.0f}% T3={p85:.0f}% T4={p93:.0f}%")
+                    f"T2={p75:.0f}% T3={p85:.0f}% T4={p93:.0f}%", category="bot")
         except Exception:
             pass
 
@@ -1859,7 +1936,7 @@ class BotEngine(threading.Thread):
             )
             self._emit("info",
                 f"TMCP: thermal coupling={self._thermal_coupling:.3f} "
-                f"(from {n} throttled samples)")
+                f"(from {n} throttled samples)", category="bot")
         except Exception:
             pass
 
@@ -1945,7 +2022,7 @@ class BotEngine(threading.Thread):
         bot_sig  = min(self._acn_weights, key=self._acn_weights.get)
         self._emit("info",
             f"RWA: signal weights updated — top={top_sig}({self._acn_weights[top_sig]:.3f}), "
-            f"bot={bot_sig}({self._acn_weights[bot_sig]:.3f})")
+            f"bot={bot_sig}({self._acn_weights[bot_sig]:.3f})", category="bot")
 
     # ── CTRE: Chronothermal Regression Engine ─────────────────────────────────
 
@@ -1997,7 +2074,7 @@ class BotEngine(threading.Thread):
             volatile = [h for h, s in stability.items() if s < 0.5]
             if volatile:
                 self._emit("info",
-                    f"CTRE: volatile hours (stability<0.5): {sorted(volatile)}")
+                    f"CTRE: volatile hours (stability<0.5): {sorted(volatile)}", category="bot")
         except Exception:
             pass
 
@@ -2156,7 +2233,7 @@ class BotEngine(threading.Thread):
                         self._dynamic_protected.add(name)
                         self._emit("info",
                             f"ASZM: {name} added to dynamic protection zone "
-                            f"(criticality={score:.2f})")
+                            f"(criticality={score:.2f})", category="bot")
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
 
@@ -2373,14 +2450,14 @@ class BotEngine(threading.Thread):
                     opset_imports=[onnx.helper.make_opsetid("", 13)])
                 onnx.save(model, str(CDA_MODEL_PATH))
                 self._emit("info",
-                    f"CDA: ONNX model saved ({n_samples} samples, acc={acc}%)")
+                    f"CDA: ONNX model saved ({n_samples} samples, acc={acc}%)", category="bot")
             except ImportError:
                 pass   # onnx not installed — weights-only inference is used
             except Exception as oe:
                 print(f"[CDA] ONNX export failed: {oe}", file=sys.stderr)
 
             self._emit("info",
-                f"CDA: model trained ({n_samples} samples, acc={acc}%)")
+                f"CDA: model trained ({n_samples} samples, acc={acc}%)", category="bot")
             self._cda_load_model()
         except Exception as e:
             print(f"[CDA] train failed: {e}", file=sys.stderr)
@@ -2437,7 +2514,7 @@ class BotEngine(threading.Thread):
                 if idx > 0:
                     self._emit("info",
                         f"CDA: root cause → {self.causal_diagnosis} "
-                        f"(conf={conf:.0%})")
+                        f"(conf={conf:.0%})", category="bot")
                 return
             except Exception:
                 pass   # fall through to rule-based
@@ -2466,7 +2543,7 @@ class BotEngine(threading.Thread):
                 if idx > 0:
                     self._emit("info",
                         f"CDA: root cause → {self.causal_diagnosis} "
-                        f"(conf={self._cda_confidence:.0%})")
+                        f"(conf={self._cda_confidence:.0%})", category="bot")
                 return
             except Exception:
                 pass
@@ -2750,6 +2827,10 @@ HTML = r"""<!DOCTYPE html>
   ::-webkit-scrollbar{width:3px;height:3px}
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+
+  /* ── Tab buttons ── */
+  .tab-btn{font-size:10px;padding:3px 10px;border-radius:4px 4px 0 0;border-bottom:none}
+  .tab-active{background:var(--bg);color:var(--text);border-color:var(--border)}
 </style>
 </head>
 <body>
@@ -2770,12 +2851,39 @@ HTML = r"""<!DOCTYPE html>
     <span id="memPressurePill" class="pill">🧠 Normal</span>
   </div>
   <div class="tb-btns">
+    <button class="btn" id="expertBtn" onclick="toggleExpert()" title="Toggle expert engine telemetry">Simple</button>
+    <button class="btn" id="logFilterBtn" onclick="toggleBotLogs()" title="Show/hide bot calibration logs">Bot Logs: Off</button>
     <button class="btn" id="pauseBtn" onclick="togglePause()">Pause</button>
     <button class="btn" onclick="clearFeed()">Clear Log</button>
   </div>
 </div>
 
+<!-- ═══ Tab bar ══════════════════════════════════════════════════════════ -->
+<div style="display:flex;align-items:center;gap:4px;padding:4px 14px 0;
+  background:var(--surface);border-bottom:1px solid var(--border)">
+  <button class="btn tab-btn tab-active" id="tabLive" onclick="showTab('live')">Live</button>
+  <button class="btn tab-btn" id="tabHistory" onclick="showTab('history')">7-Day History</button>
+  <span style="flex:1"></span>
+  <!-- Performance Score (24h) -->
+  <span id="scoreBanner" style="display:none;font-size:10px;color:var(--muted)">
+    Score: <span id="scoreNum" style="font-weight:700;font-size:13px">—</span>
+    <span style="font-size:9px">/100</span>
+    <span id="scoreSub" style="font-size:9px;margin-left:4px"></span>
+  </span>
+</div>
+
+<!-- ═══ History tab panel ═══════════════════════════════════════════════ -->
+<div id="panelHistory" style="display:none;padding:20px 16px;flex:1;overflow-y:auto">
+  <div style="font-size:12px;color:var(--text);font-weight:600;margin-bottom:10px">
+    7-Day Memory &amp; CPU Trend</div>
+  <div style="position:relative;height:180px;margin-bottom:16px">
+    <canvas id="histChart"></canvas>
+  </div>
+  <div id="histStats" style="font-size:10px;color:var(--muted);line-height:1.8"></div>
+</div>
+
 <!-- ═══ Metric strip ═════════════════════════════════════════════════════ -->
+<div id="panelLive" style="display:contents">
 <div class="metric-strip">
   <div class="metric">
     <svg class="metric-ring" width="42" height="42" viewBox="0 0 42 42">
@@ -2876,9 +2984,9 @@ HTML = r"""<!DOCTYPE html>
             <div class="bs-sub">detected</div>
           </div>
           <div class="bs-item">
-            <div class="bs-label">RAM Freed</div>
+            <div class="bs-label">Memory Paused</div>
             <div class="bs-val" id="bsFreed" style="color:var(--muted)">0</div>
-            <div class="bs-sub">MB cleared</div>
+            <div class="bs-sub">MB temp. paused</div>
           </div>
         </div>
         <div class="thr-names" id="thrNames"></div>
@@ -2910,6 +3018,18 @@ HTML = r"""<!DOCTYPE html>
           </div>
         </div>
       </div>
+
+      <!-- Root Cause Banner (shown when CDA detects non-normal state) -->
+      <div id="rootCauseBanner" style="display:none;margin:6px 4px;padding:7px 10px;
+        border-radius:6px;border:1px solid var(--border);font-size:10px;line-height:1.5">
+        <div style="font-weight:600;margin-bottom:2px" id="rootCauseTitle"></div>
+        <div style="color:var(--muted)" id="rootCauseAction"></div>
+      </div>
+
+      <!-- RAM Upgrade Recommendation (shown when 30-day avg RAM > 80%) -->
+      <div id="ramRecommendation" style="display:none;margin:4px 4px 2px;padding:6px 10px;
+        border-radius:6px;border:1px solid rgba(88,166,255,.3);
+        background:rgba(88,166,255,.06);font-size:10px;color:var(--blue)"></div>
 
       <!-- Breakdown bar -->
       <div class="bd-section">
@@ -3071,6 +3191,7 @@ HTML = r"""<!DOCTYPE html>
     </table>
   </div>
 </div><!-- /body-wrap -->
+</div><!-- /panelLive -->
 
 <!-- ── Footer ── -->
 <div class="footer">
@@ -3161,21 +3282,101 @@ function toggleTrend() {
 function barCell(pct,color){
   return `<td class="bar-cell"><div class="bar"><div class="bar-fill" style="width:${Math.min(pct,100).toFixed(1)}%;background:${color}"></div></div></td>`;
 }
+let _leakPidSet = new Set();
 function buildProcTable(procs, thrPids) {
   document.getElementById('procBody').innerHTML = procs.map(([cpu,mem,pid,name,status])=>{
     const thr=thrPids.includes(pid), hiCpu=!thr&&cpu>=70;
+    const isLeak=_leakPidSet.has(pid);
     const cls=thr?'thr':hiCpu?'hi':'';
     const cc=thr?'var(--orange)':hiCpu?'var(--yellow)':'var(--cpu)';
     const mc=mem>=10?'var(--red)':mem>=4?'var(--yellow)':'var(--mem)';
     const badge=thr?'<span class="thr-badge">THROTTLED</span>':'';
-    return `<tr class="${cls}"><td>${name}${badge}</td><td>${pid}</td><td>${cpu.toFixed(1)}%</td>${barCell(cpu,cc)}<td>${mem.toFixed(1)}%</td>${barCell(mem*8,mc)}<td>${status}</td></tr>`;
+    const leakBadge=isLeak?'<span class="thr-badge" style="background:rgba(248,81,73,.15);color:var(--red)">LEAK</span>':'';
+    const restartHint=isLeak&&mem>=4?
+      ' <span title="This process is growing — consider restarting it" style="cursor:help;color:var(--blue);font-size:9px">💡 Restart?</span>':'';
+    return `<tr class="${cls}"><td>${name}${badge}${leakBadge}</td><td>${pid}</td><td>${cpu.toFixed(1)}%</td>${barCell(cpu,cc)}<td>${mem.toFixed(1)}%</td>${barCell(mem*8,mc)}<td>${status}${restartHint}</td></tr>`;
   }).join('');
+}
+
+// ── Expert / Simple mode ───────────────────────────────────────────────────────
+const EXPERT_ROW_IDS = ['vsAcnWeights','vsSigConf','vsPsmNext','vsCtreZone',
+                        'vsEfficacy','vsAszm','vsFcModel','vsThermalCoupling',
+                        'vsCacheSize','vsBrlConf'];
+let expertMode = localStorage.getItem('expertMode') === 'true';
+function applyExpertMode() {
+  EXPERT_ROW_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { const row = el.closest ? el.closest('.vmrow') : null;
+              if (row) row.style.display = expertMode ? '' : 'none'; }
+  });
+  document.getElementById('expertBtn').textContent = expertMode ? 'Simple' : 'Expert';
+}
+function toggleExpert() { expertMode=!expertMode; localStorage.setItem('expertMode',expertMode); applyExpertMode(); }
+applyExpertMode();
+
+// ── Bot log filter ─────────────────────────────────────────────────────────────
+let showBotLogs = false;
+function toggleBotLogs() {
+  showBotLogs = !showBotLogs;
+  document.getElementById('logFilterBtn').textContent = 'Bot Logs: ' + (showBotLogs ? 'On' : 'Off');
+}
+
+// ── Tab switching ──────────────────────────────────────────────────────────────
+let histChart = null;
+function showTab(name) {
+  const live = name === 'live';
+  document.getElementById('panelLive').style.display    = live ? 'contents' : 'none';
+  document.getElementById('panelHistory').style.display = live ? 'none' : 'block';
+  document.getElementById('tabLive').classList.toggle('tab-active', live);
+  document.getElementById('tabHistory').classList.toggle('tab-active', !live);
+  if (!live) loadHistory();
+}
+async function loadHistory() {
+  try {
+    const data = await fetch('/history').then(r => r.json());
+    if (!data.length) { document.getElementById('histStats').textContent='Not enough data yet (need 1+ day of history).'; return; }
+    const labels = data.map(r => {
+      const d = new Date(r.hour * 1000);
+      return d.toLocaleDateString('en',{weekday:'short'})+' '+d.getHours()+'h';
+    });
+    const ctx = document.getElementById('histChart').getContext('2d');
+    if (histChart) histChart.destroy();
+    histChart = new Chart(ctx, {
+      type:'line',
+      data:{ labels, datasets:[
+        {label:'RAM %',  data:data.map(r=>r.mem),  borderColor:'#7ee787', backgroundColor:'rgba(126,231,135,.08)', tension:0.3, pointRadius:0, borderWidth:1.5, fill:true},
+        {label:'CPU %',  data:data.map(r=>r.cpu),  borderColor:'#ff7b54', backgroundColor:'rgba(255,123,84,.06)',  tension:0.3, pointRadius:0, borderWidth:1.5},
+        {label:'Swap %', data:data.map(r=>r.swap), borderColor:'#58a6ff', backgroundColor:'transparent',           tension:0.3, pointRadius:0, borderWidth:1, borderDash:[3,4]},
+      ]},
+      options:{
+        responsive:true, maintainAspectRatio:false, animation:false,
+        scales:{
+          x:{ticks:{color:'#656d76',maxTicksLimit:14,font:{size:8}},grid:{color:'#21262d'},border:{display:false}},
+          y:{min:0,max:100,ticks:{color:'#656d76',stepSize:25,callback:v=>v+'%',font:{size:9}},grid:{color:'#21262d'},border:{display:false}}
+        },
+        plugins:{legend:{labels:{color:'#8b949e',font:{size:9}}},tooltip:{enabled:true}}
+      }
+    });
+    const avgMem = (data.reduce((s,r)=>s+r.mem,0)/data.length).toFixed(1);
+    const avgCpu = (data.reduce((s,r)=>s+r.cpu,0)/data.length).toFixed(1);
+    const peakMem = Math.max(...data.map(r=>r.mem)).toFixed(1);
+    document.getElementById('histStats').innerHTML =
+      `7-day avg RAM: <b style="color:#7ee787">${avgMem}%</b> &nbsp;·&nbsp; `+
+      `7-day avg CPU: <b style="color:#ff7b54">${avgCpu}%</b> &nbsp;·&nbsp; `+
+      `Peak RAM: <b style="color:${peakMem>85?'var(--red)':peakMem>70?'var(--yellow)':'#7ee787'}">${peakMem}%</b> &nbsp;·&nbsp; `+
+      `${data.length} hourly samples`;
+  } catch(e) { document.getElementById('histStats').textContent='History unavailable.'; }
 }
 
 // ── Activity feed ──────────────────────────────────────────────────────────────
 const BADGE={fix:'✓ FIX',warn:'⚠ WARN',issue:'✗ ISS',info:'ℹ INFO'};
+// Bot-telemetry keywords — events containing these are category='bot'
+const BOT_KW=['ATCE','RWA','ACN','BRL','CTRE','SIE','MEG','PSM','ASZM','CDA:','calibrated','Markov','Bayesian','residual','quorum weight'];
 function addEvent(ev) {
   const key=ev.ts+ev.msg; if(seenEvs.has(key))return; seenEvs.add(key); evCnt++;
+  // Treat as bot log if server tagged it or if message matches bot keywords
+  const isBot = ev.category==='bot' || BOT_KW.some(k=>ev.msg.includes(k));
+  if (isBot && !showBotLogs) return;
   document.getElementById('evCount').textContent = evCnt;
   const div=document.createElement('div'); div.className='ev '+ev.kind;
   div.innerHTML=`<span class="ev-ts">${ev.ts}</span><span class="ev-badge">${BADGE[ev.kind]||'?'}</span><span class="ev-msg">${ev.msg}</span>`;
@@ -3253,7 +3454,7 @@ async function poll() {
       const act=d.actions||0, iss=d.issues||0, freed=d.freed_mb||0;
       set('mAct', String(act), act>0?'var(--green)':'var(--muted)');
       set('mIss', String(iss), iss>0?'var(--red)':'var(--muted)');
-      document.getElementById('mIssSub').textContent = freed>=1024?(freed/1024).toFixed(1)+' GB freed':freed.toFixed(0)+' MB freed';
+      document.getElementById('mIssSub').textContent = freed>=1024?(freed/1024).toFixed(1)+' GB paused':freed.toFixed(0)+' MB paused';
 
       // memory hero arc
       setMemArc(mem, memC);
@@ -3310,11 +3511,12 @@ async function poll() {
       set('vsUptime', fmtUp(d.uptime_s||0));
 
       // Predictive Remediation Engine rows
-      const tierLabels = ['—','Tier 1 · Observe','Tier 2 · Advisory','Tier 3 · Freeze','Tier 4 · Terminate'];
-      const tierColors = ['var(--muted)','var(--blue)','var(--yellow)','var(--orange)','var(--red)'];
+      const tierLabels = ['All Good','Watching','Intervening','Rescue Mode','Emergency'];
+      const tierColors = ['var(--green)','var(--blue)','var(--yellow)','var(--orange)','var(--red)'];
       const etier = d.effective_tier||0;
       const tierEl = document.getElementById('vsActiveTier');
       tierEl.textContent = tierLabels[etier] || ('Tier '+etier);
+      tierEl.title = 'Internal tier: ' + etier;
       tierEl.style.color = tierColors[etier] || 'var(--muted)';
 
       const lockEl = document.getElementById('vsCpuLock');
@@ -3368,12 +3570,51 @@ async function poll() {
       const cMb = d.cache_db_mb||0, cRows = d.cache_rows||0;
       cacheEl.textContent = cMb>0 ? cMb.toFixed(1)+' MB · '+(cRows/1000).toFixed(0)+'k rows' : 'Collecting…';
 
+      // Performance Score
+      const ps = d.performance_score;
+      const scoreBanner = document.getElementById('scoreBanner');
+      if (ps != null && ps >= 0) {
+        scoreBanner.style.display = 'inline-flex'; scoreBanner.style.alignItems = 'baseline'; scoreBanner.style.gap = '3px';
+        const scoreCol = ps>=80?'var(--green)':ps>=60?'var(--yellow)':'var(--red)';
+        set('scoreNum', String(ps), scoreCol);
+        document.getElementById('scoreSub').textContent = ps>=80?'· Great':ps>=60?'· Fair':'· Needs attention';
+      }
+
+      // RAM upgrade recommendation
+      const ltMem = d.longterm_avg_mem||0;
+      const ramRec = document.getElementById('ramRecommendation');
+      if (ltMem > 80) {
+        ramRec.style.display = 'block';
+        ramRec.textContent = '💡 Your 30-day average RAM is '+ltMem.toFixed(0)+'%. Your Mac is consistently under pressure — adding RAM would make a noticeable difference.';
+      } else { ramRec.style.display = 'none'; }
+
+      // Pass leak PIDs for process table highlighting
+      if (d.leak_pids_list) _leakPidSet = new Set(d.leak_pids_list.map(Number));
+
       // v2.0 rows
-      // Root Cause (CDA)
+      // Root Cause (CDA) — banner + vmrow
       const rcEl = document.getElementById('vsRootCause');
       const rc = d.causal_diagnosis||'normal';
-      const rcColor = {normal:'var(--green)',leak:'var(--yellow)',compressor_collapse:'var(--orange)',cpu_collision:'var(--red)'};
-      rcEl.textContent = rc; rcEl.style.color = rcColor[rc]||'var(--muted)';
+      const rcColor = {normal:'var(--green)',leak:'var(--red)',compressor_collapse:'var(--orange)',cpu_collision:'var(--yellow)'};
+      rcEl.textContent = rc.replace('_',' '); rcEl.style.color = rcColor[rc]||'var(--muted)';
+
+      // Root Cause Banner (prominent, plain English)
+      const rcBanner = document.getElementById('rootCauseBanner');
+      const rcMap = {
+        leak:                ['⚠ Memory Leak Detected','var(--red)',
+                              'A process is growing without releasing memory. Check the process table — consider restarting the flagged app.'],
+        compressor_collapse: ['⚠ Memory Compressor Overloaded','var(--orange)',
+                              'Your Mac is running out of room to compress inactive memory. Closing unused apps will help.'],
+        cpu_collision:       ['⚠ CPU & Memory Pressure Competing','var(--yellow)',
+                              'High CPU is competing with memory needs. The bot is throttling the top offender.'],
+      };
+      if (rcMap[rc]) {
+        const [title,color,action]=rcMap[rc];
+        document.getElementById('rootCauseTitle').textContent=title;
+        document.getElementById('rootCauseTitle').style.color=color;
+        document.getElementById('rootCauseAction').textContent=action;
+        rcBanner.style.borderColor=color; rcBanner.style.display='block';
+      } else { rcBanner.style.display='none'; }
 
       // BRL Confidence
       const brlEl = document.getElementById('vsBrlConf');
@@ -3548,6 +3789,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/stats":
             snap = _engine.snapshot()   # disk_pct + disk_free_gb already in snapshot
             self._send(200, "application/json", json.dumps(snap).encode())
+        elif path == "/history":
+            rows = _engine._cache.hourly_history(days=7)
+            self._send(200, "application/json", json.dumps(rows).encode())
         elif path == "/pause":
             if "state=1" in q:
                 _engine.pause()
@@ -3566,11 +3810,57 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+# ─── macOS menu bar (optional — requires `pip install rumps`) ─────────────────
+def _start_menubar(engine: "BotEngine") -> None:
+    """Show current tier + RAM % in the macOS menu bar via rumps."""
+    try:
+        import rumps  # type: ignore
+    except ImportError:
+        return   # rumps not installed — menu bar is optional
+
+    TIER_ICON = {0: "🟢", 1: "🔵", 2: "🟡", 3: "🟠", 4: "🔴"}
+    TIER_NAME = {0: "All Good", 1: "Watching", 2: "Intervening",
+                 3: "Rescue Mode", 4: "Emergency"}
+
+    app = rumps.App("PerfBot", title="🟢 —%", quit_button=None)
+
+    @rumps.timer(3)
+    def _tick(sender):                       # noqa: ARG001
+        tier = getattr(engine, "effective_tier", 0)
+        mem  = list(engine.mem_hist)[-1] if engine.mem_hist else 0.0
+        ps   = getattr(engine, "performance_score", -1)
+        icon = TIER_ICON.get(tier, "🟢")
+        app.title = f"{icon} {mem:.0f}%"
+        score_str = f"Score: {ps}/100" if ps >= 0 else "Score: warming up…"
+        app.menu["Status"].title    = f"{TIER_NAME.get(tier, 'Unknown')}  —  {score_str}"
+        app.menu["RAM"].title       = f"RAM: {mem:.0f}%"
+        app.menu["Actions"].title   = f"Bot actions: {engine.actions}"
+
+    status_item  = rumps.MenuItem("Status", callback=None)
+    ram_item     = rumps.MenuItem("RAM",    callback=None)
+    actions_item = rumps.MenuItem("Actions",callback=None)
+    dash_item    = rumps.MenuItem(
+        "Open Dashboard",
+        callback=lambda _: __import__("webbrowser").open(f"http://{HOST}:{PORT}")
+    )
+    quit_item = rumps.MenuItem(
+        "Quit Performance Bot",
+        callback=lambda _: (engine.__setattr__("running", False),
+                            rumps.quit_application())
+    )
+    app.menu = [status_item, ram_item, actions_item, None, dash_item, None, quit_item]
+    app.run()
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 def main():
     global _engine
     _engine = BotEngine()
     _engine.start()
+
+    # Optional: macOS menu bar icon (non-blocking daemon thread)
+    mb_thread = threading.Thread(target=_start_menubar, args=(_engine,), daemon=True)
+    mb_thread.start()
 
     server = HTTPServer((HOST, PORT), Handler)
     url    = f"http://{HOST}:{PORT}"
