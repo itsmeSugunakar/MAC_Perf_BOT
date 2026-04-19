@@ -4,7 +4,7 @@
 Five-Layer Cognitive Engine Architecture on Consumer macOS Systems
 
 **Author:** itsmeSugunakar · sugun.sr@gmail.com
-**Version:** 2.0.0 · **Date:** 2026-04-12
+**Version:** 2.1.0 · **Date:** 2026-04-18
 **Repository:** https://github.com/itsmeSugunakar/MAC_Perf_BOT
 
 ---
@@ -848,10 +848,12 @@ been closed in `docs/provisional-patent-application.md`:
 
 ---
 
-## Appendix C — API Schema (v2.0 /stats endpoint)
+## Appendix C — API Schema (v2.1 /stats and /history endpoints)
 
-The system exposes a JSON API at `http://127.0.0.1:8765/stats` polling at 1 Hz
-with 45 fields covering all engine outputs. Key v2.0 fields added over v1.5:
+The system exposes two JSON APIs:
+
+**`GET /stats`** — polled at 1 Hz; 48 fields covering all engine outputs.
+Key v2.0 fields added over v1.5:
 
 | Field | Type | Engine |
 |-------|------|--------|
@@ -866,10 +868,48 @@ with 45 fields covering all engine outputs. Key v2.0 fields added over v1.5:
 | `causal_diagnosis` | `string` | CDA |
 | `dynamic_protected` | `int` | ASZM |
 
+New v2.1 product metric fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `performance_score` | `int` | 0–100 daily score; -1 = warming up. Formula: 100 − (0.5×avg_mem + 0.3×avg_cpu + 0.2×avg_swap) over 24 h |
+| `longterm_avg_mem` | `float` | 30-day average RAM %; drives hardware upgrade recommendation when > 80% |
+| `leak_pids_list` | `list[int]` | PIDs currently flagged as memory leaks; used to highlight process table rows |
+
+**`GET /history`** — on demand (triggered by History tab); returns 7-day hourly aggregates:
+
+```json
+[{"hour": 1776564000, "mem": 80.2, "cpu": 44.2, "swap": 67.8}, ...]
+```
+
+`hour` is a Unix epoch timestamp (floor to nearest 3600 s). Rendered as a
+Chart.js multi-line chart (RAM/CPU/Swap) in the 7-Day History tab.
+
+---
+
+## Appendix D — v2.1 User-Facing Product Changes
+
+v2.1 (2026-04-18) adds a product layer on top of the existing engine stack,
+answering the three questions every user implicitly asks:
+
+| Question | v2.1 Feature |
+|----------|-------------|
+| How is my Mac right now? | Performance Score (0–100) in the tab bar; tier labels in plain English (All Good / Watching / Intervening / Rescue Mode / Emergency) |
+| What did the bot do? | Activity Log with Bot Logs toggle (calibration events hidden by default); Memory Paused counter (accurate: SIGSTOP ≠ freed) |
+| What should I do next? | Root Cause Banner (plain-English, prominent); 💡 Restart? hint on leak-flagged processes; RAM upgrade recommendation when 30d avg > 80% |
+
+Additional v2.1 changes:
+
+- **7-Day History tab** — Chart.js trend chart from SQLite hourly aggregates; `/history` endpoint
+- **Simple/Expert mode** — 10 engine telemetry rows hidden by default; toggle persisted in `localStorage`
+- **macOS Menu Bar** — tier icon + RAM % via `rumps` (optional, `pip install rumps`)
+- **LaunchAgent path** — updated to `~/Documents/performance-bot/app/performance_gui.py`
+
 ---
 
 _This white paper documents the technical design and runtime behaviour of
-MAC Performance Bot v2.0.0. All statistics are from a live deployment session
-(2026-04-12, 22.8-hour uptime) on a 17.2 GB Apple Silicon Mac running macOS._
+MAC Performance Bot v2.1.0. Runtime statistics in §3–§7 are from a live
+deployment session (2026-04-12, 22.8-hour uptime) on a 17.2 GB Apple Silicon
+Mac running macOS. v2.1 product changes documented in Appendix D._
 
 _© 2026 itsmeSugunakar. All rights reserved._

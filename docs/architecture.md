@@ -144,6 +144,14 @@ BotEngine (background thread, 1 Hz)
       │   ├── _criticality_scores{}             ← ASZM: process name → criticality float
       │   └── causal_diagnosis                  ← CDA: "normal"|"leak"|"compressor_collapse"|"cpu_collision"
       │
+      ├── v2.1 Product metrics
+      │   ├── performance_score (int)            ← 0–100 daily score; -1 = warming up (<10 min data)
+      │   │                                         formula: 100 − (0.5×avg_mem + 0.3×avg_cpu + 0.2×avg_swap)
+      │   │                                         refreshed every 5 min from MetricsCache
+      │   ├── longterm_avg_mem (float)           ← 30-day average RAM %; drives upgrade recommendation
+      │   └── _leak_pids (set[int])              ← PIDs currently flagged as memory leaks;
+      │                                             kept in sync with _warned_leaks by _track_memory_leaks()
+      │
       └── MetricsCache (disk)
           └── ~/Library/Application Support/performance-bot/metrics.db
               ← 90-day SQLite store, flushed every 60 s
@@ -151,35 +159,53 @@ BotEngine (background thread, 1 Hz)
                │
                ├── app_mem_trend()              → week-over-week RAM trends
                ├── chronic_pressure_pct()       → % time above MEM_WARN
+               ├── daily_performance_score()    → 0–100 score from last 24 h  [v2.1]
+               ├── longterm_avg_mem(30d)        → 30-day avg RAM %             [v2.1]
+               ├── hourly_history(7d)           → [{hour, mem, cpu, swap}] for /history [v2.1]
                ├── _analyse_app_predictions()   → risk ratings per app
                ├── _calibrate_thresholds()      → ATCE percentile query (30d)
                ├── _build_circadian_profile()   → CMPE GROUP BY hour (all rows)
                └── _compute_thermal_coupling()  → TMCP regression (throttled rows)
                     │
-               snapshot() also exposes: frozen_count (int), leak_pids (int)
+               snapshot() also exposes: frozen_count (int), leak_pids (int),
+                    performance_score (int), longterm_avg_mem (float), leak_pids_list (list[int])
                     ▼ snapshot() called by HTTP handler
       HTTP Handler (main thread)
             │
-            ├── GET /             → HTML page (embedded, ~30 KB)
-            ├── GET /stats        → JSON snapshot (< 10 KB)
+            ├── GET /             → HTML page (embedded, ~35 KB)
+            ├── GET /stats        → JSON snapshot (< 12 KB)
+            ├── GET /history      → 7-day hourly JSON [{hour,mem,cpu,swap}]  [v2.1]
             ├── GET /manifest.json → PWA manifest
             ├── GET /icon.svg     → PWA icon
             └── GET /pause?state= → toggle engine.running
                   │
                   ▼  polling every 1 s via setInterval
       Browser (Chart.js PWA)
+            ├── Tab bar           — Live | 7-Day History tabs              [v2.1]
+            ├── Performance Score — 0–100 headline metric in tab bar         [v2.1]
             ├── Metric strip      — ring gauges: CPU / MEM / Swap / Disk
+            ├── Root Cause Banner — prominent plain-English alert when non-normal [v2.1]
+            ├── RAM Recommendation — "add RAM" advisory when 30d avg > 80%   [v2.1]
             ├── Memory Intelligence panel — arc gauge, vm_stat breakdown,
-            │   Active Tier row, predictive escalation banner, CPU-RAM Lock,
-            │   XPC Blocked, Cache (90d) size, Forecast Model, CPI,
-            │   Swap Velocity, Thermal Coupling, App Predictions panel,
-            │   Root Cause (CDA), BRL Confidence, ACN Weights sparkbar,
-            │   Signal Integrity traffic-light, PSM Next Tier,
-            │   CTRE Zone stability, Action Efficacy, ASZM Protected+
+            │   Active Tier (user language: All Good/Watching/Intervening/Rescue Mode/Emergency),
+            │   predictive escalation banner, CPU-RAM Lock, XPC Blocked,
+            │   Forecast Model, CPI, Swap Velocity, Thermal Coupling,
+            │   App Predictions panel, Root Cause (CDA), BRL Confidence,
+            │   ACN Weights sparkbar, Signal Integrity traffic-light,
+            │   PSM Next Tier, CTRE Zone stability, Action Efficacy, ASZM Protected+
+            │   (expert rows hidden by default; Simple/Expert toggle in titlebar)
+            ├── 7-Day History tab — Chart.js multi-line RAM/CPU/Swap trend    [v2.1]
             ├── CPU / Swap sparklines (90 s canvas charts)
-            ├── Bot Status cards  — Throttled / Actions / Issues / RAM Freed
+            ├── Bot Status cards  — Throttled / Actions / Issues / Memory Paused [v2.1]
             ├── Activity log      — FIX / WARN / ISSUE / INFO events
-            └── Process table     — top-12 with CPU/MEM bars + memory trend
+            │   (Bot Logs toggle hides engine calibration events by default)   [v2.1]
+            └── Process table     — top-12 with CPU/MEM bars, LEAK badge,
+                  💡 Restart? hint for leak-flagged processes, memory trend    [v2.1]
+
+      macOS Menu Bar (optional — requires `pip install rumps`)               [v2.1]
+            ├── Shows current tier icon (🟢🔵🟡🟠🔴) + RAM % in menu bar
+            ├── Submenu: Status / RAM / Bot actions / Open Dashboard / Quit
+            └── Updates every 3 s from engine state; daemon thread, no blocking
 ```
 
 ---
@@ -190,6 +216,7 @@ BotEngine (background thread, 1 Hz)
 Main thread      → HTTPServer.serve_forever()
 bot-engine       → BotEngine.run()  (daemon=True)
 timer thread     → webbrowser.open() after 0.8 s  (one-shot)
+menubar thread   → _start_menubar() via rumps  (daemon=True, optional)  [v2.1]
 ```
 
 All shared state is protected by `BotEngine._lock` (threading.Lock).
@@ -254,6 +281,7 @@ Every 60 s  → _track_memory_leaks()
 Every 60 s  → _check_circadian_pressure()   [CMPE: hour-of-day profile refresh + pre-freeze]
 
 Every 300 s → _check_caches()        ~/Library/Caches du scan
+Every 300 s → performance_score refresh  [v2.1: daily_performance_score() + longterm_avg_mem()]
 Every 3600 s→ _analyse_app_predictions()    guarded by 86400 s internal cooldown
 Every 3600 s→ _calibrate_thresholds()       [ATCE: recalibrate Tier 2/3/4 from 30-day cache]
 Every 3600 s→ _compute_thermal_coupling()   [TMCP: update EMA coefficient from throttled rows]
@@ -457,6 +485,9 @@ Additional v2.0 tables:
 Analysis methods (all run aggregate SQL — zero raw rows loaded into Python):
   app_mem_trend(app, 30d)        → {avg_mem_pct, week1_avg, week2_avg, trend}
   chronic_pressure_pct(7d)       → float: % of time RAM above MEM_WARN
+  daily_performance_score(24h)   → int 0–100; -1 if < 60 rows  [v2.1]
+  longterm_avg_mem(30d)          → float avg RAM %; 0.0 if < 100 rows  [v2.1]
+  hourly_history(7d)             → [{hour, mem, cpu, swap}] for /history  [v2.1]
   record_outcome(...)            → RAC outcome INSERT
   query_signal_accuracy(sig, 24h)→ float success rate for RWA
   query_tier_distribution(30d)   → {tier: count} for BRL
