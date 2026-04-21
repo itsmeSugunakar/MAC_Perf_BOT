@@ -413,6 +413,11 @@ CPI_TIER2            = 0.50   # CPI ≥ this → compression headroom degrading
 CPI_TIER3            = 0.75   # CPI ≥ this → compressor near exhaustion
 CEO_MIN_COMPRESSED   = 200    # MB; below this CEO signal is noise-floored
 
+# ─── Stale-App Closer ────────────────────────────────────────────────────────
+APP_IDLE_CLOSE_S  = 14400   # 4 h of no CPU activity → eligible for closure
+APP_IDLE_MIN_MB   = 50      # minimum RSS (MB) before stale-app closure applies
+APP_IDLE_CHECK_S  = 600     # run stale-app sweep every 10 minutes
+
 # ─── MSCEE — Multi-Signal Consensus Escalation Engine ─────────────────────────
 MSCEE_QUORUM         = 0.55   # weighted vote share required to adopt a tier
 
@@ -562,6 +567,8 @@ class BotEngine(threading.Thread):
         self._last_tmcp: float = 0.0
         # ── RVMS: RSS Velocity Momentum Scorer ────────────────────────────────
         self._rss_velocity: dict = {}         # pid → (ts, rss_mb)
+        # ── Stale-App Closer ──────────────────────────────────────────────────
+        self._app_last_active: dict = {}      # pid → timestamp of last CPU activity
         # ── Swap velocity ─────────────────────────────────────────────────────
         self._swap_velocity: float = 0.0
         self._last_swap_used: float = 0.0
@@ -705,6 +712,7 @@ class BotEngine(threading.Thread):
                     if tick % 60 == 0: self._check_zombies()
                     if tick % 60 == 0: self._track_memory_leaks()
                     if tick % IDLE_SWEEP_S == 0: self._sweep_idle_services()
+                    if tick % APP_IDLE_CHECK_S == 0 and tick > 0: self._close_stale_apps()
                     if tick % 60  == 0: self._check_circadian_pressure()
                     if tick % 300 == 0 and tick > 0: self._check_caches()
                     if tick % CACHE_WRITE_S == 0:
@@ -755,6 +763,7 @@ class BotEngine(threading.Thread):
 
         rows        = []
         to_throttle = []   # (Process, name, pid, cpu_pct) — applied after loop
+        _now_active = time.time()
 
         with self._lock:
             ram_lock   = self._ram_pressure_lock
@@ -770,6 +779,12 @@ class BotEngine(threading.Thread):
                 c     = (info["cpu_percent"] or 0.0) / ncpu
                 mem_p = info["memory_percent"] or 0.0
                 stat  = info["status"]
+
+                # Stale-app tracker: record last time this PID had CPU activity
+                if c > 0.1:
+                    self._app_last_active[pid] = _now_active
+                elif pid not in self._app_last_active:
+                    self._app_last_active[pid] = _now_active  # first seen → grace period
 
                 rows.append((c, mem_p, pid, name, stat))
 
@@ -1112,6 +1127,71 @@ class BotEngine(threading.Thread):
             self._emit("fix",
                 f"Idle sweep: {len(swept)} services cleared, "
                 f"~{total:.0f} MB paused (session total: {self.freed_mb:.0f} MB)")
+
+    # ── Stale-App Closer ──────────────────────────────────────────────────────
+
+    def _close_stale_apps(self):
+        """
+        Close user-owned applications that have had zero CPU activity for
+        APP_IDLE_CLOSE_S seconds (default 4 hours).  Only targets processes
+        with RSS ≥ APP_IDLE_MIN_MB; respects PROTECTED, NEVER_TERMINATE, and
+        the XPC respawn blocklist.  Runs every APP_IDLE_CHECK_S (10 min).
+        """
+        now    = time.time()
+        closed = []
+
+        for p in psutil.process_iter(["pid", "name", "status",
+                                       "memory_info", "username"]):
+            try:
+                if p.info["username"] == "root":
+                    continue
+                name = p.name()
+                if name in PROTECTED or name in NEVER_TERMINATE:
+                    continue
+                if "Python" in name or "python" in name:
+                    continue
+                if p.pid in self._terminated:
+                    continue
+                if name in self._no_kill:
+                    continue
+
+                rss = (p.info.get("memory_info") or p.memory_info()).rss / 1e6
+                if rss < APP_IDLE_MIN_MB:
+                    continue
+
+                last_active = self._app_last_active.get(p.pid, now)
+                idle_s = now - last_active
+                if idle_s < APP_IDLE_CLOSE_S:
+                    continue
+
+                idle_h = idle_s / 3600
+                p.terminate()
+                self._terminated.add(p.pid)
+                self._terminated_ts[name] = now
+                self.freed_mb += rss
+                self.actions  += 1
+                closed.append((name, p.pid, rss, idle_h))
+                self._emit("fix",
+                    f"Closed stale app: {name} (PID {p.pid}) "
+                    f"— idle {idle_h:.1f}h, freed {rss:.0f} MB")
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        # Purge dead PIDs from the tracking dict
+        try:
+            live = {p.pid for p in psutil.process_iter(["pid"])}
+            for pid in list(self._app_last_active):
+                if pid not in live:
+                    self._app_last_active.pop(pid, None)
+        except Exception:
+            pass
+
+        if closed:
+            total = sum(r for _, _, r, _ in closed)
+            self._emit("fix",
+                f"Stale-app sweep: {len(closed)} app(s) closed after ≥4 h idle"
+                f" — ~{total:.0f} MB freed")
 
     # ── Predictive Remediation Engine ─────────────────────────────────────────
 
