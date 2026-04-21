@@ -556,6 +556,7 @@ class BotEngine(threading.Thread):
         self._last_circadian: float = 0.0
         # ── CEO: Compression Efficiency Oracle ────────────────────────────────
         self._compression_pressure: float = 0.0
+        self._ceo_warn_ts: float = 0.0   # last time a CEO warn was emitted
         # ── TMCP: Thermal-Memory Coupling Predictor ───────────────────────────
         self._thermal_coupling: float = 0.0
         self._last_tmcp: float = 0.0
@@ -988,7 +989,7 @@ class BotEngine(threading.Thread):
                 hist.append((now, rss))
                 if len(hist) > 5:
                     hist.pop(0)
-                if len(hist) >= 3 and pid not in self._warned_leaks:
+                if len(hist) >= 3 and pid not in self._warned_leaks and pid >= 2000:
                     elapsed = hist[-1][0] - hist[0][0]
                     growth  = hist[-1][1] - hist[0][1]
                     if elapsed > 0:
@@ -1575,14 +1576,19 @@ class BotEngine(threading.Thread):
             vm = psutil.virtual_memory()
             self._emit("issue",
                 f"Kernel memory pressure: CRITICAL — system at {vm.percent:.0f}% RAM")
+        _ceo_cool = 300  # emit CEO warn at most once per 5 minutes
         if cpi >= CPI_TIER3:
-            self._emit("warn",
-                f"CEO: Compression near exhaustion (CPI={cpi:.2f}) — "
-                f"purgeable headroom depleted, swap imminent")
+            if now - self._ceo_warn_ts >= _ceo_cool:
+                self._ceo_warn_ts = now
+                self._emit("warn",
+                    f"CEO: Compression near exhaustion (CPI={cpi:.2f}) — "
+                    f"purgeable headroom depleted, swap imminent")
         elif cpi >= CPI_TIER2:
-            self._emit("issue",
-                f"CEO: Compression efficiency degrading (CPI={cpi:.2f}) — "
-                f"purgeable headroom running low")
+            if now - self._ceo_warn_ts >= _ceo_cool:
+                self._ceo_warn_ts = now
+                self._emit("issue",
+                    f"CEO: Compression efficiency degrading (CPI={cpi:.2f}) — "
+                    f"purgeable headroom running low")
         # Ancestry is expensive; refresh at most every MEM_ANCESTRY_COOL_S
         now = time.time()
         if now - self._last_ancestry >= MEM_ANCESTRY_COOL_S:
@@ -1832,7 +1838,7 @@ class BotEngine(threading.Thread):
             def pct(p):
                 return vals[max(0, min(int(p / 100 * n), n - 1))]
             p75, p85, p93 = pct(ATCE_PERCENTILE), pct(85), pct(93)
-            if 60 <= p75 <= 92 and p75 < p85 < p93:
+            if 60 <= p75 <= 92 and p75 < p85 < p93 and (p93 - p75) >= 5.0:
                 with self._lock:
                     self._cal_thresholds = {
                         "tier2": round(p75, 1),
