@@ -351,14 +351,15 @@ class MetricsCache:
                 "ram_saved_mb":          round(saved_mb, 0),
                 "pct_below_87":          pct_below,
                 "alltime_interventions":  all_total,
+                "alltime_successes":      all_succ,
                 "alltime_success_rate":   round(all_succ / all_total, 2) if all_total else 0.0,
                 "alltime_ram_saved_gb":   round(all_saved / 1024, 1),
                 "alltime_best_save_mb":   round((best_save[0] or 0), 0),
             }
         except Exception:
             return {"total": 0, "succeeded": 0, "success_rate": 0.0, "ram_saved_mb": 0.0,
-                    "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_success_rate": 0.0,
-                    "alltime_ram_saved_gb": 0.0, "alltime_best_save_mb": 0.0}
+                    "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_successes": 0,
+                    "alltime_success_rate": 0.0, "alltime_ram_saved_gb": 0.0, "alltime_best_save_mb": 0.0}
 
     def query_signal_accuracy(self, signal: str, hours: int = 24) -> float:
         """
@@ -689,6 +690,39 @@ class BotEngine(threading.Thread):
 
     def resume(self):
         self._paused = False
+
+    def freeze_pid(self, pid: int) -> bool:
+        import signal as _sig
+        try:
+            p = psutil.Process(pid)
+            if p.name() in self._dynamic_protected:
+                return False
+            os.kill(pid, _sig.SIGSTOP)
+            with self._lock:
+                self._frozen_pids[pid] = p.name()
+            return True
+        except Exception:
+            return False
+
+    def thaw_pid(self, pid: int) -> bool:
+        import signal as _sig
+        try:
+            os.kill(pid, _sig.SIGCONT)
+            with self._lock:
+                self._frozen_pids.pop(pid, None)
+            return True
+        except Exception:
+            return False
+
+    def kill_pid(self, pid: int) -> bool:
+        try:
+            p = psutil.Process(pid)
+            if p.name() in self._dynamic_protected:
+                return False
+            p.terminate()
+            return True
+        except Exception:
+            return False
 
     def snapshot(self):
         with self._lock:
@@ -2788,14 +2822,15 @@ HTML = r"""<!DOCTYPE html>
 
   /* ── Metric strip ── */
   .metric-strip{
-    display:grid;grid-template-columns:repeat(6,1fr);
+    display:flex;align-items:stretch;
     gap:1px;background:var(--border);
-    border-bottom:1px solid var(--border);flex-shrink:0;
+    border-bottom:1px solid var(--border);flex-shrink:0;overflow:hidden;
   }
   .metric{
     background:var(--surface);padding:8px 12px;
     display:flex;align-items:center;gap:9px;
     cursor:default;transition:background .15s;
+    flex:1;min-width:110px;
   }
   .metric:hover{background:var(--surface2)}
   .metric-ring{flex-shrink:0}
@@ -2989,25 +3024,137 @@ HTML = r"""<!DOCTYPE html>
 
   /* ── Achievement banner ── */
   .achieve-strip{
-    display:flex;align-items:stretch;
-    background:linear-gradient(135deg,rgba(46,160,67,.10) 0%,rgba(88,166,255,.07) 100%);
-    border:1px solid rgba(46,160,67,.25);
-    border-radius:6px;margin:0 6px;padding:0 4px;
-    flex-shrink:0;min-width:0;
+    display:flex;align-items:stretch;flex:2;min-width:260px;
+    background:linear-gradient(135deg,rgba(46,160,67,.07) 0%,rgba(88,166,255,.05) 100%);
+    position:relative;overflow:hidden;
+  }
+  .achieve-strip::before{
+    content:'BOT IMPACT';position:absolute;top:5px;left:10px;
+    font-size:8px;font-weight:700;letter-spacing:.6px;color:rgba(126,231,135,.4);
+    pointer-events:none;
   }
   .achieve-item{
     display:flex;flex-direction:column;align-items:center;justify-content:center;
-    padding:4px 10px;min-width:72px;
+    flex:1;padding:6px 8px;cursor:default;transition:background .15s;
   }
-  .achieve-icon{font-size:13px;line-height:1;margin-bottom:1px}
+  .achieve-item:hover{background:rgba(255,255,255,.03)}
+  .achieve-icon{font-size:12px;line-height:1;margin-bottom:2px}
   .achieve-val{
-    font-size:15px;font-weight:800;
+    font-size:16px;font-weight:800;line-height:1.1;
     background:linear-gradient(135deg,#7ee787,#58a6ff);
     -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-    line-height:1.1;
   }
-  .achieve-label{font-size:8px;color:var(--muted);text-align:center;margin-top:1px;white-space:nowrap}
-  .achieve-sep{width:1px;background:rgba(46,160,67,.2);margin:6px 0;flex-shrink:0}
+  .achieve-val.zero{
+    -webkit-text-fill-color:var(--muted2);background:none;font-weight:500;font-size:13px;
+  }
+  .achieve-label{font-size:8px;color:var(--muted);text-align:center;margin-top:1px;white-space:nowrap;letter-spacing:.2px}
+  .achieve-sub{font-size:8px;color:rgba(126,231,135,.5);text-align:center;margin-top:1px;white-space:nowrap}
+  .achieve-sep{width:1px;background:rgba(46,160,67,.15);margin:8px 0;flex-shrink:0}
+
+  /* ── Tier badge (titlebar) ── */
+  .tier-badge{
+    display:inline-flex;align-items:center;gap:5px;border-radius:20px;
+    padding:3px 11px;font-size:10px;font-weight:700;letter-spacing:.3px;
+    border:1px solid transparent;transition:all .4s;flex-shrink:0;
+  }
+  .tier-badge.t0{background:rgba(63,185,80,.08);border-color:rgba(63,185,80,.25);color:var(--green)}
+  .tier-badge.t1{background:rgba(88,166,255,.08);border-color:rgba(88,166,255,.25);color:var(--blue)}
+  .tier-badge.t2{background:rgba(210,153,34,.10);border-color:rgba(210,153,34,.32);color:var(--yellow)}
+  .tier-badge.t3{background:rgba(227,179,65,.12);border-color:rgba(227,179,65,.38);color:var(--orange);animation:pulse 1.8s infinite}
+  .tier-badge.t4{background:rgba(248,81,73,.14);border-color:rgba(248,81,73,.45);color:var(--red);animation:pulse .75s infinite}
+  .tier-dot{width:5px;height:5px;border-radius:50%;background:currentColor;flex-shrink:0}
+
+  /* ── Flash animation for changing values ── */
+  @keyframes flash-g{0%,100%{background:transparent}50%{background:rgba(63,185,80,.20)}}
+  @keyframes flash-r{0%,100%{background:transparent}50%{background:rgba(248,81,73,.20)}}
+  @keyframes flash-y{0%,100%{background:transparent}50%{background:rgba(210,153,34,.20)}}
+  .flash-g{animation:flash-g .65s ease;border-radius:3px}
+  .flash-r{animation:flash-r .65s ease;border-radius:3px}
+  .flash-y{animation:flash-y .65s ease;border-radius:3px}
+
+  /* ── Toast notifications ── */
+  #toastBox{position:fixed;bottom:36px;right:14px;z-index:9999;display:flex;flex-direction:column-reverse;gap:7px;pointer-events:none}
+  .toast{
+    display:flex;align-items:flex-start;gap:9px;
+    background:var(--surface);border:1px solid var(--border2);border-radius:8px;
+    padding:9px 12px;min-width:230px;max-width:310px;
+    box-shadow:0 6px 24px rgba(0,0,0,.55);pointer-events:all;
+    animation:t-in .22s ease;
+  }
+  .toast.t-fix  {border-left:3px solid var(--green)}
+  .toast.t-warn {border-left:3px solid var(--yellow)}
+  .toast.t-issue{border-left:3px solid var(--red)}
+  .toast.t-info {border-left:3px solid var(--blue)}
+  .toast-ico{font-size:14px;padding-top:1px;flex-shrink:0}
+  .toast-body{flex:1;min-width:0}
+  .toast-kind{font-size:9px;font-weight:800;letter-spacing:.55px;text-transform:uppercase;margin-bottom:2px}
+  .toast.t-fix   .toast-kind{color:var(--green)}
+  .toast.t-warn  .toast-kind{color:var(--yellow)}
+  .toast.t-issue .toast-kind{color:var(--red)}
+  .toast.t-info  .toast-kind{color:var(--blue)}
+  .toast-txt{font-size:10px;color:var(--text);line-height:1.4;word-break:break-word}
+  .toast-x{font-size:12px;color:var(--muted);cursor:pointer;padding-left:4px;line-height:1}
+  .toast-x:hover{color:var(--text)}
+  @keyframes t-in {from{opacity:0;transform:translateX(18px)}to{opacity:1;transform:none}}
+  @keyframes t-out{from{opacity:1;transform:none}to{opacity:0;transform:translateX(18px)}}
+
+  /* ── Activity log filter pills ── */
+  .log-filter-bar{
+    display:flex;align-items:center;gap:4px;padding:5px 8px 4px;
+    border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;
+  }
+  .lf{
+    font-size:9px;font-weight:700;letter-spacing:.45px;text-transform:uppercase;
+    border:1px solid var(--border2);border-radius:20px;padding:2px 8px;
+    cursor:pointer;background:transparent;color:var(--muted);transition:all .14s;
+    font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+  }
+  .lf:hover{color:var(--text)}
+  .lf.active{color:#0d1117}
+  .lf.lf-all.active  {background:var(--muted);  border-color:var(--muted)}
+  .lf.lf-fix.active  {background:var(--green);  border-color:var(--green)}
+  .lf.lf-warn.active {background:var(--yellow); border-color:var(--yellow)}
+  .lf.lf-issue.active{background:var(--red);    border-color:var(--red)}
+  .lf.lf-info.active {background:var(--blue);   border-color:var(--blue)}
+  .log-search{
+    flex:1;min-width:70px;background:var(--surface2);border:1px solid var(--border);
+    border-radius:4px;padding:2px 7px;font-size:10px;color:var(--text);outline:none;
+    font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+  }
+  .log-search::placeholder{color:var(--muted2)}
+  .log-search:focus{border-color:var(--accent)}
+
+  /* ── Collapsible vmrow groups ── */
+  .vmgroup-hdr{
+    display:flex;align-items:center;justify-content:space-between;
+    cursor:pointer;user-select:none;padding:5px 0 3px;
+  }
+  .vmgroup-hdr:hover .section-title{color:var(--text)}
+  .vmchev{font-size:9px;color:var(--muted2);transition:transform .2s;display:inline-block}
+  .vmgroup-hdr.collapsed .vmchev{transform:rotate(-90deg)}
+
+  /* ── Process context menu ── */
+  #ctxMenu{
+    position:fixed;z-index:9998;background:var(--surface);
+    border:1px solid var(--border2);border-radius:9px;padding:5px;
+    box-shadow:0 10px 30px rgba(0,0,0,.65);min-width:160px;display:none;
+  }
+  .ctx-hd{font-size:9px;color:var(--muted);padding:3px 10px 5px;border-bottom:1px solid var(--border);margin-bottom:3px}
+  .ctx-it{
+    display:flex;align-items:center;gap:8px;padding:6px 10px;
+    border-radius:5px;font-size:11px;cursor:pointer;color:var(--text);transition:background .12s;
+  }
+  .ctx-it:hover{background:var(--surface2)}
+  .ctx-it.danger{color:var(--red)}
+  .ctx-it.danger:hover{background:rgba(248,81,73,.1)}
+  .ctx-it.safe{color:var(--green)}
+
+  /* ── Keyboard shortcut badge ── */
+  .kbd{
+    display:inline-block;background:var(--surface2);border:1px solid var(--border2);
+    border-radius:3px;padding:0 4px;font-size:8px;font-family:'SF Mono',monospace;
+    color:var(--muted2);margin-left:4px;line-height:1.7;
+  }
 </style>
 </head>
 <body>
@@ -3019,6 +3166,10 @@ HTML = r"""<!DOCTYPE html>
   <div class="status-chip" id="statusChip">
     <div class="status-dot" id="statusDot"></div>
     <span class="status-label" id="statusText">RUNNING</span>
+  </div>
+  <div class="tier-badge t0" id="tierBadge" title="Active remediation tier">
+    <div class="tier-dot"></div>
+    <span id="tierBadgeLabel">All Good</span>
   </div>
   <span class="tb-spacer"></span>
   <div class="tb-pills">
@@ -3108,28 +3259,32 @@ HTML = r"""<!DOCTYPE html>
   </div>
   <!-- ── Bot Achievements banner ── -->
   <div class="achieve-strip">
-    <div class="achieve-item">
+    <div class="achieve-item" title="Tier 2+ interventions confirmed successful by RAC (this session)">
       <div class="achieve-icon">🛡</div>
-      <div class="achieve-val" id="mAct">—</div>
+      <div class="achieve-val zero" id="mAct">—</div>
       <div class="achieve-label">crises averted</div>
+      <div class="achieve-sub" id="achActSub">this session</div>
     </div>
     <div class="achieve-sep"></div>
-    <div class="achieve-item">
+    <div class="achieve-item" title="Total RAM freed by process termination — all-time">
       <div class="achieve-icon">💾</div>
-      <div class="achieve-val" id="achRamSaved">—</div>
-      <div class="achieve-label">total RAM saved</div>
+      <div class="achieve-val zero" id="achRamSaved">—</div>
+      <div class="achieve-label">RAM saved all-time</div>
+      <div class="achieve-sub" id="achRamSub">from interventions</div>
     </div>
     <div class="achieve-sep"></div>
-    <div class="achieve-item">
-      <div class="achieve-icon">✓</div>
-      <div class="achieve-val" id="achContain">—</div>
-      <div class="achieve-label">time below 87%</div>
+    <div class="achieve-item" title="% of all recorded measurements where RAM stayed below 87% — the containment proof">
+      <div class="achieve-icon">📊</div>
+      <div class="achieve-val zero" id="achContain">—</div>
+      <div class="achieve-label">held below 87%</div>
+      <div class="achieve-sub" id="achContainSub">of all time</div>
     </div>
     <div class="achieve-sep"></div>
-    <div class="achieve-item">
+    <div class="achieve-item" title="Largest single-intervention RAM recovery on record">
       <div class="achieve-icon">⚡</div>
-      <div class="achieve-val" id="achBest">—</div>
-      <div class="achieve-label">biggest save</div>
+      <div class="achieve-val zero" id="achBest">—</div>
+      <div class="achieve-label">best single save</div>
+      <div class="achieve-sub" id="achBestSub">all-time record</div>
     </div>
   </div>
 </div>
@@ -3275,6 +3430,10 @@ HTML = r"""<!DOCTYPE html>
 
       <!-- vm detail rows -->
       <div class="vmrow-section">
+        <div class="vmgroup-hdr" onclick="toggleVmGroup('vmg-system')">
+          <span class="section-title">System</span><span class="vmchev">▼</span>
+        </div>
+        <div id="vmg-system">
         <div class="vmrow">
           <span class="vmkey">Total RAM</span>
           <span class="vmval" id="vsRam">—</span>
@@ -3291,7 +3450,14 @@ HTML = r"""<!DOCTYPE html>
           <span class="vmkey">Uptime</span>
           <span class="vmval" id="vsUptime">—</span>
         </div>
-        <div class="vmrow" style="border-top:1px solid var(--border);margin-top:3px;padding-top:4px">
+        </div><!-- /vmg-system -->
+
+        <!-- Engine State group -->
+        <div class="vmgroup-hdr" onclick="toggleVmGroup('vmg-engine')" style="margin-top:4px">
+          <span class="section-title">Engine State</span><span class="vmchev">▼</span>
+        </div>
+        <div id="vmg-engine">
+        <div class="vmrow">
           <span class="vmkey">Active Tier</span>
           <span class="vmval" id="vsActiveTier" style="font-weight:700">—</span>
         </div>
@@ -3311,7 +3477,14 @@ HTML = r"""<!DOCTYPE html>
           <span class="vmkey">Leak Alerts</span>
           <span class="vmval" id="vsLeaks">—</span>
         </div>
-        <div class="vmrow" style="border-top:1px solid var(--border);margin-top:3px;padding-top:4px">
+        </div><!-- /vmg-engine -->
+
+        <!-- Forecast group -->
+        <div class="vmgroup-hdr" onclick="toggleVmGroup('vmg-forecast')" style="margin-top:4px">
+          <span class="section-title">Forecast</span><span class="vmchev">▼</span>
+        </div>
+        <div id="vmg-forecast">
+        <div class="vmrow">
           <span class="vmkey">Forecast Model</span>
           <span class="vmval" id="vsFcModel" style="color:var(--muted)">—</span>
         </div>
@@ -3327,11 +3500,18 @@ HTML = r"""<!DOCTYPE html>
           <span class="vmkey">Thermal Coupling</span>
           <span class="vmval" id="vsThermalCoupling" style="color:var(--muted)">—</span>
         </div>
-        <div class="vmrow" style="border-top:1px solid var(--border);margin-top:3px;padding-top:4px">
+        <div class="vmrow">
           <span class="vmkey">Cache (90d)</span>
           <span class="vmval" id="vsCacheSize" style="color:var(--muted)">—</span>
         </div>
-        <div class="vmrow" style="border-top:1px solid var(--border);margin-top:3px;padding-top:4px">
+        </div><!-- /vmg-forecast -->
+
+        <!-- Intelligence group (expert rows) -->
+        <div class="vmgroup-hdr" onclick="toggleVmGroup('vmg-intel')" style="margin-top:4px">
+          <span class="section-title">Intelligence</span><span class="vmchev">▼</span>
+        </div>
+        <div id="vmg-intel">
+        <div class="vmrow">
           <span class="vmkey">Root Cause</span>
           <span class="vmval" id="vsRootCause" style="color:var(--muted)">—</span>
         </div>
@@ -3363,7 +3543,8 @@ HTML = r"""<!DOCTYPE html>
           <span class="vmkey">ASZM Protected+</span>
           <span class="vmval" id="vsAszm" style="color:var(--muted)">—</span>
         </div>
-      </div>
+        </div><!-- /vmg-intel -->
+      </div><!-- /vmrow-section -->
 
       <!-- Memory Events mini-feed -->
       <div class="vmrow-section" style="flex-shrink:0;max-height:140px;overflow-y:auto">
@@ -3387,8 +3568,17 @@ HTML = r"""<!DOCTYPE html>
     <!-- ── Right: Activity feed ── -->
     <div class="feed-col">
       <div class="feed-hdr">
-        <span class="feed-title">Activity Log</span>
+        <span class="feed-title">Activity Log<span class="kbd">/ to search</span></span>
         <span class="ev-badge-pill" id="evCount">0</span>
+      </div>
+      <!-- Filter bar -->
+      <div class="log-filter-bar">
+        <button class="lf lf-all active" onclick="setLogFilter('all')">All</button>
+        <button class="lf lf-fix"        onclick="setLogFilter('fix')">Fix</button>
+        <button class="lf lf-warn"       onclick="setLogFilter('warn')">Warn</button>
+        <button class="lf lf-issue"      onclick="setLogFilter('issue')">Issue</button>
+        <button class="lf lf-info"       onclick="setLogFilter('info')">Info</button>
+        <input  class="log-search" id="logSearch" placeholder="Search…" oninput="applyLogFilters()">
       </div>
       <div class="feed-body" id="feedBody"></div>
     </div>
@@ -3410,7 +3600,7 @@ HTML = r"""<!DOCTYPE html>
           <th>Process</th><th>PID</th>
           <th>CPU %</th><th style="width:52px">CPU</th>
           <th>MEM %</th><th style="width:52px">MEM</th>
-          <th>Status</th>
+          <th>Status</th><th style="width:28px"></th>
         </tr>
       </thead>
       <tbody id="procBody"></tbody>
@@ -3419,10 +3609,21 @@ HTML = r"""<!DOCTYPE html>
 </div><!-- /body-wrap -->
 </div><!-- /panelLive -->
 
+<!-- ── Context menu ── -->
+<div id="ctxMenu">
+  <div class="ctx-hd" id="ctxPidLine">PID —</div>
+  <div class="ctx-it safe"   onclick="ctxAction('freeze')">❄ Freeze (SIGSTOP)</div>
+  <div class="ctx-it"        onclick="ctxAction('thaw')">▶ Thaw (SIGCONT)</div>
+  <div class="ctx-it danger" onclick="ctxAction('kill')">✕ Terminate (SIGTERM)</div>
+</div>
+
+<!-- ── Toast container ── -->
+<div id="toastBox"></div>
+
 <!-- ── Footer ── -->
 <div class="footer">
   <span id="lastUpdate">Initializing…</span>
-  <span>Poll 1 s · Throttle &gt;85% CPU · Warn &gt;80% RAM · v2.0 Autonomous Engine active</span>
+  <span>Poll 1 s · Throttle &gt;85% CPU · Warn &gt;80% RAM · v2.2 Autonomous Engine active<span class="kbd">Space</span> pause <span class="kbd">/</span> search <span class="kbd">?</span> expert</span>
 </div>
 
 <script>
@@ -3520,7 +3721,9 @@ function buildProcTable(procs, thrPids) {
     const leakBadge=isLeak?'<span class="thr-badge" style="background:rgba(248,81,73,.15);color:var(--red)">LEAK</span>':'';
     const restartHint=isLeak&&mem>=4?
       ' <span title="This process is growing — consider restarting it" style="cursor:help;color:var(--blue);font-size:9px">💡 Restart?</span>':'';
-    return `<tr class="${cls}"><td>${name}${badge}${leakBadge}</td><td>${pid}</td><td>${cpu.toFixed(1)}%</td>${barCell(cpu,cc)}<td>${mem.toFixed(1)}%</td>${barCell(mem*8,mc)}<td>${status}${restartHint}</td></tr>`;
+    const safeN=name.replace(/'/g,"\\'");
+    const menuBtn=`<span style="cursor:pointer;color:var(--muted2);font-size:11px;padding:0 3px" title="Actions" onclick="showCtxMenu(event,${pid},'${safeN}')">⋯</span>`;
+    return `<tr class="${cls}" oncontextmenu="showCtxMenu(event,${pid},'${safeN}')"><td>${name}${badge}${leakBadge}</td><td>${pid}</td><td>${cpu.toFixed(1)}%</td>${barCell(cpu,cc)}<td>${mem.toFixed(1)}%</td>${barCell(mem*8,mc)}<td>${status}${restartHint}</td><td>${menuBtn}</td></tr>`;
   }).join('');
 }
 
@@ -3600,13 +3803,15 @@ const BADGE={fix:'✓ FIX',warn:'⚠ WARN',issue:'✗ ISS',info:'ℹ INFO'};
 const BOT_KW=['ATCE','RWA','ACN','BRL','CTRE','SIE','MEG','PSM','ASZM','CDA:','calibrated','Markov','Bayesian','residual','quorum weight'];
 function addEvent(ev) {
   const key=ev.ts+ev.msg; if(seenEvs.has(key))return; seenEvs.add(key); evCnt++;
-  // Treat as bot log if server tagged it or if message matches bot keywords
   const isBot = ev.category==='bot' || BOT_KW.some(k=>ev.msg.includes(k));
   if (isBot && !showBotLogs) return;
   document.getElementById('evCount').textContent = evCnt;
   const div=document.createElement('div'); div.className='ev '+ev.kind;
+  div.dataset.kind=ev.kind;
   div.innerHTML=`<span class="ev-ts">${ev.ts}</span><span class="ev-badge">${BADGE[ev.kind]||'?'}</span><span class="ev-msg">${ev.msg}</span>`;
   document.getElementById('feedBody').prepend(div);
+  maybeToast(ev);
+  applyLogFilters();
 }
 function clearFeed(){
   evCnt=0; seenEvs.clear();
@@ -3673,29 +3878,63 @@ async function poll() {
       set('mMem',  mem.toFixed(0)+'%',  memC);
       set('mSwap', swap.toFixed(0)+'%', swpC);
       set('mDisk', disk.toFixed(0)+'%', dskC);
+      flashIfChanged('mMem', mem.toFixed(0), mem>80?'flash-r':mem>60?'flash-y':'flash-g');
+      flashIfChanged('mCpu', cpu.toFixed(0), cpu>80?'flash-r':cpu>60?'flash-y':'flash-g');
       document.getElementById('mMemSub').textContent  = (memTotalGb*mem/100).toFixed(1)+' / '+memTotalGb.toFixed(1)+' GB';
       document.getElementById('mSwapSub').textContent = (swapTotalGb*swap/100).toFixed(2)+' / '+swapTotalGb.toFixed(1)+' GB';
       document.getElementById('mDiskSub').textContent = d.disk_free_gb ? d.disk_free_gb.toFixed(1)+' GB free' : '—';
 
-      const act=d.crises_averted||0, iss=d.issues||0, freed=d.freed_mb||0;
+      const iss=d.issues||0, freed=d.freed_mb||0;
       const va=d.value_add||{total:0,succeeded:0,success_rate:0,ram_saved_mb:0,
-        pct_below_87:100,alltime_ram_saved_gb:0,alltime_best_save_mb:0};
+        pct_below_87:100,alltime_ram_saved_gb:0,alltime_best_save_mb:0,
+        alltime_interventions:0,alltime_successes:0};
       const vaFreedMb = va.ram_saved_mb||0;
 
-      // ── Achievement banner (top strip) ──────────────────────────────────
-      // Crises averted: session count (inline, no set() — gradient text via CSS)
-      document.getElementById('mAct').textContent = String(act||0);
-      // Total RAM saved all-time
+      // ── Achievement banner ───────────────────────────────────────────────
+      function achSet(valId, subId, val, label, sub, hasVal) {
+        const el = document.getElementById(valId);
+        if (!el) return;
+        el.textContent = val;
+        el.classList.toggle('zero', !hasVal);
+        const sl = document.getElementById(subId);
+        if (sl) sl.textContent = sub;
+      }
+      // Crises averted (all-time historical)
+      const allSucc = va.alltime_successes||0;
+      const allTot  = va.alltime_interventions||0;
+      achSet('mAct', 'achActSub',
+        allSucc > 0 ? String(allSucc) : 'none yet',
+        'crises averted',
+        allSucc > 0
+          ? allSucc + ' of ' + allTot + ' total'
+          : 'no interventions yet',
+        allSucc > 0);
+      // All-time RAM saved
       const atSaved = va.alltime_ram_saved_gb||0;
-      document.getElementById('achRamSaved').textContent =
-        atSaved>=1 ? atSaved.toFixed(1)+' GB' : ((atSaved*1024).toFixed(0)+' MB');
-      // Containment: % of time RAM stayed below 87%
+      const atSavedTxt = atSaved>=1 ? atSaved.toFixed(1)+' GB'
+                       : atSaved>0  ? (atSaved*1024).toFixed(0)+' MB'
+                       : 'none yet';
+      achSet('achRamSaved', 'achRamSub',
+        atSavedTxt, 'RAM saved',
+        atSaved>0 ? 'across '+allSucc+' rescues' : 'no data yet',
+        atSaved>0);
+      // Containment %
       const contain = va.pct_below_87!=null ? va.pct_below_87 : 100;
-      document.getElementById('achContain').textContent = contain.toFixed(1)+'%';
-      // Biggest single save
+      achSet('achContain', 'achContainSub',
+        contain.toFixed(1)+'%', 'held below 87%',
+        contain>=99 ? '✓ never crossed 87%'
+        : contain>=95 ? 'rarely exceeded'
+        : 'under pressure',
+        true);
+      // Best single save
       const bestMb = va.alltime_best_save_mb||0;
-      document.getElementById('achBest').textContent =
-        bestMb>=1024 ? (bestMb/1024).toFixed(1)+' GB' : bestMb.toFixed(0)+' MB';
+      const bestTxt = bestMb>=1024 ? (bestMb/1024).toFixed(1)+' GB'
+                    : bestMb>0     ? bestMb.toFixed(0)+' MB'
+                    : 'none yet';
+      achSet('achBest', 'achBestSub',
+        bestTxt, 'best save',
+        bestMb>0 ? 'single rescue' : 'no data yet',
+        bestMb>0);
       // Value Add card
       const vaTotal = va.total||0, vaSucc = va.succeeded||0;
       set('vaTotal', String(vaTotal), vaTotal>0?'var(--text)':'var(--muted)');
@@ -3776,6 +4015,7 @@ async function poll() {
       const tierLabels = ['All Good','Watching','Intervening','Rescue Mode','Emergency'];
       const tierColors = ['var(--green)','var(--blue)','var(--yellow)','var(--orange)','var(--red)'];
       const etier = d.effective_tier||0;
+      updateTierBadge(etier);
       const tierEl = document.getElementById('vsActiveTier');
       tierEl.textContent = tierLabels[etier] || ('Tier '+etier);
       tierEl.title = 'Internal tier: ' + etier;
@@ -4010,6 +4250,151 @@ async function poll() {
     }
   } catch(e) {}
 }
+// ── Toast notification system ─────────────────────────────────────────────────
+function showToast(kind, msg) {
+  const box = document.getElementById('toastBox');
+  const icons = {fix:'✓',warn:'⚠',issue:'✗',info:'ℹ'};
+  const t = document.createElement('div');
+  t.className = 'toast t-'+kind;
+  t.innerHTML = `<span class="toast-ico">${icons[kind]||'·'}</span>`+
+    `<div class="toast-body"><div class="toast-kind">${kind}</div><div class="toast-txt">${msg}</div></div>`+
+    `<span class="toast-x" onclick="this.parentElement.remove()">✕</span>`;
+  box.appendChild(t);
+  setTimeout(()=>{ t.style.animation='t-out .3s ease forwards'; setTimeout(()=>t.remove(),300); }, 4500);
+}
+
+// Toast dedup: only fire when the alert *changes* (up or down).
+// Key = kind + normalized message (numbers stripped). Cooldown = 90s.
+const _toastCooldown = new Map();   // key -> {ts, kind}
+const _toastKinds = new Set(['fix','issue','warn']);
+function maybeToast(ev) {
+  if (!_toastKinds.has(ev.kind)) return;
+  // Normalize: strip all numbers so "RAM at 82%" == "RAM at 84%"
+  const norm = ev.msg.replace(/\d[\d.,]*/g, '#').replace(/\s+/g,' ').trim().slice(0,70);
+  const key  = norm;
+  const now  = Date.now();
+  const prev = _toastCooldown.get(key);
+  // Fire if: never seen, OR kind changed (escalation/de-escalation), OR 90s elapsed
+  const shouldFire = !prev
+    || prev.kind !== ev.kind
+    || (now - prev.ts) > 90000;
+  if (!shouldFire) return;
+  _toastCooldown.set(key, {ts: now, kind: ev.kind});
+  showToast(ev.kind, ev.msg.length > 90 ? ev.msg.slice(0, 90)+'…' : ev.msg);
+}
+
+// ── Flash animation helper ────────────────────────────────────────────────────
+let _prevVals = {};
+function flashIfChanged(id, newVal, cls) {
+  if (_prevVals[id] === newVal) return;
+  _prevVals[id] = newVal;
+  const el = document.getElementById(id); if (!el) return;
+  el.classList.remove('flash-g','flash-r','flash-y');
+  void el.offsetWidth; // reflow
+  el.classList.add(cls || 'flash-g');
+  setTimeout(()=>el.classList.remove('flash-g','flash-r','flash-y'), 700);
+}
+
+// ── Tier badge update ─────────────────────────────────────────────────────────
+const _tierBadgeLbls = ['All Good','Watching','Intervening','Rescue Mode','Emergency'];
+let _lastTier = -1;
+function updateTierBadge(tier) {
+  if (tier === _lastTier) return; _lastTier = tier;
+  const el = document.getElementById('tierBadge');
+  if (!el) return;
+  el.className = 'tier-badge t'+tier;
+  document.getElementById('tierBadgeLabel').textContent = _tierBadgeLbls[tier] || ('Tier '+tier);
+  if (tier >= 3) flashIfChanged('tierBadge', tier, 'flash-r');
+}
+
+// ── Log filter & search ───────────────────────────────────────────────────────
+let _logFilter = 'all';
+function setLogFilter(f) {
+  _logFilter = f;
+  document.querySelectorAll('.lf').forEach(b => {
+    b.classList.toggle('active', b.classList.contains('lf-'+f));
+  });
+  applyLogFilters();
+}
+function applyLogFilters() {
+  const q = (document.getElementById('logSearch').value||'').toLowerCase();
+  document.querySelectorAll('#feedBody .ev').forEach(el => {
+    const kind = el.className.replace('ev','').trim().split(' ')[0];
+    const txt  = el.textContent.toLowerCase();
+    const kindOk = (_logFilter==='all') || (kind===_logFilter);
+    const txtOk  = !q || txt.includes(q);
+    el.style.display = (kindOk && txtOk) ? '' : 'none';
+  });
+}
+
+// ── Collapsible vmrow sections ────────────────────────────────────────────────
+function toggleVmGroup(id) {
+  const el  = document.getElementById(id); if (!el) return;
+  const hdr = el.previousElementSibling;
+  const chev = hdr ? hdr.querySelector('.vmchev') : null;
+  const collapsed = el.style.display === 'none';
+  el.style.display = collapsed ? '' : 'none';
+  if (hdr)  hdr.classList.toggle('collapsed', !collapsed);
+  if (chev) chev.style.transform = collapsed ? '' : 'rotate(-90deg)';
+}
+
+// ── Process context menu ──────────────────────────────────────────────────────
+let _ctxPid = 0, _ctxName = '';
+function showCtxMenu(e, pid, name) {
+  e.preventDefault(); e.stopPropagation();
+  _ctxPid = pid; _ctxName = name;
+  const m = document.getElementById('ctxMenu');
+  document.getElementById('ctxPidLine').textContent = name+' · PID '+pid;
+  m.style.display = 'block';
+  const x = Math.min(e.clientX, window.innerWidth  - m.offsetWidth  - 8);
+  const y = Math.min(e.clientY, window.innerHeight - m.offsetHeight - 8);
+  m.style.left = x+'px'; m.style.top = y+'px';
+}
+function hideCtxMenu() { document.getElementById('ctxMenu').style.display='none'; }
+document.addEventListener('click',  hideCtxMenu);
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') hideCtxMenu(); });
+
+async function ctxAction(action) {
+  hideCtxMenu();
+  if (!_ctxPid) return;
+  const labels = {freeze:'Freezing', thaw:'Thawing', kill:'Terminating'};
+  showToast('info', labels[action]+' '+_ctxName+' (PID '+_ctxPid+')…');
+  try {
+    const r = await fetch('/action', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pid:_ctxPid, action})
+    });
+    const d = await r.json();
+    if (d.ok) showToast('fix',  action.charAt(0).toUpperCase()+action.slice(1)+' succeeded: '+_ctxName);
+    else      showToast('warn', action+' failed for PID '+_ctxPid+' (protected or gone)');
+  } catch(e) { showToast('issue','Action failed: '+e.message); }
+}
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  const tag = document.activeElement.tagName;
+  if (tag==='INPUT') return;
+  if (e.key===' ')   { e.preventDefault(); togglePause(); }
+  if (e.key==='/')   { e.preventDefault(); document.getElementById('logSearch').focus(); }
+  if (e.key==='?')   { toggleExpert(); }
+  if (e.key==='c')   { clearFeed(); }
+});
+
+// ── Enhanced chart tooltips ───────────────────────────────────────────────────
+[cpuChart, swapChart].forEach(ch => {
+  ch.options.plugins.tooltip = {
+    enabled: true,
+    mode: 'index', intersect: false,
+    backgroundColor: 'rgba(22,27,34,.95)',
+    borderColor: '#30363d', borderWidth: 1,
+    titleColor: '#8b949e', bodyColor: '#e6edf3',
+    titleFont: {size:9}, bodyFont: {size:10, family:"'SF Mono',monospace"},
+    callbacks: { label: ctx => ' '+ctx.parsed.y.toFixed(1)+'%' }
+  };
+  ch.options.hover = { mode: 'index', intersect: false };
+  ch.update('none');
+});
+
 setInterval(poll, 1000);
 poll();
 </script>
@@ -4063,11 +4448,30 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"Not found")
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/action":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body   = json.loads(self.rfile.read(length))
+                pid    = int(body.get("pid", 0))
+                action = body.get("action", "")
+                ok = False
+                if   action == "freeze" and pid: ok = _engine.freeze_pid(pid)
+                elif action == "thaw"   and pid: ok = _engine.thaw_pid(pid)
+                elif action == "kill"   and pid: ok = _engine.kill_pid(pid)
+                self._send(200, "application/json", json.dumps({"ok": ok}).encode())
+            except Exception as e:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
+        else:
+            self._send(404, "text/plain", b"Not found")
+
     def _send(self, code, content_type, body):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
