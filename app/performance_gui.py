@@ -307,6 +307,59 @@ class MetricsCache:
         except Exception as e:
             print(f"[cache] record_outcome failed: {e}", file=sys.stderr)
 
+    def interventions_today(self) -> dict:
+        """
+        Return today's intervention summary from remediation_outcomes,
+        plus all-time 'time below critical' proof of containment.
+        'Today' = since local midnight.
+        """
+        if not self._ok:
+            return {"total": 0, "succeeded": 0, "success_rate": 0.0, "ram_saved_mb": 0.0,
+                    "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_success_rate": 0.0}
+        import datetime as _dt
+        now_dt = _dt.datetime.now()
+        midnight_ts = int(now_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                # Today's RAC outcomes
+                today_rows = cx.execute(
+                    "SELECT success, delta_mb FROM remediation_outcomes WHERE ts >= ?",
+                    (midnight_ts,)
+                ).fetchall()
+                # All-time RAC outcomes
+                all_rows = cx.execute(
+                    "SELECT success, delta_mb FROM remediation_outcomes"
+                ).fetchall()
+                # All-time containment: % of rows where RAM stayed below Tier 3 (87%)
+                contain = cx.execute(
+                    "SELECT SUM(CASE WHEN mem_pct < 87 THEN 1 ELSE 0 END), COUNT(*) FROM metrics"
+                ).fetchone()
+            total     = len(today_rows)
+            succeeded = sum(1 for r in today_rows if r[0] == 1)
+            saved_mb  = sum(r[1] for r in today_rows if r[0] == 1 and r[1] > 0)
+            all_total   = len(all_rows)
+            all_succ    = sum(1 for r in all_rows if r[0] == 1)
+            all_saved   = sum((r[1] or 0) for r in all_rows if r[0] == 1 and (r[1] or 0) > 0)
+            best_save   = cx.execute(
+                "SELECT MAX(delta_mb) FROM remediation_outcomes WHERE success=1"
+            ).fetchone()
+            pct_below   = round((contain[0] or 0) / max(contain[1], 1) * 100, 1)
+            return {
+                "total":                 total,
+                "succeeded":             succeeded,
+                "success_rate":          round(succeeded / total, 2) if total else 0.0,
+                "ram_saved_mb":          round(saved_mb, 0),
+                "pct_below_87":          pct_below,
+                "alltime_interventions":  all_total,
+                "alltime_success_rate":   round(all_succ / all_total, 2) if all_total else 0.0,
+                "alltime_ram_saved_gb":   round(all_saved / 1024, 1),
+                "alltime_best_save_mb":   round((best_save[0] or 0), 0),
+            }
+        except Exception:
+            return {"total": 0, "succeeded": 0, "success_rate": 0.0, "ram_saved_mb": 0.0,
+                    "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_success_rate": 0.0,
+                    "alltime_ram_saved_gb": 0.0, "alltime_best_save_mb": 0.0}
+
     def query_signal_accuracy(self, signal: str, hours: int = 24) -> float:
         """
         Return fraction of outcomes in last `hours` hours where `signal` voted high
@@ -463,7 +516,7 @@ AIP_MIN_MB           = 50     # minimum family RSS to include in propagation
 AIP_MAX_DEPTH        = 3      # max parent-child chain depth
 
 # ─── RAC — Reinforcement Action Coordinator ───────────────────────────────────
-RAC_EVAL_DELAY_S     = 30     # seconds after action before outcome measured
+RAC_EVAL_DELAY_S     = 120    # seconds after action before outcome measured (SIGSTOP needs OS time to reclaim pages)
 RAC_SUCCESS_PCT      = 2.0    # RAM must drop ≥ this % to count as success
 
 # ─── ASZM — Adaptive Safety Zone Mapping ──────────────────────────────────────
@@ -502,7 +555,9 @@ class BotEngine(threading.Thread):
         self.events           = deque(maxlen=200)   # O(1) append+bound, no pop(0)
         self.actions          = 0
         self.issues           = 0
-        self.freed_mb         = 0.0
+        self.freed_mb         = 0.0    # MB actually freed (terminate actions)
+        self.suspended_mb     = 0.0    # MB of SIGSTOP'd processes (not freed — resumed later)
+        self.crises_averted   = 0      # interventions that successfully prevented escalation
         self.thermal_pct      = 100    # 100 = no throttle; <100 = thermally limited
         self.on_battery       = False
         self._start_time      = time.time()
@@ -512,7 +567,6 @@ class BotEngine(threading.Thread):
         self._warned_leaks    = set()  # pids already flagged this session
         self._cache_warned    = False
         self.performance_score: int  = -1    # 0–100 daily score; -1 = warming up
-        self.longterm_avg_mem: float = 0.0   # 30-day avg RAM %
         self._leak_pids: set         = set() # PIDs currently flagged as leaks
         self.disk_pct         = 0.0
         self.disk_free_gb     = 0.0
@@ -550,6 +604,8 @@ class BotEngine(threading.Thread):
         # App-level predictions derived from cache; refreshed every 24 h
         self.app_predictions: list = []       # [{app, avg_mb, trend, risk}]
         self._last_app_predict: float = 0.0
+        # Pre-load long-term avg from cache so it's non-zero from first /stats request
+        self.longterm_avg_mem: float = self._cache.longterm_avg_mem()
         self._paused: bool = False
         # ── MMAF: Multi-Model Adaptive Forecaster ────────────────────────────
         self._last_forecast_model: str = "linear"
@@ -646,6 +702,8 @@ class BotEngine(threading.Thread):
                 "actions":       self.actions,
                 "issues":        self.issues,
                 "freed_mb":      round(self.freed_mb, 0),
+                "suspended_mb":  round(self.suspended_mb, 0),
+                "crises_averted": self.crises_averted,
                 "thermal_pct":   self.thermal_pct,
                 "on_battery":    self.on_battery,
                 "uptime_s":      int(time.time() - self._start_time),
@@ -683,6 +741,7 @@ class BotEngine(threading.Thread):
                 "aip_impact":           list(self._aip_impact),
                 "causal_diagnosis":     self.causal_diagnosis,
                 "dynamic_protected":    len(self._dynamic_protected) - len(PROTECTED),
+                "value_add":            self._cache.interventions_today(),
                 # product metrics
                 "performance_score":    self.performance_score,
                 "longterm_avg_mem":     round(self.longterm_avg_mem, 1),
@@ -1660,9 +1719,17 @@ class BotEngine(threading.Thread):
         if cpi >= CPI_TIER3:
             if now - self._ceo_warn_ts >= _ceo_cool:
                 self._ceo_warn_ts = now
+                mem_now = self._last_vm.percent
                 self._emit("warn",
                     f"CEO: Compression near exhaustion (CPI={cpi:.2f}) — "
                     f"purgeable headroom depleted, swap imminent")
+                # Compressor collapse + high RAM → proactively freeze daemons to let OS reclaim
+                if mem_now >= 80 and now - self._last_freeze >= FREEZE_COOL_S:
+                    self._emit("fix",
+                        f"CEO collapse response: triggering daemon freeze at {mem_now:.0f}% RAM "
+                        f"(CPI={cpi:.2f}) before MSCEE tier threshold")
+                    self._freeze_background_daemons()
+                    self._record_rac_action(3, "freeze_daemon", mem_now)
         elif cpi >= CPI_TIER2:
             if now - self._ceo_warn_ts >= _ceo_cool:
                 self._ceo_warn_ts = now
@@ -1844,10 +1911,10 @@ class BotEngine(threading.Thread):
                 pass
 
         if frozen:
-            self.freed_mb += freed_mb
+            self.suspended_mb += freed_mb
             self._emit("fix",
                 f"MEMORY TRIAGE (Tier 3): froze {frozen} background daemons "
-                f"(~{freed_mb:.0f} MB paused) — auto-thaw when pressure drops")
+                f"(~{freed_mb:.0f} MB suspended) — auto-thaw when pressure drops")
 
     def _thaw_frozen_daemons(self):
         """
@@ -2272,6 +2339,8 @@ class BotEngine(threading.Thread):
             delta_pct = pre_mem - current_mem
             delta_mb  = delta_pct / 100.0 * self._mem_total_gb * 1024
             success   = 1 if delta_pct >= RAC_SUCCESS_PCT else 0
+            if success and tier >= 2:
+                self.crises_averted += 1
             # EMA update for action efficacy
             prev_eff  = self._action_efficacy.get(action, 0.0)
             self._action_efficacy[action] = round(
@@ -2917,6 +2986,28 @@ HTML = r"""<!DOCTYPE html>
   /* ── Tab buttons ── */
   .tab-btn{font-size:10px;padding:3px 10px;border-radius:4px 4px 0 0;border-bottom:none}
   .tab-active{background:var(--bg);color:var(--text);border-color:var(--border)}
+
+  /* ── Achievement banner ── */
+  .achieve-strip{
+    display:flex;align-items:stretch;
+    background:linear-gradient(135deg,rgba(46,160,67,.10) 0%,rgba(88,166,255,.07) 100%);
+    border:1px solid rgba(46,160,67,.25);
+    border-radius:6px;margin:0 6px;padding:0 4px;
+    flex-shrink:0;min-width:0;
+  }
+  .achieve-item{
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    padding:4px 10px;min-width:72px;
+  }
+  .achieve-icon{font-size:13px;line-height:1;margin-bottom:1px}
+  .achieve-val{
+    font-size:15px;font-weight:800;
+    background:linear-gradient(135deg,#7ee787,#58a6ff);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+    line-height:1.1;
+  }
+  .achieve-label{font-size:8px;color:var(--muted);text-align:center;margin-top:1px;white-space:nowrap}
+  .achieve-sep{width:1px;background:rgba(46,160,67,.2);margin:6px 0;flex-shrink:0}
 </style>
 </head>
 <body>
@@ -3015,18 +3106,30 @@ HTML = r"""<!DOCTYPE html>
       <div class="metric-sub" id="mDiskSub">— GB free</div>
     </div>
   </div>
-  <div class="metric">
-    <div class="metric-info">
-      <div class="metric-name">Bot Actions</div>
-      <div class="metric-val" id="mAct" style="color:var(--muted)">0</div>
-      <div class="metric-sub">remediations</div>
+  <!-- ── Bot Achievements banner ── -->
+  <div class="achieve-strip">
+    <div class="achieve-item">
+      <div class="achieve-icon">🛡</div>
+      <div class="achieve-val" id="mAct">—</div>
+      <div class="achieve-label">crises averted</div>
     </div>
-  </div>
-  <div class="metric">
-    <div class="metric-info">
-      <div class="metric-name">Issues</div>
-      <div class="metric-val" id="mIss" style="color:var(--muted)">0</div>
-      <div class="metric-sub" id="mIssSub">— freed</div>
+    <div class="achieve-sep"></div>
+    <div class="achieve-item">
+      <div class="achieve-icon">💾</div>
+      <div class="achieve-val" id="achRamSaved">—</div>
+      <div class="achieve-label">total RAM saved</div>
+    </div>
+    <div class="achieve-sep"></div>
+    <div class="achieve-item">
+      <div class="achieve-icon">✓</div>
+      <div class="achieve-val" id="achContain">—</div>
+      <div class="achieve-label">time below 87%</div>
+    </div>
+    <div class="achieve-sep"></div>
+    <div class="achieve-item">
+      <div class="achieve-icon">⚡</div>
+      <div class="achieve-val" id="achBest">—</div>
+      <div class="achieve-label">biggest save</div>
     </div>
   </div>
 </div>
@@ -3116,6 +3219,43 @@ HTML = r"""<!DOCTYPE html>
       <div id="ramRecommendation" style="display:none;margin:4px 4px 2px;padding:6px 10px;
         border-radius:6px;border:1px solid rgba(88,166,255,.3);
         background:rgba(88,166,255,.06);font-size:10px;color:var(--blue)"></div>
+
+      <!-- Value Add card -->
+      <div id="valueAddCard" style="margin:4px 4px 2px;padding:6px 10px;
+        border-radius:6px;border:1px solid var(--border);background:rgba(126,231,135,.04)">
+        <div style="font-size:9px;font-weight:700;letter-spacing:.06em;
+          text-transform:uppercase;color:var(--muted);margin-bottom:5px">Bot Value Add — Today</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 12px">
+          <div>
+            <div style="font-size:9px;color:var(--muted)">Interventions (today)</div>
+            <div style="font-size:13px;font-weight:700" id="vaTotal">—</div>
+          </div>
+          <div>
+            <div style="font-size:9px;color:var(--muted)">Success Rate (today)</div>
+            <div style="font-size:13px;font-weight:700" id="vaRate">—</div>
+          </div>
+          <div>
+            <div style="font-size:9px;color:var(--muted)">RAM Freed (today)</div>
+            <div style="font-size:13px;font-weight:700;color:var(--green)" id="vaFreed">—</div>
+          </div>
+          <div>
+            <div style="font-size:9px;color:var(--muted)">RAM Suspended (session)</div>
+            <div style="font-size:13px;font-weight:700;color:var(--yellow)" id="vaSuspended">—</div>
+          </div>
+        </div>
+        <div style="margin-top:6px;padding-top:5px;border-top:1px solid var(--border);
+          display:grid;grid-template-columns:1fr 1fr;gap:3px 12px">
+          <div>
+            <div style="font-size:9px;color:var(--muted)">All-time interventions</div>
+            <div style="font-size:11px;font-weight:600" id="vaAllTotal">—</div>
+          </div>
+          <div>
+            <div style="font-size:9px;color:var(--muted)">RAM contained below 87%</div>
+            <div style="font-size:11px;font-weight:600;color:var(--green)" id="vaContain">—</div>
+          </div>
+        </div>
+        <div style="margin-top:4px;font-size:9px;color:var(--muted)" id="vaDetail"></div>
+      </div>
 
       <!-- Breakdown bar -->
       <div class="bd-section">
@@ -3520,7 +3660,7 @@ async function poll() {
       if (trendVisible) updateChart(memChart, d.mem_hist||[]);
 
       // chart live labels
-      const set=(id,t,c)=>{const e=document.getElementById(id);e.textContent=t;if(c)e.style.color=c;};
+      const set=(id,t,c)=>{const e=document.getElementById(id);if(!e)return;e.textContent=t;if(c)e.style.color=c;};
       set('cpuLive', cpu.toFixed(0)+'%', cpuC);
       set('swapLive',swap.toFixed(0)+'%',swpC);
 
@@ -3537,10 +3677,46 @@ async function poll() {
       document.getElementById('mSwapSub').textContent = (swapTotalGb*swap/100).toFixed(2)+' / '+swapTotalGb.toFixed(1)+' GB';
       document.getElementById('mDiskSub').textContent = d.disk_free_gb ? d.disk_free_gb.toFixed(1)+' GB free' : '—';
 
-      const act=d.actions||0, iss=d.issues||0, freed=d.freed_mb||0;
-      set('mAct', String(act), act>0?'var(--green)':'var(--muted)');
-      set('mIss', String(iss), iss>0?'var(--red)':'var(--muted)');
-      document.getElementById('mIssSub').textContent = freed>=1024?(freed/1024).toFixed(1)+' GB paused':freed.toFixed(0)+' MB paused';
+      const act=d.crises_averted||0, iss=d.issues||0, freed=d.freed_mb||0;
+      const va=d.value_add||{total:0,succeeded:0,success_rate:0,ram_saved_mb:0,
+        pct_below_87:100,alltime_ram_saved_gb:0,alltime_best_save_mb:0};
+      const vaFreedMb = va.ram_saved_mb||0;
+
+      // ── Achievement banner (top strip) ──────────────────────────────────
+      // Crises averted: session count (inline, no set() — gradient text via CSS)
+      document.getElementById('mAct').textContent = String(act||0);
+      // Total RAM saved all-time
+      const atSaved = va.alltime_ram_saved_gb||0;
+      document.getElementById('achRamSaved').textContent =
+        atSaved>=1 ? atSaved.toFixed(1)+' GB' : ((atSaved*1024).toFixed(0)+' MB');
+      // Containment: % of time RAM stayed below 87%
+      const contain = va.pct_below_87!=null ? va.pct_below_87 : 100;
+      document.getElementById('achContain').textContent = contain.toFixed(1)+'%';
+      // Biggest single save
+      const bestMb = va.alltime_best_save_mb||0;
+      document.getElementById('achBest').textContent =
+        bestMb>=1024 ? (bestMb/1024).toFixed(1)+' GB' : bestMb.toFixed(0)+' MB';
+      // Value Add card
+      const vaTotal = va.total||0, vaSucc = va.succeeded||0;
+      set('vaTotal', String(vaTotal), vaTotal>0?'var(--text)':'var(--muted)');
+      const rateCol = va.success_rate>=0.7?'var(--green)':va.success_rate>=0.4?'var(--yellow)':'var(--muted)';
+      set('vaRate', vaTotal>0?(va.success_rate*100).toFixed(0)+'%':'—', rateCol);
+      set('vaFreed', vaFreedMb>0?(vaFreedMb>=1024?(vaFreedMb/1024).toFixed(1)+' GB':vaFreedMb.toFixed(0)+' MB'):'0 MB', 'var(--green)');
+      const susMb = d.suspended_mb||0;
+      set('vaSuspended', susMb>0?(susMb>=1024?(susMb/1024).toFixed(1)+' GB':susMb.toFixed(0)+' MB'):'0 MB', susMb>0?'var(--yellow)':'var(--muted)');
+      // All-time containment stats
+      const vaAllTot = va.alltime_interventions||0;
+      set('vaAllTotal', String(vaAllTot), vaAllTot>0?'var(--text)':'var(--muted)');
+      const containCol = contain>=99?'var(--green)':contain>=95?'var(--yellow)':'var(--red)';
+      set('vaContain', contain.toFixed(1)+'% of time', containCol);
+      // Footer detail
+      const vaDetailEl = document.getElementById('vaDetail');
+      if (vaAllTot>0){
+        const asr = va.alltime_success_rate||0;
+        vaDetailEl.textContent = 'All-time: '+(asr*100).toFixed(0)+'% success rate · Freed = terminated; Suspended = SIGSTOP (resumes when pressure drops).';
+      } else {
+        vaDetailEl.textContent = 'No interventions recorded yet — system is stable or bot just started.';
+      }
 
       // memory hero arc
       setMemArc(mem, memC);

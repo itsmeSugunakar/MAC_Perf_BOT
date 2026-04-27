@@ -148,9 +148,18 @@ BotEngine (background thread, 1 Hz)
       │   ├── performance_score (int)            ← 0–100 daily score; -1 = warming up (<10 min data)
       │   │                                         formula: 100 − (0.5×avg_mem + 0.3×avg_cpu + 0.2×avg_swap)
       │   │                                         refreshed every 5 min from MetricsCache
-      │   ├── longterm_avg_mem (float)           ← 30-day average RAM %; drives upgrade recommendation
+      │   ├── longterm_avg_mem (float)           ← 30-day average RAM %; pre-loaded from DB at startup;
+      │   │                                         drives upgrade recommendation
       │   └── _leak_pids (set[int])              ← PIDs currently flagged as memory leaks;
       │                                             kept in sync with _warned_leaks by _track_memory_leaks()
+      │
+      ├── v2.2 Value-add metrics
+      │   ├── freed_mb (float)                   ← MB reclaimed by actual process termination only
+      │   ├── suspended_mb (float)               ← MB of SIGSTOP'd processes (RSS held, not freed)
+      │   ├── crises_averted (int)               ← session count: RAC-confirmed rescues (tier ≥ 2,
+      │   │                                         delta_pct ≥ 2 %) incremented in _evaluate_rac_outcomes()
+      │   └── value_add (dict)                   ← interventions_today() snapshot: today + all-time
+      │                                             remediation_outcomes aggregates
       │
       └── MetricsCache (disk)
           └── ~/Library/Application Support/performance-bot/metrics.db
@@ -184,6 +193,7 @@ BotEngine (background thread, 1 Hz)
             ├── Tab bar           — Live | 7-Day History tabs              [v2.1]
             ├── Performance Score — 0–100 headline metric in tab bar         [v2.1]
             ├── Metric strip      — ring gauges: CPU / MEM / Swap / Disk
+            │   + Achievement banner: Crises Averted / Total RAM Saved / Time <87% / Biggest Save  [v2.2]
             ├── Root Cause Banner — prominent plain-English alert when non-normal [v2.1]
             ├── RAM Recommendation — "add RAM" advisory when 30d avg > 80%   [v2.1]
             ├── Memory Intelligence panel — arc gauge, vm_stat breakdown,
@@ -488,6 +498,10 @@ Analysis methods (all run aggregate SQL — zero raw rows loaded into Python):
   daily_performance_score(24h)   → int 0–100; -1 if < 60 rows  [v2.1]
   longterm_avg_mem(30d)          → float avg RAM %; 0.0 if < 100 rows  [v2.1]
   hourly_history(7d)             → [{hour, mem, cpu, swap}] for /history  [v2.1]
+  interventions_today()          → {total, succeeded, success_rate, ram_saved_mb,  [v2.2]
+                                    pct_below_87, alltime_interventions,
+                                    alltime_success_rate, alltime_ram_saved_gb,
+                                    alltime_best_save_mb}
   record_outcome(...)            → RAC outcome INSERT
   query_signal_accuracy(sig, 24h)→ float success rate for RWA
   query_tier_distribution(30d)   → {tier: count} for BRL

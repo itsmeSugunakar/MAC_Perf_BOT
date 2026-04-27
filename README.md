@@ -2,7 +2,7 @@
 
 A lightweight, always-on macOS performance monitor with **autonomous closed-loop resource management**, a **19-engine 5-layer control architecture**, and an installable PWA dashboard.
 
-Current version: **2.0.0**
+Current version: **2.2.0**
 
 ---
 
@@ -18,7 +18,8 @@ Current version: **2.0.0**
 - **Chronothermal regression** — CTRE maps hour-of-day × thermal load to memory stability zones
 - **Ancestral impact propagation** — AIP scores process families by cascading RSS depth
 - **Dynamic protected set** — ASZM elevates long-running, low-CPU system daemons to the protection list automatically
-- **Reinforcement action coordinator** — RAC measures post-action RAM deltas to label each remediation as success/failure
+- **Reinforcement action coordinator** — RAC measures post-action RAM deltas (evaluated at 120 s to allow page reclaim) to label each remediation as success/failure; confirmed rescues increment `crises_averted`
+- **Value-add achievement panel** — live dashboard strip: crises averted / all-time GB saved / % time RAM held below 87% / biggest single save; backed by `interventions_today()` SQLite aggregate
 - **Signal integrity validation** — SIE applies z-score anomaly detection per signal; low-confidence signals are down-weighted in ACN
 - **Model ensemble governance** — MEG tracks rolling residuals per MMAF model and promotes the historically best-fit model
 - **4-tier memory remediation cascade** — observe → advisory → SIGSTOP idle daemons → emergency termination
@@ -147,7 +148,7 @@ Thresholds self-tune hourly via ATCE. When TTE-driven escalation fires, an amber
 
 | Panel | Contents |
 |-------|----------|
-| Metric strip | SVG ring gauges — CPU / Memory / Swap / Disk + Actions / Issues |
+| Metric strip | SVG ring gauges — CPU / Memory / Swap / Disk + **Achievement banner** (Crises Averted / Total RAM Saved / Time Below 87% / Biggest Save) |
 | Memory Intelligence | Arc gauge, % + GB, MMAF forecast ETA, predictive escalation banner, Active Tier, CPU-RAM Lock, XPC Blocked, Cache size |
 | vm_stat rows | RAM, Swap, Disk, Uptime, Active Tier, CPU-RAM Lock, XPC Blocked, Cache, Forecast Model, CPI, Swap Velocity, Thermal Coupling |
 | v2.0 rows | Root Cause (CDA), BRL Confidence, ACN Weights sparkbar, Signal Integrity traffic-light, PSM Next Tier, CTRE Zone stability, Action Efficacy, ASZM Protected+ |
@@ -155,7 +156,7 @@ Thresholds self-tune hourly via ATCE. When TTE-driven escalation fires, an amber
 | App Predictions | Risk-rated app cards from 90-day cache (appears after first 24 h analysis cycle) |
 | Memory Families | Top-8 app families by aggregated RSS with proportional bars |
 | CPU / Swap charts | 90-second sparklines |
-| Bot Status | Throttled count, total actions, issues, RAM freed |
+| Bot Status | Throttled count, total actions, issues, RAM freed (terminated), Memory Paused (SIGSTOP'd) |
 | Activity Log | Live event feed — FIX / WARN / ISSUE / INFO |
 | Process Table | Top-12 processes with CPU/MEM bars; throttled badge; toggleable memory trend |
 
