@@ -315,7 +315,8 @@ class MetricsCache:
         """
         if not self._ok:
             return {"total": 0, "succeeded": 0, "success_rate": 0.0, "ram_saved_mb": 0.0,
-                    "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_success_rate": 0.0}
+                    "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_successes": 0,
+                    "alltime_success_rate": 0.0, "alltime_ram_saved_gb": 0.0, "alltime_best_save_mb": 0.0}
         import datetime as _dt
         now_dt = _dt.datetime.now()
         midnight_ts = int(now_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -400,6 +401,92 @@ class MetricsCache:
             return {int(r[0]): int(r[1]) for r in rows}
         except Exception:
             return {}
+
+    def fetch_training_data(self, max_rows=600):
+        """
+        Build (X, y) pairs for NPA training from the full 30-day cache.
+        Fetches ALL rows then strides uniformly so training covers the entire
+        history (not just the oldest max_rows rows).
+        X: 11-element feature vectors.
+        y: [next-60s avg mem norm, next-60s avg cpu norm, anomaly_label].
+        """
+        if not self._ok:
+            return [], []
+        cutoff = int(time.time() - 30 * 86400)
+        try:
+            with sqlite3.connect(self._db, timeout=10) as cx:
+                all_rows = cx.execute(
+                    "SELECT ts, cpu_pct, mem_pct, swap_pct, disk_pct, "
+                    "thermal_pct, eff_tier, tte_min FROM metrics "
+                    "WHERE ts >= ? AND cpu_pct IS NOT NULL "
+                    "ORDER BY ts ASC",
+                    (cutoff,)
+                ).fetchall()
+        except Exception:
+            return [], []
+        n = len(all_rows)
+        if n < 20:
+            return [], []
+        # Stride so we get at most max_rows representative samples from full history
+        step = max(1, n // max_rows)
+        X, y = [], []
+        for i in range(0, n - 6, step):
+            ts, cpu, mem, swap, disk, therm, tier, tte = all_rows[i]
+            cpu = cpu or 0.0; mem = mem or 0.0; swap = swap or 0.0
+            disk = disk or 0.0; therm = therm or 100.0
+            tier = tier or 0;   tte = tte if tte and tte > 0 else -1.0
+            dt     = datetime.fromtimestamp(ts)
+            hr_sin = math.sin(dt.hour * 2 * math.pi / 24)
+            hr_cos = math.cos(dt.hour * 2 * math.pi / 24)
+            dw_sin = math.sin(dt.weekday() * 2 * math.pi / 7)
+            dw_cos = math.cos(dt.weekday() * 2 * math.pi / 7)
+            tte_n  = 1.0 - min(1.0, tte / 60.0) if tte > 0 else 0.0
+            xi = [cpu/100, mem/100, swap/100, disk/100, therm/100,
+                  tier/4, tte_n, hr_sin, hr_cos, dw_sin, dw_cos]
+            # Use the actual next 6 rows (60 s) as targets — always consecutive
+            future  = all_rows[i+1:i+7]
+            f_mems  = [r[2] or 0.0 for r in future]
+            f_cpus  = [r[1] or 0.0 for r in future]
+            f_tiers = [r[6] or 0   for r in future]
+            yi = [
+                (sum(f_mems) / len(f_mems)) / 100.0,
+                (sum(f_cpus) / len(f_cpus)) / 100.0,
+                1.0 if any(t >= 2 for t in f_tiers) else 0.0,
+            ]
+            X.append(xi); y.append(yi)
+        return X, y
+
+    def fetch_recent_window(self, n=12):
+        """
+        Return last n metric rows as raw feature vectors for NPA inference.
+        Each element: [cpu/100, mem/100, swap/100, disk/100, therm/100,
+                       tier/4, tte_norm, hr_sin, hr_cos, dow_sin, dow_cos]
+        """
+        if not self._ok:
+            return []
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT ts, cpu_pct, mem_pct, swap_pct, disk_pct, "
+                    "thermal_pct, eff_tier, tte_min FROM metrics "
+                    "ORDER BY ts DESC LIMIT ?", (n,)
+                ).fetchall()
+        except Exception:
+            return []
+        result = []
+        for ts, cpu, mem, swap, disk, therm, tier, tte in reversed(rows):
+            cpu = cpu or 0.0; mem = mem or 0.0; swap = swap or 0.0
+            disk = disk or 0.0; therm = therm or 100.0
+            tier = tier or 0;   tte = tte if tte and tte > 0 else -1.0
+            dt     = datetime.fromtimestamp(ts)
+            hr_sin = math.sin(dt.hour * 2 * math.pi / 24)
+            hr_cos = math.cos(dt.hour * 2 * math.pi / 24)
+            dw_sin = math.sin(dt.weekday() * 2 * math.pi / 7)
+            dw_cos = math.cos(dt.weekday() * 2 * math.pi / 7)
+            tte_n  = 1.0 - min(1.0, tte / 60.0) if tte > 0 else 0.0
+            result.append([cpu/100, mem/100, swap/100, disk/100, therm/100,
+                           tier/4, tte_n, hr_sin, hr_cos, dw_sin, dw_cos])
+        return result
 
 # ─── Thresholds & Patterns ────────────────────────────────────────────────────
 PROTECTED = {
@@ -541,6 +628,282 @@ CDA_EPOCHS           = 100    # gradient-descent epochs per training run
 CDA_LABEL_LEAK       = 50     # MB/min growth rate threshold → label "leak"
 CDA_LABEL_COMP_CPI   = 0.60   # CPI threshold → label "compressor_collapse"
 
+# ─── NPA — Neural Performance Analyzer ───────────────────────────────────────
+NPA_TRAIN_MIN_ROWS  = 150    # minimum training samples before model is used
+NPA_RETRAIN_COOL_S  = 21600  # retrain at most every 6 hours
+NPA_LR              = 0.002  # SGD learning rate
+NPA_EPOCHS          = 40     # SGD epochs per training run
+NPA_MAX_ROWS        = 600    # cap training set (keeps pure-Python SGD under ~3 s)
+
+
+class NeuralPerformanceAnalyzer:
+    """
+    3-layer MLP trained on the 90-day SQLite metric cache.
+    Architecture: 11 inputs → 12 hidden (ReLU) → 6 hidden (ReLU) → 3 outputs (sigmoid)
+
+    Inputs  (normalised): cpu, mem, swap, disk, thermal, tier, tte_norm,
+                          hr_sin, hr_cos, dow_sin, dow_cos
+    Outputs (0–1 range):  pred_mem_1h, pred_cpu_1h, anomaly_score
+
+    Pure Python — no external dependencies beyond the standard library.
+    Training via sample-wise SGD with MSE loss; ~2–3 s for 600 samples × 40 epochs.
+    """
+    N_IN = 11; N_H1 = 12; N_H2 = 6; N_OUT = 3
+
+    def __init__(self):
+        import random as _rnd
+        self._trained    = False
+        self._last_train = 0.0
+        self._last_pred  = [0.5, 0.3, 0.0]   # [mem, cpu, anomaly] — safe defaults
+        self._means      = [0.5] * self.N_IN
+        self._stds       = [1.0] * self.N_IN
+        # Xavier weight initialisation (seed fixed for reproducibility)
+        _rnd.seed(42)
+        def _xavier(fan_in, fan_out):
+            lim = math.sqrt(6.0 / (fan_in + fan_out))
+            return [[_rnd.uniform(-lim, lim) for _ in range(fan_out)]
+                    for _ in range(fan_in)]
+        self._W1 = _xavier(self.N_IN,  self.N_H1)   # 11 × 12
+        self._b1 = [0.0] * self.N_H1
+        self._W2 = _xavier(self.N_H1,  self.N_H2)   # 12 × 6
+        self._b2 = [0.0] * self.N_H2
+        self._W3 = _xavier(self.N_H2,  self.N_OUT)  # 6 × 3
+        self._b3 = [0.0] * self.N_OUT
+
+    # ── forward primitives ────────────────────────────────────────────────────
+    @staticmethod
+    def _relu(v):
+        return [max(0.0, x) for x in v]
+
+    @staticmethod
+    def _sig(v):
+        return [1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, x)))) for x in v]
+
+    def _dot_add(self, W, b, x):
+        n_out = len(b); n_in = len(x)
+        return [sum(W[j][k] * x[j] for j in range(n_in)) + b[k]
+                for k in range(n_out)]
+
+    def _forward(self, x):
+        """
+        Forward pass with mixed output activations:
+          outputs 0,1 (pred_mem, pred_cpu) — clipped linear in [0,1], avoids saturation
+          output  2   (anomaly)            — sigmoid, appropriate for 0/1 classification
+        Returns (h1, h2, out, raw_out) where raw_out is the pre-activation vector.
+        """
+        h1      = self._relu(self._dot_add(self._W1, self._b1, x))
+        h2      = self._relu(self._dot_add(self._W2, self._b2, h1))
+        raw_out = self._dot_add(self._W3, self._b3, h2)
+        out = [
+            max(0.0, min(1.0, raw_out[0])),          # pred_mem  — linear clipped
+            max(0.0, min(1.0, raw_out[1])),          # pred_cpu  — linear clipped
+            self._sig([raw_out[2]])[0],              # anomaly   — sigmoid
+        ]
+        return h1, h2, out, raw_out
+
+    # ── training ──────────────────────────────────────────────────────────────
+    def fit(self, X_raw, y_raw):
+        """SGD training on (X_raw, y_raw). Normalises features in-place."""
+        n = len(X_raw)
+        if n < NPA_TRAIN_MIN_ROWS:
+            return
+        nf = self.N_IN
+        # z-score normalisation
+        self._means = [sum(X_raw[i][j] for i in range(n)) / n for j in range(nf)]
+        self._stds  = [
+            max(math.sqrt(sum((X_raw[i][j] - self._means[j])**2 for i in range(n)) / n), 1e-6)
+            for j in range(nf)
+        ]
+        X = [[(X_raw[i][j] - self._means[j]) / self._stds[j] for j in range(nf)]
+             for i in range(n)]
+        lr = NPA_LR
+        for _ in range(NPA_EPOCHS):
+            for i in range(n):
+                xi = X[i]; yi = y_raw[i]
+                h1, h2, out, raw_out = self._forward(xi)
+                # Gradient w.r.t. pre-activation:
+                # mem/cpu (clipped linear): use out[k]-target so gradient stays in [-1,1]
+                # anomaly (sigmoid):        standard sigmoid-BCE gradient
+                anom_sig = out[2]
+                d_out = [
+                    out[0] - yi[0],
+                    out[1] - yi[1],
+                    (anom_sig - yi[2]) * anom_sig * (1.0 - anom_sig),
+                ]
+                # Snapshot W3 before update so d_h2 uses original weights
+                W3_snap = [[self._W3[j][k] for k in range(self.N_OUT)]
+                           for j in range(self.N_H2)]
+                # Backprop W3 / b3
+                for k in range(self.N_OUT):
+                    for j in range(self.N_H2):
+                        self._W3[j][k] -= lr * d_out[k] * h2[j]
+                    self._b3[k] -= lr * d_out[k]
+                # h2 delta (ReLU derivative) — uses pre-update W3
+                d_h2 = [
+                    (1.0 if h2[j] > 0 else 0.0) *
+                    sum(W3_snap[j][k] * d_out[k] for k in range(self.N_OUT))
+                    for j in range(self.N_H2)
+                ]
+                # Snapshot W2 before update so d_h1 uses original weights
+                W2_snap = [[self._W2[m][j] for j in range(self.N_H2)]
+                           for m in range(self.N_H1)]
+                for j in range(self.N_H2):
+                    for m in range(self.N_H1):
+                        self._W2[m][j] -= lr * d_h2[j] * h1[m]
+                    self._b2[j] -= lr * d_h2[j]
+                # h1 delta — uses pre-update W2
+                d_h1 = [
+                    (1.0 if h1[m] > 0 else 0.0) *
+                    sum(W2_snap[m][j] * d_h2[j] for j in range(self.N_H2))
+                    for m in range(self.N_H1)
+                ]
+                for m in range(self.N_H1):
+                    for f in range(nf):
+                        self._W1[f][m] -= lr * d_h1[m] * xi[f]
+                    self._b1[m] -= lr * d_h1[m]
+        self._trained    = True
+        self._last_train = time.time()
+
+    # ── inference ─────────────────────────────────────────────────────────────
+    def predict(self, row_raw):
+        """Forward pass on a single unnormalised feature vector."""
+        xi = [(row_raw[j] - self._means[j]) / self._stds[j] for j in range(self.N_IN)]
+        _, _, out, _ = self._forward(xi)
+        self._last_pred = out
+        return out   # [pred_mem, pred_cpu, anomaly]  — all in [0, 1]
+
+    def predict_from_rows(self, recent_rows):
+        """
+        Average predictions over up to 12 recent raw rows.
+        Returns [avg_pred_mem, avg_pred_cpu, max_anomaly].
+        Falls back to _last_pred when not yet trained.
+        """
+        if not self._trained or not recent_rows:
+            return self._last_pred
+        preds    = [self.predict(r) for r in recent_rows[-12:]]
+        avg_mem  = sum(p[0] for p in preds) / len(preds)
+        avg_cpu  = sum(p[1] for p in preds) / len(preds)
+        max_anom = max(p[2] for p in preds)
+        self._last_pred = [avg_mem, avg_cpu, max_anom]
+        return self._last_pred
+
+    # ── recommendations ───────────────────────────────────────────────────────
+    def generate_recommendations(self, pred, bot_state):
+        """
+        Combine NN predictions with live bot state to produce ranked,
+        plain-English recommendations for the user.
+
+        Returns a list of up to 5 dicts:
+          {priority, icon, title, detail, action, confidence}
+        Priority: 0=critical, 1=warning, 2=info, 3=tip, 4=all-clear
+        """
+        pred_mem = pred[0] * 100   # back to %
+        pred_cpu = pred[1] * 100
+        anomaly  = pred[2]
+        recs     = []
+        add      = recs.append
+
+        # 0. Critical — imminent RAM exhaustion
+        if pred_mem >= 90:
+            add({'priority': 0, 'icon': '🔴',
+                 'title': f'RAM will reach {pred_mem:.0f}% in ~60 min',
+                 'detail': 'Close the largest apps now before the bot has to intervene.',
+                 'action': 'Activity Monitor → sort by Memory → quit top apps',
+                 'confidence': round(min(1.0, (pred_mem - 85) / 15), 2)})
+        elif pred_mem >= 85:
+            add({'priority': 1, 'icon': '🟠',
+                 'title': f'Memory pressure building: {pred_mem:.0f}% forecast',
+                 'detail': 'AI predicts RAM will exceed 87% threshold within the hour.',
+                 'action': 'Pre-emptively close unused browser tabs and background apps',
+                 'confidence': round((pred_mem - 80) / 20, 2)})
+
+        # 1. Warning — anomalous usage pattern for this time of day
+        if anomaly >= 0.70:
+            hour = datetime.now().hour
+            add({'priority': 1, 'icon': '⚠️',
+                 'title': f'Unusual pattern detected ({anomaly:.0%} anomaly)',
+                 'detail': f'Resource usage is significantly above normal for {hour}:00.',
+                 'action': 'Check Activity Monitor for unexpected background processes',
+                 'confidence': round(anomaly, 2)})
+
+        # 1. Warning — active memory leaks (up to 2)
+        leak_pids = bot_state.get('leak_pids_list', [])
+        pid_names = {p[2]: p[3] for p in bot_state.get('top_procs', []) if len(p) > 3}
+        for pid in leak_pids[:2]:
+            name = pid_names.get(pid, f'PID {pid}')
+            add({'priority': 1, 'icon': '💧',
+                 'title': f'Memory leak: {name}',
+                 'detail': f'{name} is growing >50 MB/min. Restart it to reclaim RAM.',
+                 'action': f'Activity Monitor → select {name} → Force Quit (✕)',
+                 'confidence': 0.85})
+
+        # 1. Warning — thermal throttle
+        thermal = bot_state.get('thermal_pct', 100)
+        if thermal < 90:
+            add({'priority': 1, 'icon': '🌡️',
+                 'title': f'Thermal throttle active — CPU at {thermal}% speed',
+                 'detail': 'Your Mac is running hot and has reduced CPU clock speed.',
+                 'action': 'Elevate Mac for airflow or use an external cooling pad',
+                 'confidence': 0.95})
+
+        # 2. Info — high CPU predicted
+        if pred_cpu >= 75 and thermal >= 90:
+            add({'priority': 2, 'icon': '🔥',
+                 'title': f'High CPU forecast: {pred_cpu:.0f}%',
+                 'detail': 'AI expects sustained CPU load over the next hour.',
+                 'action': 'Defer Spotlight indexing, iCloud sync, or software updates',
+                 'confidence': round(min(1.0, (pred_cpu - 60) / 40), 2)})
+
+        # 2. Info — disk nearly full
+        disk = bot_state.get('disk_pct', 0)
+        if disk >= 88:
+            add({'priority': 2, 'icon': '💿',
+                 'title': f'Disk nearly full ({disk:.0f}%)',
+                 'detail': 'Low disk reduces swap space and can cause system slowdowns.',
+                 'action': 'Empty Trash · clear ~/Downloads · run "brew cleanup"',
+                 'confidence': 0.98})
+        elif disk >= 80:
+            add({'priority': 3, 'icon': '💿',
+                 'title': f'Disk at {disk:.0f}% — watch space',
+                 'detail': 'Under 20% free disk may affect virtual memory performance.',
+                 'action': 'Review ~/Library/Caches and remove large unused files',
+                 'confidence': 0.90})
+
+        # 3. Tip — circadian peak hour (from CMPE profile)
+        hour = datetime.now().hour
+        circ = bot_state.get('circadian_profile', {})
+        if circ:
+            cur_avg = circ.get(str(hour), 0) or circ.get(hour, 0) or 0
+            if cur_avg >= 83:
+                vals     = {h: circ.get(str(h), 100) or circ.get(h, 100) or 100 for h in range(24)}
+                next_low = min(range(24), key=lambda h: vals[h])
+                add({'priority': 3, 'icon': '🕐',
+                     'title': f'Peak usage hour: {hour}:00 (avg {cur_avg:.0f}% RAM)',
+                     'detail': f'Historical data shows high memory pressure at this time. '
+                               f'Off-peak: {next_low}:00.',
+                     'action': f'Schedule heavy tasks before {next_low}:00 tomorrow',
+                     'confidence': 0.75})
+
+        # 3. Tip — chronic RAM pressure → hardware upgrade
+        longterm = bot_state.get('longterm_avg_mem', 0)
+        if longterm >= 82 and pred_mem < 85:
+            add({'priority': 3, 'icon': '💾',
+                 'title': f'30-day avg RAM: {longterm:.0f}% — upgrade recommended',
+                 'detail': 'Your Mac is chronically memory-constrained over the past month.',
+                 'action': 'Consider a Mac with more unified memory on your next upgrade',
+                 'confidence': 0.90})
+
+        # 4. All clear
+        if not recs:
+            add({'priority': 4, 'icon': '✅',
+                 'title': 'System healthy — no action needed',
+                 'detail': f'AI forecasts {pred_mem:.0f}% RAM and {pred_cpu:.0f}% CPU next hour.',
+                 'action': 'Keep doing what you\'re doing',
+                 'confidence': round(max(0.0, 1.0 - anomaly), 2)})
+
+        recs.sort(key=lambda r: r['priority'])
+        return recs[:5]
+
 
 # ─── Bot Engine ───────────────────────────────────────────────────────────────
 class BotEngine(threading.Thread):
@@ -680,6 +1043,11 @@ class BotEngine(threading.Thread):
         self._cda_confidence: float = 0.0
         # Try to load existing CDA model at startup
         self._cda_load_model()
+        # ── NPA: Neural Performance Analyzer ──────────────────────────────────
+        self._npa             = NeuralPerformanceAnalyzer()
+        self._npa_recs: list  = []   # [{priority, icon, title, detail, action, confidence}]
+        self._npa_next_hour: dict = {}  # {mem: float, cpu: float, anomaly: float}
+        self._last_npa: float = 0.0
 
     # ── public ────────────────────────────────────────────────────────────────
     def stop(self):
@@ -780,6 +1148,10 @@ class BotEngine(threading.Thread):
                 "performance_score":    self.performance_score,
                 "longterm_avg_mem":     round(self.longterm_avg_mem, 1),
                 "leak_pids_list":       list(self._leak_pids),
+                # NPA — Neural Performance Analyzer
+                "npa_trained":          self._npa._trained,
+                "npa_next_hour":        dict(self._npa_next_hour),
+                "npa_recs":             list(self._npa_recs),
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
@@ -804,6 +1176,7 @@ class BotEngine(threading.Thread):
                     if tick % 60 == 0: self._check_thermal()                # 0.016 Hz — pmset subprocess
                     if tick % 60 == 0: self._check_zombies()
                     if tick % 60 == 0: self._track_memory_leaks()
+                    if tick % 60 == 0: self._run_npa()
                     if tick % IDLE_SWEEP_S == 0: self._sweep_idle_services()
                     if tick % APP_IDLE_CHECK_S == 0 and tick > 0: self._close_stale_apps()
                     if tick % 60  == 0: self._check_circadian_pressure()
@@ -1749,6 +2122,7 @@ class BotEngine(threading.Thread):
             vm = psutil.virtual_memory()
             self._emit("issue",
                 f"Kernel memory pressure: CRITICAL — system at {vm.percent:.0f}% RAM")
+        now = time.time()
         _ceo_cool = 300  # emit CEO warn at most once per 5 minutes
         if cpi >= CPI_TIER3:
             if now - self._ceo_warn_ts >= _ceo_cool:
@@ -1771,7 +2145,6 @@ class BotEngine(threading.Thread):
                     f"CEO: Compression efficiency degrading (CPI={cpi:.2f}) — "
                     f"purgeable headroom running low")
         # Ancestry is expensive; refresh at most every MEM_ANCESTRY_COOL_S
-        now = time.time()
         if now - self._last_ancestry >= MEM_ANCESTRY_COOL_S:
             self._last_ancestry = now
             ancestry = self._build_memory_ancestry()
@@ -2742,6 +3115,51 @@ class BotEngine(threading.Thread):
         self.causal_diagnosis = LABELS[label]
         self._cda_confidence  = 0.0
 
+    def _run_npa(self):
+        """
+        NPA — Neural Performance Analyzer.
+        Trains from the 90-day cache (every 6 h) using a pure-Python 3-layer MLP,
+        then infers next-hour RAM/CPU predictions and anomaly score from the most
+        recent 12 data rows. Results drive the AI Insights panel on the dashboard.
+        Runs entirely in the engine thread — no extra threading required.
+        """
+        now = time.time()
+        # ── train / retrain ────────────────────────────────────────────────────
+        should_train = (not self._npa._trained or
+                        now - self._npa._last_train >= NPA_RETRAIN_COOL_S)
+        if should_train:
+            X, y = self._cache.fetch_training_data(NPA_MAX_ROWS)
+            if len(X) >= NPA_TRAIN_MIN_ROWS:
+                self._npa.fit(X, y)
+                if self._npa._trained:
+                    self._emit("info",
+                        f"NPA: trained on {len(X)} samples — "
+                        f"next-hour forecast active", category="bot")
+        # ── inference ─────────────────────────────────────────────────────────
+        if not self._npa._trained:
+            return
+        recent = self._cache.fetch_recent_window(12)
+        if not recent:
+            return
+        pred = self._npa.predict_from_rows(recent)
+        with self._lock:
+            bot_state = {
+                'thermal_pct':       self.thermal_pct,
+                'leak_pids_list':    list(self._leak_pids),
+                'top_procs':         list(self.top_procs),
+                'longterm_avg_mem':  self.longterm_avg_mem,
+                'disk_pct':          self.disk_pct,
+                'circadian_profile': dict(self._circadian_profile),
+            }
+        recs = self._npa.generate_recommendations(pred, bot_state)
+        with self._lock:
+            self._npa_recs      = recs
+            self._npa_next_hour = {
+                'mem':     round(pred[0] * 100, 1),
+                'cpu':     round(pred[1] * 100, 1),
+                'anomaly': round(pred[2], 3),
+            }
+
 
 # ─── HTML Dashboard ───────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -3155,6 +3573,29 @@ HTML = r"""<!DOCTYPE html>
     border-radius:3px;padding:0 4px;font-size:8px;font-family:'SF Mono',monospace;
     color:var(--muted2);margin-left:4px;line-height:1.7;
   }
+  /* ── NPA AI Insights panel ── */
+  .npa-panel{margin:4px 4px 2px;border-radius:6px;border:1px solid var(--border);overflow:hidden}
+  .npa-hdr{display:flex;align-items:center;gap:6px;padding:6px 10px;
+    background:rgba(31,111,235,.07);border-bottom:1px solid var(--border)}
+  .npa-badge{font-size:8px;font-weight:700;letter-spacing:.05em;padding:1px 5px;
+    border-radius:3px;text-transform:uppercase}
+  .npa-badge-warm{background:rgba(228,179,65,.15);color:var(--orange)}
+  .npa-badge-on{background:rgba(63,185,80,.15);color:var(--green)}
+  .npa-fc{font-size:9px;color:var(--muted);margin-left:auto}
+  .npa-rec{display:flex;gap:8px;padding:6px 10px;border-bottom:1px solid var(--border);
+    align-items:flex-start}
+  .npa-rec:last-child{border-bottom:none}
+  .npa-ico{font-size:14px;flex-shrink:0;line-height:1.6}
+  .npa-body{flex:1;min-width:0}
+  .npa-ttl{font-size:10px;font-weight:700;color:var(--text);margin-bottom:2px}
+  .npa-det{font-size:9px;color:var(--muted);line-height:1.4;margin-bottom:2px}
+  .npa-act{font-size:9px;color:var(--blue);font-weight:600}
+  .npa-conf{font-size:8px;color:var(--muted2);margin-left:auto;flex-shrink:0;align-self:center}
+  .npa-p0{border-left:3px solid var(--red)}
+  .npa-p1{border-left:3px solid var(--orange)}
+  .npa-p2{border-left:3px solid var(--blue)}
+  .npa-p3{border-left:3px solid var(--muted2)}
+  .npa-p4{border-left:3px solid var(--green)}
 </style>
 </head>
 <body>
@@ -3374,6 +3815,24 @@ HTML = r"""<!DOCTYPE html>
       <div id="ramRecommendation" style="display:none;margin:4px 4px 2px;padding:6px 10px;
         border-radius:6px;border:1px solid rgba(88,166,255,.3);
         background:rgba(88,166,255,.06);font-size:10px;color:var(--blue)"></div>
+
+      <!-- ── NPA AI Insights ── -->
+      <div class="npa-panel">
+        <div class="npa-hdr">
+          <span style="font-size:10px;font-weight:700;color:var(--text)">🤖 AI Insights</span>
+          <span class="npa-badge npa-badge-warm" id="npaBadge">Warming Up</span>
+          <span class="npa-fc" id="npaFc">Next hour: — RAM · — CPU</span>
+        </div>
+        <div id="npaRecs">
+          <div class="npa-rec npa-p3">
+            <div class="npa-ico">⏳</div>
+            <div class="npa-body">
+              <div class="npa-ttl">Neural model training…</div>
+              <div class="npa-det">Needs ≥150 rows of history. Recommendations appear after first training run (tick 60).</div>
+            </div>
+          </div>
+        </div>
+      </div>
 
       <!-- Value Add card -->
       <div id="valueAddCard" style="margin:4px 4px 2px;padding:6px 10px;
@@ -3727,6 +4186,47 @@ function buildProcTable(procs, thrPids) {
   }).join('');
 }
 
+// ── NPA — render AI Insights panel ────────────────────────────────────────────
+function renderNpa(d) {
+  const recs    = d.npa_recs    || [];
+  const nh      = d.npa_next_hour || {};
+  const trained = d.npa_trained || false;
+  const badge   = document.getElementById('npaBadge');
+  const fc      = document.getElementById('npaFc');
+  const cont    = document.getElementById('npaRecs');
+  if (!badge || !cont) return;
+
+  badge.textContent = trained ? 'AI Active' : 'Warming Up';
+  badge.className   = 'npa-badge ' + (trained ? 'npa-badge-on' : 'npa-badge-warm');
+
+  if (nh.mem != null) {
+    const mc = nh.mem > 87 ? 'var(--red)' : nh.mem > 80 ? 'var(--orange)' : 'var(--mem)';
+    const cc = nh.cpu > 75 ? 'var(--orange)' : 'var(--cpu)';
+    fc.innerHTML =
+      'Next hour: <span style="color:'+mc+'">'+nh.mem.toFixed(0)+'% RAM</span>' +
+      ' · <span style="color:'+cc+'">'+nh.cpu.toFixed(0)+'% CPU</span>' +
+      (nh.anomaly > 0.5
+        ? ' · <span style="color:var(--red)">⚠ '+(nh.anomaly*100).toFixed(0)+'% anomaly</span>'
+        : '');
+  }
+
+  if (!recs.length) return;
+  const pc = ['npa-p0','npa-p1','npa-p2','npa-p3','npa-p4'];
+  cont.innerHTML = recs.map(r => {
+    const cls  = pc[Math.min(r.priority == null ? 3 : r.priority, 4)];
+    const conf = r.confidence != null ? Math.round(r.confidence * 100) + '%' : '';
+    return '<div class="npa-rec ' + cls + '">' +
+      '<div class="npa-ico">' + (r.icon || '·') + '</div>' +
+      '<div class="npa-body">' +
+        '<div class="npa-ttl">' + (r.title  || '') + '</div>' +
+        '<div class="npa-det">' + (r.detail || '') + '</div>' +
+        (r.action ? '<div class="npa-act">→ ' + r.action + '</div>' : '') +
+      '</div>' +
+      (conf ? '<div class="npa-conf">' + conf + '</div>' : '') +
+      '</div>';
+  }).join('');
+}
+
 // ── Expert / Simple mode ───────────────────────────────────────────────────────
 const EXPERT_ROW_IDS = ['vsAcnWeights','vsSigConf','vsPsmNext','vsCtreZone',
                         'vsEfficacy','vsAszm','vsFcModel','vsThermalCoupling',
@@ -3884,7 +4384,7 @@ async function poll() {
       document.getElementById('mSwapSub').textContent = (swapTotalGb*swap/100).toFixed(2)+' / '+swapTotalGb.toFixed(1)+' GB';
       document.getElementById('mDiskSub').textContent = d.disk_free_gb ? d.disk_free_gb.toFixed(1)+' GB free' : '—';
 
-      const iss=d.issues||0, freed=d.freed_mb||0;
+      const iss=d.issues||0, freed=d.freed_mb||0, act=d.actions||0;
       const va=d.value_add||{total:0,succeeded:0,success_rate:0,ram_saved_mb:0,
         pct_below_87:100,alltime_ram_saved_gb:0,alltime_best_save_mb:0,
         alltime_interventions:0,alltime_successes:0};
@@ -4221,6 +4721,7 @@ async function poll() {
       document.getElementById('thrNames').textContent=thrNames.join('\n');
 
       buildProcTable(d.top_procs||[], thrKeys.map(Number));
+      renderNpa(d);
       document.getElementById('lastUpdate').textContent='Last update: '+new Date().toLocaleTimeString();
     }
     (d.events||[]).forEach(ev=>addEvent(ev));

@@ -13,7 +13,7 @@
 |--------------------|-----------------------------------------------------|
 | **App Name**       | MAC Performance Bot                                 |
 | **Short Name**     | mac-perf-bot                                        |
-| **Version**        | 2.2.0                                               |
+| **Version**        | 2.3.0                                               |
 | **Owner**          | itsmeSugunakar                                      |
 | **Contact**        | sugun.sr@gmail.com                                  |
 | **Repository**     | https://github.com/itsmeSugunakar/MAC_Perf_BOT      |
@@ -49,6 +49,7 @@ A lightweight, always-on macOS daemon that:
 18. **Measures remediation efficacy** via Reinforcement Action Coordinator (RAC) — 30 s delayed outcome evaluation; RAM delta classified as success/failure and stored for RWA
 19. **Maintains a dynamic protection zone** via Adaptive Safety Zone Mapping (ASZM) — criticality-scored long-running system daemons are automatically elevated to the PROTECTED set
 20. **Diagnoses root causes** via Causal Diagnostic Agent (CDA) — rule-based or ONNX softmax classifier (normal / leak / compressor_collapse / cpu_collision); ONNX model auto-trains from 90-day cache after 200 labeled samples
+21. **Surfaces AI-driven recommendations** via the Neural Performance Analyzer (NPA) — a pure-Python 3-layer MLP (11→12→6→3) trained every 6 hours on a stratified sample of the full 30-day cache; predicts next-60-second RAM and CPU levels plus an anomaly score, then generates up to 5 prioritised plain-English recommendations displayed in the dashboard "AI Insights" panel
 
 ---
 
@@ -132,6 +133,7 @@ MAC_Perf_BOT/
 | 60 s | `_check_zombies()` | Zombie process detection |
 | 60 s | `_track_memory_leaks()` | Per-process RSS growth rate |
 | 60 s | `_check_circadian_pressure()` | CMPE hour-of-day profile refresh + proactive pre-freeze |
+| 60 s | `_run_npa()` | NPA inference — predict next-60s RAM/CPU + generate recommendations; trains from DB on first tick and every 6 h |
 | 60 s | `cache.flush()` + `cache.prune()` | Batch SQLite write + daily prune gate |
 | 300 s | `_check_caches()` | `~/Library/Caches` size warning |
 | 3600 s | `_analyse_app_predictions()` | 90-day cache risk analysis (daily gate inside) |
@@ -173,6 +175,7 @@ MAC_Perf_BOT/
 | **BRL**                          | `app/performance_gui.py` | `_update_brl()` + `_compute_brl_confidence()` — Bayesian posterior confidence for tier decisions |
 | **ASZM**                         | `app/performance_gui.py` | `_update_aszm()` — criticality scoring; adds long-lived low-CPU daemons to dynamic PROTECTED set |
 | **CDA**                          | `app/performance_gui.py` | `_diagnose_root_cause()` — rule-based or ONNX softmax: normal \| leak \| compressor_collapse \| cpu_collision |
+| **NPA**                          | `app/performance_gui.py` | `_run_npa()` + `NeuralPerformanceAnalyzer` class — 3-layer MLP trained on stratified 30-day cache sample; `fetch_training_data()` / `fetch_recent_window()` on `MetricsCache`; `generate_recommendations()` combines NN predictions with live bot state |
 
 ---
 
@@ -348,6 +351,27 @@ MAC_Perf_BOT/
 | `CDA_EPOCHS`           | 100         | Gradient-descent epochs per training run             |
 | `CDA_LABEL_LEAK`       | 50 MB/min   | Growth rate threshold to label a row as "leak"       |
 | `CDA_LABEL_COMP_CPI`   | 0.60        | CPI threshold to label a row as "compressor_collapse"|
+
+### NPA — Neural Performance Analyzer constants
+| Parameter              | Default  | Description                                                    |
+|------------------------|----------|----------------------------------------------------------------|
+| `NPA_TRAIN_MIN_ROWS`   | 150      | Minimum training samples before the model is used for inference|
+| `NPA_RETRAIN_COOL_S`   | 21600 s  | Retrain at most every 6 hours                                  |
+| `NPA_LR`               | 0.002    | SGD learning rate (low to prevent gradient explosion)          |
+| `NPA_EPOCHS`           | 40       | SGD epochs per training run                                    |
+| `NPA_MAX_ROWS`         | 600      | Maximum training samples (strided from full 30-day history)    |
+
+**NPA architecture:** 11 inputs → 12 hidden (ReLU) → 6 hidden (ReLU) → 3 outputs
+
+| Layer | Activation | Gradient | Purpose |
+|-------|-----------|----------|---------|
+| Output 0 (pred_mem) | Clipped linear `max(0, min(1, raw))` | `out − target` (bounded to [-1,1]) | Next-60s RAM forecast |
+| Output 1 (pred_cpu) | Clipped linear `max(0, min(1, raw))` | `out − target` (bounded to [-1,1]) | Next-60s CPU forecast |
+| Output 2 (anomaly)  | Sigmoid | `(out − target) × out × (1 − out)` | Anomaly score 0–1 |
+
+**Training data:** `fetch_training_data()` fetches **all** rows from the past 30 days and strides every N-th row to produce ≤600 stratified samples covering the full history. The `y` target for each sample uses the **actual next 6 consecutive rows** (60 s window) — not subsampled rows — so targets are always the true immediate future. Xavier weight init (seed 42) with z-score feature normalisation; means/stds stored on the model instance for inference.
+
+**Recommendation priorities:** 0 = critical (red), 1 = warning (orange), 2 = info (blue), 3 = tip (muted), 4 = all-clear (green). Triggers in priority order: pred_mem ≥ 90 % → critical; pred_mem ≥ 85 % / anomaly ≥ 0.70 / leak_pids / thermal throttle → warning; pred_cpu ≥ 75 % / disk ≥ 88 % → info; disk 80–88 % / circadian peak / longterm_avg ≥ 82 % → tip; nothing triggered → all-clear.
 
 To change a threshold, edit the constants at the top of `app/performance_gui.py`
 and reload the LaunchAgent (`scripts/install_gui.sh`).
@@ -541,7 +565,24 @@ Dashboard server listens on `http://127.0.0.1:8765`.
   "performance_score":    int,       // 0–100 daily score; -1 = warming up (<10 min data)
                                      // formula: 100 − (0.5×avg_mem + 0.3×avg_cpu + 0.2×avg_swap) 24h
   "longterm_avg_mem":     float,     // 30-day average RAM %; >80% triggers upgrade recommendation
-  "leak_pids_list":       [int]      // PIDs currently flagged as memory leaks
+  "leak_pids_list":       [int],     // PIDs currently flagged as memory leaks
+  // ── v2.3 NPA — Neural Performance Analyzer ────────────────────────────────
+  "npa_trained":          bool,      // true once the MLP has completed at least one training run
+  "npa_next_hour": {                 // NN predictions; empty {} until first training completes
+    "mem":     float,                // Predicted RAM % over next 60 s (0–100)
+    "cpu":     float,                // Predicted CPU % over next 60 s (0–100)
+    "anomaly": float                 // Anomaly score 0–1; > 0.70 triggers a warning recommendation
+  },
+  "npa_recs": [                      // Up to 5 ranked recommendations; empty [] until trained
+    {
+      "priority":   int,             // 0=critical 1=warning 2=info 3=tip 4=all-clear
+      "icon":       str,             // Emoji icon for the recommendation
+      "title":      str,             // Short headline
+      "detail":     str,             // Explanatory sentence
+      "action":     str,             // Actionable next step for the user
+      "confidence": float            // Model confidence 0–1
+    }
+  ]
 }
 ```
 
@@ -651,6 +692,10 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 | CDA ONNX optional | ONNX/onnxruntime are optional dependencies. Without them, CDA uses pure-Python weight inference (same model, no file serialisation). |
 | PSM Markov cold start | `_psm_predict()` returns current tier until `PSM_HISTORY` (20) tier transitions have been observed; predictions improve with uptime. |
 | RAC evaluation delay | Each remediation action's outcome is evaluated `RAC_EVAL_DELAY_S` (120 s) later. The delay was raised from 30 s to 120 s because the OS needs time to reclaim pages after a SIGSTOP, so shorter windows produced false negatives. |
+| NPA cold start | The "AI Insights" panel shows "Warming Up" until the first training run completes (requires ≥150 rows in the 30-day cache; typically fires on the very first 60-second tick given the existing 62K-row history). |
+| NPA prediction horizon | Outputs represent the average of the *next 60 seconds*, not the next hour — the label "AI Insights" describes the trend direction. The recommendation text is worded to avoid implying 60-minute precision. |
+| NPA training time | Fetching all 30-day rows (~62K) takes ~0.5 s; 600 samples × 40 epochs of pure-Python SGD takes ~2–3 s. Both run in the engine thread; no perceived dashboard lag because the engine sleeps 1 s/tick. |
+| NPA distribution shift | If the machine undergoes a sustained change in workload type (e.g., new always-on process), predictions drift until the next 6-hour retrain incorporates recent data. |
 
 ---
 
@@ -677,6 +722,7 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 | 2026-04-10 | 1.5.0   | itsmeSugunakar | 8 patent-level engine innovations: **MMAF** — 3-model adaptive forecaster (linear/quadratic/exponential, best-RSS selection); **CEO** — Compression Efficiency Oracle (CPI signal); **MSCEE** — 6-signal weighted quorum replaces 2-signal `max()` (signals: RAM %, TTE, kernel oracle, CPI, swap velocity, circadian); **GTS** — Graduated Thaw Sequencing (RSS-ascending SIGCONT, 2 s gap, RAM gate); **RVMS** — RSS Velocity Momentum Scorer (1×–2× freeze boost); **ATCE** — Adaptive Threshold Calibration Engine (hourly self-tuning from 30-day cache percentiles); **CMPE** — Circadian Memory Pattern Engine (hour-of-day SQL profile, proactive pre-freeze); **TMCP** — Thermal-Memory Coupling Predictor (EMA-learned TTE shortening under thermal throttle); `MetricsCache` schema extended with `thermal_pct` column (auto-migrates); 4 new dashboard vmrows (Forecast Model, CPI, Swap Velocity, Thermal Coupling); `/stats` extended with 6 new fields |
 | 2026-04-18 | 2.1.0   | itsmeSugunakar | **Product UX Layer** — 10 user-outcome improvements on top of the v2.0 engine: **Performance Score** (0–100 daily, `daily_performance_score()` from 24h SQLite); **Memory Paused** (accurate label for SIGSTOP — was "RAM Freed"); **Tier labels** renamed to user language (All Good / Watching / Intervening / Rescue Mode / Emergency); **Root Cause Banner** (plain-English, prominent, hidden when normal); **Simple/Expert mode** toggle (10 engine-telemetry rows hidden by default, `localStorage` persisted); **Activity Log filter** (`category="bot"` on calibration `_emit()` calls, "Bot Logs" toggle in titlebar); **7-Day History tab** (`hourly_history()` MetricsCache method, `/history` HTTP endpoint, Chart.js multi-line chart); **RAM Recommendation** (`longterm_avg_mem()` 30d query, advisory card when avg > 80%); **Leak hints** in process table (LEAK badge + 💡 Restart? for leak-flagged processes); **macOS Menu Bar** (`_start_menubar()` via `rumps`, daemon thread, optional); LaunchAgent path updated to `~/Documents/performance-bot/` |
 | 2026-04-26 | 2.2.0   | itsmeSugunakar | **Value-Add Metrics + Reliability Fixes** — **Achievement banner** replaces Actions/Issues cards in metric strip (Crises Averted / Total RAM Saved / Time Below 87% / Biggest Save); **`interventions_today()`** MetricsCache method aggregates today's and all-time remediation_outcomes; **`crises_averted`** session counter (RAC-confirmed rescues at tier ≥ 2); **`suspended_mb`** split from `freed_mb` — SIGSTOP RSS tracked separately from actual termination reclamation; **`RAC_EVAL_DELAY_S` 30 s → 120 s** to give OS time to reclaim pages post-SIGSTOP; **CEO collapse response** — CPI ≥ 0.75 AND RAM ≥ 80 % now triggers proactive daemon freeze; **`longterm_avg_mem`** pre-loaded from DB at startup (was 0.0 until first hourly update); **LaunchAgent `KeepAlive: true` + `ThrottleInterval: 30`** — bot now survives crashes/kills without 5-day gaps; **JS null-guard on `set()` helper** + **duplicate `const contain` SyntaxError fixed** (caused "no metrics showing" on dashboard); `/stats` extended with `suspended_mb`, `crises_averted`, `value_add` |
+| 2026-05-04 | 2.3.0   | itsmeSugunakar | **Neural Performance Analyzer (NPA)** — pure-Python 3-layer MLP (11→12→6→3, no external deps) trained every 6 h on a stratified stride-sample of the full 30-day SQLite cache; predicts next-60s RAM and CPU; anomaly score flags unusual hour-of-day patterns; `generate_recommendations()` produces up to 5 prioritised plain-English cards (critical / warning / info / tip / all-clear) shown in a new "AI Insights" panel on the dashboard; `MetricsCache.fetch_training_data()` fetches all 30-day rows and strides to ≤600 representative samples (fixes prior bug where only the oldest 11-minute burst was used); gradient uses post-clip output `out − target` (bounded [-1,1], prevents explosion); pre-update weight snapshots fix backprop correctness; LR reduced 0.008 → 0.002; `/stats` extended with `npa_trained`, `npa_next_hour`, `npa_recs` |
 | 2026-04-12 | 2.0.0   | itsmeSugunakar | **Autonomous Dynamic Resource Management Agent** — 11 new cognitive engines across a 5-layer governed control model: **SIE** — Signal Integrity Estimator (z-score anomaly confidence per signal); **MEG** — Model Ensemble Governance (meta-weight historical residuals over MMAF models); **ACN** — Adaptive Consensus Network (RWA-driven adaptive weights replace static MSCEE weights); **RWA** — Reinforcement-Weighted Arbitration (hourly EMA weight update from `remediation_outcomes` table); **CTRE** — Chronothermal Regression Engine (per-hour variance stability from 30-day cache); **AIP** — Ancestral Impact Propagation (family-tree RSS depth scoring + cascade risk detection); **RAC** — Reinforcement Action Coordinator (records and evaluates remediation outcomes via new SQLite table); **PSM** — Predictive State Machine (Markov next-tier prediction + dwell estimation); **BRL** — Bayesian Reasoning Layer (Beta prior tier-frequency + likelihood posterior confidence); **ASZM** — Adaptive Safety Zone Mapping (criticality scoring → dynamic `_dynamic_protected` set); **CDA** — Causal Diagnostic Agent (pure-Python softmax LR + optional ONNX export: normal \| leak \| compressor_collapse \| cpu_collision); new SQLite tables `remediation_outcomes` + `signal_weights` (auto-migrates existing DB); 8 new dashboard vmrows (Root Cause, BRL Confidence, ACN Weights, Signal Integrity, PSM Next Tier, CTRE Zone, Action Efficacy, ASZM Protected+); `/stats` extended with 10 new fields |
 
 ---
