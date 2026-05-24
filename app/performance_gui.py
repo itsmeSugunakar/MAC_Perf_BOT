@@ -3596,6 +3596,47 @@ HTML = r"""<!DOCTYPE html>
   .npa-p2{border-left:3px solid var(--blue)}
   .npa-p3{border-left:3px solid var(--muted2)}
   .npa-p4{border-left:3px solid var(--green)}
+
+  /* ── Summary tab ── */
+  .sum-wrap{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
+  .sum-hero-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;display:flex;align-items:center;gap:16px;flex-shrink:0}
+  .sum-score-block{display:flex;align-items:baseline;gap:2px;flex-shrink:0;width:88px;justify-content:center;flex-direction:column;align-items:center;padding:8px;border:3px solid var(--green);border-radius:50%;width:80px;height:80px;justify-content:center}
+  .sum-score-num{font-size:30px;font-weight:800;line-height:1;transition:color .3s}
+  .sum-score-denom{font-size:11px;color:var(--muted);font-weight:500;line-height:1}
+  .sum-hero-info{flex:1;min-width:0}
+  .sum-hero-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:5px}
+  .sum-hero-title{font-size:15px;font-weight:700;color:var(--text)}
+  .sum-hero-status{font-size:11px;color:var(--muted);line-height:1.5;margin-bottom:6px}
+  .sum-hero-pills{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+  .sum-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;flex-shrink:0}
+  .sum-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+  .sum-card-lbl{font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.55px;color:var(--muted);margin-bottom:3px}
+  .sum-card-val{font-size:22px;font-weight:700;line-height:1.1;transition:color .3s}
+  .sum-card-sub{font-size:9px;color:var(--muted);margin-top:2px}
+  .sum-issue-alert{background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.3);border-radius:8px;padding:10px 14px;flex-shrink:0;display:none}
+  .sum-issue-title{font-size:11px;font-weight:700;color:var(--red);margin-bottom:3px}
+  .sum-issue-action{font-size:10px;color:var(--muted)}
+  .sum-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;flex-shrink:0}
+  .sum-section-hdr{padding:8px 14px;border-bottom:1px solid var(--border);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.55px;color:var(--muted);display:flex;align-items:center}
+  .sum-bot-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border)}
+  .sum-bot-cell{background:var(--surface);padding:10px 14px}
+  .sum-bot-cell-lbl{font-size:9px;color:var(--muted);margin-bottom:3px}
+  .sum-bot-cell-val{font-size:18px;font-weight:700;transition:color .3s}
+  .sum-proc-row{display:flex;align-items:center;gap:10px;padding:6px 14px;border-bottom:1px solid var(--border);font-size:11px}
+  .sum-proc-row:last-child{border-bottom:none}
+  .sum-proc-name{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+  .sum-proc-bar-wrap{width:72px;flex-shrink:0}
+  .sum-proc-bar{height:4px;border-radius:2px;background:var(--border);overflow:hidden}
+  .sum-proc-bar-fill{height:100%;border-radius:2px;transition:width .5s}
+  .sum-proc-pct{font-family:'SF Mono',monospace;font-size:10px;color:var(--muted);flex-shrink:0;min-width:36px;text-align:right}
+
+  /* ── Admin tab ── */
+  .adm-wrap{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
+  .adm-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;flex-shrink:0}
+  .adm-section-hdr{padding:10px 14px;font-size:10px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;border-bottom:1px solid var(--border)}
+  .adm-section-hdr .vmchev{margin-left:auto}
+  .adm-vmrow{display:flex;justify-content:space-between;align-items:center;padding:5px 14px;font-size:10px;border-bottom:1px solid var(--border)}
+  .adm-vmrow:last-child{border:none}
 </style>
 </head>
 <body>
@@ -3620,8 +3661,8 @@ HTML = r"""<!DOCTYPE html>
     <span id="memPressurePill" class="pill">🧠 Normal</span>
   </div>
   <div class="tb-btns">
-    <button class="btn" id="expertBtn" onclick="toggleExpert()" title="Toggle expert engine telemetry">Simple</button>
-    <button class="btn" id="logFilterBtn" onclick="toggleBotLogs()" title="Show/hide bot calibration logs">Bot Logs: Off</button>
+    <button class="btn" id="expertBtn" style="display:none" onclick="toggleExpert()">Simple</button>
+    <button class="btn" id="logFilterBtn" style="display:none" onclick="toggleBotLogs()">Bot Logs: Off</button>
     <button class="btn" id="pauseBtn" onclick="togglePause()">Pause</button>
     <button class="btn" onclick="clearFeed()">Clear Log</button>
   </div>
@@ -3630,8 +3671,9 @@ HTML = r"""<!DOCTYPE html>
 <!-- ═══ Tab bar ══════════════════════════════════════════════════════════ -->
 <div style="display:flex;align-items:center;gap:4px;padding:4px 14px 0;
   background:var(--surface);border-bottom:1px solid var(--border)">
-  <button class="btn tab-btn tab-active" id="tabLive" onclick="showTab('live')">Live</button>
-  <button class="btn tab-btn" id="tabHistory" onclick="showTab('history')">7-Day History</button>
+  <button class="btn tab-btn tab-active" id="tabSummary" onclick="showTab('summary')">Summary</button>
+  <button class="btn tab-btn" id="tabLive" onclick="showTab('live')">Live</button>
+  <button class="btn tab-btn" id="tabAdmin" onclick="showTab('admin')">Admin</button>
   <span style="flex:1"></span>
   <!-- Performance Score (24h) -->
   <span id="scoreBanner" style="display:none;font-size:10px;color:var(--muted)">
@@ -3641,15 +3683,106 @@ HTML = r"""<!DOCTYPE html>
   </span>
 </div>
 
-<!-- ═══ History tab panel ═══════════════════════════════════════════════ -->
-<div id="panelHistory" style="display:none;padding:20px 16px;flex:1;overflow-y:auto">
-  <div style="font-size:12px;color:var(--text);font-weight:600;margin-bottom:10px">
-    7-Day Memory &amp; CPU Trend</div>
-  <div style="position:relative;height:180px;margin-bottom:16px">
-    <canvas id="histChart"></canvas>
+<!-- ═══ Summary tab panel ═══════════════════════════════════════════════ -->
+<div id="panelSummary" class="sum-wrap">
+
+  <!-- Health Hero -->
+  <div class="sum-hero-card">
+    <div class="sum-score-block" id="sumScoreBlock" style="border-color:var(--green)">
+      <span class="sum-score-num" id="sumScore" style="color:var(--green)">—</span>
+      <span class="sum-score-denom">/100</span>
+    </div>
+    <div class="sum-hero-info">
+      <div class="sum-hero-top">
+        <span class="sum-hero-title">System Health</span>
+        <span class="tier-badge t0" id="sumTierBadge"><div class="tier-dot"></div><span id="sumTierLabel">All Good</span></span>
+      </div>
+      <div class="sum-hero-status" id="sumStatusLine">Initializing…</div>
+      <div class="sum-hero-pills">
+        <span id="sumUptimePill" class="pill">⏱ 0s</span>
+        <span id="sumPowerPill"  class="pill">⚡ AC</span>
+        <span id="sumMemPressBadge" class="pill">🧠 Normal</span>
+        <span id="sumFcPill" class="mem-forecast fc-stable" style="font-size:10px;padding:2px 8px;border-radius:20px;border:1px solid var(--border)">✓ Stable</span>
+      </div>
+    </div>
   </div>
-  <div id="histStats" style="font-size:10px;color:var(--muted);line-height:1.8"></div>
-</div>
+
+  <!-- Quick Stats (4 cards) -->
+  <div class="sum-cards">
+    <div class="sum-card">
+      <div class="sum-card-lbl">Memory</div>
+      <div class="sum-card-val" id="sumRamVal" style="color:var(--mem)">—</div>
+      <div class="sum-card-sub" id="sumRamSub">— / — GB</div>
+    </div>
+    <div class="sum-card">
+      <div class="sum-card-lbl">CPU</div>
+      <div class="sum-card-val" id="sumCpuVal" style="color:var(--cpu)">—</div>
+      <div class="sum-card-sub">system-wide</div>
+    </div>
+    <div class="sum-card">
+      <div class="sum-card-lbl">Swap</div>
+      <div class="sum-card-val" id="sumSwapVal" style="color:var(--swap)">—</div>
+      <div class="sum-card-sub" id="sumSwapSubCard">— GB</div>
+    </div>
+    <div class="sum-card">
+      <div class="sum-card-lbl">Disk Free</div>
+      <div class="sum-card-val" id="sumDiskVal" style="color:var(--blue)">—</div>
+      <div class="sum-card-sub">available</div>
+    </div>
+  </div>
+
+  <!-- Issue Alert (shown when root cause is active) -->
+  <div id="sumIssueAlert" class="sum-issue-alert">
+    <div class="sum-issue-title" id="sumIssueTitle"></div>
+    <div class="sum-issue-action" id="sumIssueAction"></div>
+  </div>
+
+  <!-- AI Recommendations -->
+  <div class="sum-section">
+    <div class="sum-section-hdr">
+      🤖 AI Recommendations
+      <span class="npa-badge npa-badge-warm" id="sumNpaBadge" style="margin-left:6px">Warming Up</span>
+      <span class="npa-fc" id="sumNpaFc" style="margin-left:auto"></span>
+    </div>
+    <div id="sumNpaRecs">
+      <div class="npa-rec npa-p3">
+        <div class="npa-ico">⏳</div>
+        <div class="npa-body">
+          <div class="npa-ttl">Neural model training…</div>
+          <div class="npa-det">Needs ≥150 rows of history. Recommendations appear after first training run.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bot Activity Today -->
+  <div class="sum-section">
+    <div class="sum-section-hdr">Bot Activity — Today</div>
+    <div class="sum-bot-grid">
+      <div class="sum-bot-cell">
+        <div class="sum-bot-cell-lbl">Interventions</div>
+        <div class="sum-bot-cell-val" id="sumInterventions">—</div>
+      </div>
+      <div class="sum-bot-cell">
+        <div class="sum-bot-cell-lbl">RAM Freed</div>
+        <div class="sum-bot-cell-val" id="sumRamFreed" style="color:var(--green)">—</div>
+      </div>
+      <div class="sum-bot-cell">
+        <div class="sum-bot-cell-lbl">Success Rate</div>
+        <div class="sum-bot-cell-val" id="sumSuccessRate">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Top Memory Consumers -->
+  <div class="sum-section">
+    <div class="sum-section-hdr">Top Memory Consumers</div>
+    <div id="sumProcList">
+      <div style="padding:12px 14px;color:var(--muted);font-size:10px">Loading processes…</div>
+    </div>
+  </div>
+
+</div><!-- /panelSummary -->
 
 <!-- ═══ Metric strip ═════════════════════════════════════════════════════ -->
 <div id="panelLive" style="display:contents">
@@ -3887,123 +4020,6 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- vm detail rows -->
-      <div class="vmrow-section">
-        <div class="vmgroup-hdr" onclick="toggleVmGroup('vmg-system')">
-          <span class="section-title">System</span><span class="vmchev">▼</span>
-        </div>
-        <div id="vmg-system">
-        <div class="vmrow">
-          <span class="vmkey">Total RAM</span>
-          <span class="vmval" id="vsRam">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">Swap Used</span>
-          <span class="vmval" id="vsSwap" style="color:var(--swap)">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">Disk Free</span>
-          <span class="vmval" id="vsDisk" style="color:var(--blue)">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">Uptime</span>
-          <span class="vmval" id="vsUptime">—</span>
-        </div>
-        </div><!-- /vmg-system -->
-
-        <!-- Engine State group -->
-        <div class="vmgroup-hdr" onclick="toggleVmGroup('vmg-engine')" style="margin-top:4px">
-          <span class="section-title">Engine State</span><span class="vmchev">▼</span>
-        </div>
-        <div id="vmg-engine">
-        <div class="vmrow">
-          <span class="vmkey">Active Tier</span>
-          <span class="vmval" id="vsActiveTier" style="font-weight:700">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">CPU-RAM Lock</span>
-          <span class="vmval" id="vsCpuLock">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">XPC Blocked</span>
-          <span class="vmval" id="vsXpcBlocked">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">Frozen Daemons</span>
-          <span class="vmval" id="vsFrozen">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">Leak Alerts</span>
-          <span class="vmval" id="vsLeaks">—</span>
-        </div>
-        </div><!-- /vmg-engine -->
-
-        <!-- Forecast group -->
-        <div class="vmgroup-hdr" onclick="toggleVmGroup('vmg-forecast')" style="margin-top:4px">
-          <span class="section-title">Forecast</span><span class="vmchev">▼</span>
-        </div>
-        <div id="vmg-forecast">
-        <div class="vmrow">
-          <span class="vmkey">Forecast Model</span>
-          <span class="vmval" id="vsFcModel" style="color:var(--muted)">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">CPI (Compression)</span>
-          <span class="vmval" id="vsCpi">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">Swap Velocity</span>
-          <span class="vmval" id="vsSwapVel">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">Thermal Coupling</span>
-          <span class="vmval" id="vsThermalCoupling" style="color:var(--muted)">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">Cache (90d)</span>
-          <span class="vmval" id="vsCacheSize" style="color:var(--muted)">—</span>
-        </div>
-        </div><!-- /vmg-forecast -->
-
-        <!-- Intelligence group (expert rows) -->
-        <div class="vmgroup-hdr" onclick="toggleVmGroup('vmg-intel')" style="margin-top:4px">
-          <span class="section-title">Intelligence</span><span class="vmchev">▼</span>
-        </div>
-        <div id="vmg-intel">
-        <div class="vmrow">
-          <span class="vmkey">Root Cause</span>
-          <span class="vmval" id="vsRootCause" style="color:var(--muted)">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">BRL Confidence</span>
-          <span class="vmval" id="vsBrlConf" style="color:var(--muted)">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">ACN Weights</span>
-          <span class="vmval" id="vsAcnWeights" style="color:var(--muted);font-size:9px">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">Signal Integrity</span>
-          <span class="vmval" id="vsSigConf" style="font-size:9px">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">PSM Next Tier</span>
-          <span class="vmval" id="vsPsmNext" style="color:var(--muted)">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">CTRE Zone</span>
-          <span class="vmval" id="vsCtreZone" style="color:var(--muted)">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">Action Efficacy</span>
-          <span class="vmval" id="vsEfficacy" style="color:var(--muted);font-size:9px">—</span>
-        </div>
-        <div class="vmrow">
-          <span class="vmkey">ASZM Protected+</span>
-          <span class="vmval" id="vsAszm" style="color:var(--muted)">—</span>
-        </div>
-        </div><!-- /vmg-intel -->
-      </div><!-- /vmrow-section -->
 
       <!-- Memory Events mini-feed -->
       <div class="vmrow-section" style="flex-shrink:0;max-height:140px;overflow-y:auto">
@@ -4067,6 +4083,79 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div><!-- /body-wrap -->
 </div><!-- /panelLive -->
+
+<!-- ═══ Admin tab panel ════════════════════════════════════════════════ -->
+<div id="panelAdmin" class="adm-wrap" style="display:none">
+
+  <!-- Bot Controls -->
+  <div class="adm-section">
+    <div class="adm-section-hdr" style="cursor:default">Bot Controls</div>
+    <div style="padding:10px 14px;display:flex;gap:8px;flex-wrap:wrap;border-bottom:none">
+      <button class="btn" id="expertBtn2" onclick="toggleExpert()">Expert Mode: Off</button>
+      <button class="btn" id="logFilterBtn2" onclick="toggleBotLogs()">Bot Logs: Off</button>
+    </div>
+  </div>
+
+  <!-- System -->
+  <div class="adm-section">
+    <div class="adm-section-hdr" onclick="toggleAdmSection('admSystem')">System <span class="vmchev">▼</span></div>
+    <div id="admSystem">
+      <div class="adm-vmrow"><span class="vmkey">Total RAM</span><span class="vmval" id="vsRam">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">Swap Used</span><span class="vmval" id="vsSwap" style="color:var(--swap)">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">Disk Free</span><span class="vmval" id="vsDisk" style="color:var(--blue)">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">Uptime</span><span class="vmval" id="vsUptime">—</span></div>
+    </div>
+  </div>
+
+  <!-- Engine State -->
+  <div class="adm-section">
+    <div class="adm-section-hdr" onclick="toggleAdmSection('admEngineState')">Engine State <span class="vmchev">▼</span></div>
+    <div id="admEngineState">
+      <div class="adm-vmrow"><span class="vmkey">Active Tier</span><span class="vmval" id="vsActiveTier" style="font-weight:700">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">CPU-RAM Lock</span><span class="vmval" id="vsCpuLock">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">XPC Blocked</span><span class="vmval" id="vsXpcBlocked">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">Frozen Daemons</span><span class="vmval" id="vsFrozen">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">Leak Alerts</span><span class="vmval" id="vsLeaks">—</span></div>
+    </div>
+  </div>
+
+  <!-- Forecast -->
+  <div class="adm-section">
+    <div class="adm-section-hdr" onclick="toggleAdmSection('admForecast')">Forecast <span class="vmchev">▼</span></div>
+    <div id="admForecast">
+      <div class="adm-vmrow"><span class="vmkey">Forecast Model</span><span class="vmval" id="vsFcModel" style="color:var(--muted)">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">CPI (Compression)</span><span class="vmval" id="vsCpi">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">Swap Velocity</span><span class="vmval" id="vsSwapVel">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">Thermal Coupling</span><span class="vmval" id="vsThermalCoupling" style="color:var(--muted)">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">Cache (90d)</span><span class="vmval" id="vsCacheSize" style="color:var(--muted)">—</span></div>
+    </div>
+  </div>
+
+  <!-- Intelligence -->
+  <div class="adm-section">
+    <div class="adm-section-hdr" onclick="toggleAdmSection('admIntel')">Intelligence <span class="vmchev">▼</span></div>
+    <div id="admIntel">
+      <div class="adm-vmrow"><span class="vmkey">Root Cause</span><span class="vmval" id="vsRootCause" style="color:var(--muted)">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">BRL Confidence</span><span class="vmval" id="vsBrlConf" style="color:var(--muted)">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">ACN Weights</span><span class="vmval" id="vsAcnWeights" style="color:var(--muted);font-size:9px">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">Signal Integrity</span><span class="vmval" id="vsSigConf" style="font-size:9px">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">PSM Next Tier</span><span class="vmval" id="vsPsmNext" style="color:var(--muted)">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">CTRE Zone</span><span class="vmval" id="vsCtreZone" style="color:var(--muted)">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">Action Efficacy</span><span class="vmval" id="vsEfficacy" style="color:var(--muted);font-size:9px">—</span></div>
+      <div class="adm-vmrow"><span class="vmkey">ASZM Protected+</span><span class="vmval" id="vsAszm" style="color:var(--muted)">—</span></div>
+    </div>
+  </div>
+
+  <!-- 7-Day History -->
+  <div class="adm-section">
+    <div class="adm-section-hdr" onclick="toggleAdmSection('admHistory');if(!_histLoaded){loadHistory();_histLoaded=true;}">7-Day History <span class="vmchev" id="admHistChev">▶</span></div>
+    <div id="admHistory" style="display:none;padding:16px">
+      <div style="position:relative;height:180px;margin-bottom:12px"><canvas id="histChart"></canvas></div>
+      <div id="histStats" style="font-size:10px;color:var(--muted);line-height:1.8"></div>
+    </div>
+  </div>
+
+</div><!-- /panelAdmin -->
 
 <!-- ── Context menu ── -->
 <div id="ctxMenu">
@@ -4147,7 +4236,7 @@ function updateChart(chart, data) {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let evCnt=0, seenEvs=new Set(), paused=false, trendVisible=false;
+let evCnt=0, seenEvs=new Set(), paused=false, trendVisible=false, _histLoaded=false;
 let memTotalGb=0, swapTotalGb=0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -4239,26 +4328,30 @@ function applyExpertMode() {
               if (row) row.style.display = expertMode ? '' : 'none'; }
   });
   document.getElementById('expertBtn').textContent = expertMode ? 'Simple' : 'Expert';
+  const eb2=document.getElementById('expertBtn2');if(eb2)eb2.textContent=expertMode?'Expert Mode: On':'Expert Mode: Off';
 }
 function toggleExpert() { expertMode=!expertMode; localStorage.setItem('expertMode',expertMode); applyExpertMode(); }
 applyExpertMode();
+showTab('summary');
 
 // ── Bot log filter ─────────────────────────────────────────────────────────────
 let showBotLogs = false;
 function toggleBotLogs() {
   showBotLogs = !showBotLogs;
-  document.getElementById('logFilterBtn').textContent = 'Bot Logs: ' + (showBotLogs ? 'On' : 'Off');
+  const label = 'Bot Logs: ' + (showBotLogs ? 'On' : 'Off');
+  document.getElementById('logFilterBtn').textContent = label;
+  const lb2=document.getElementById('logFilterBtn2');if(lb2)lb2.textContent=label;
 }
 
 // ── Tab switching ──────────────────────────────────────────────────────────────
 let histChart = null;
 function showTab(name) {
-  const live = name === 'live';
-  document.getElementById('panelLive').style.display    = live ? 'contents' : 'none';
-  document.getElementById('panelHistory').style.display = live ? 'none' : 'block';
-  document.getElementById('tabLive').classList.toggle('tab-active', live);
-  document.getElementById('tabHistory').classList.toggle('tab-active', !live);
-  if (!live) loadHistory();
+  document.getElementById('panelSummary').style.display = name==='summary' ? ''         : 'none';
+  document.getElementById('panelLive').style.display    = name==='live'    ? 'contents' : 'none';
+  document.getElementById('panelAdmin').style.display   = name==='admin'   ? ''         : 'none';
+  document.getElementById('tabSummary').classList.toggle('tab-active', name==='summary');
+  document.getElementById('tabLive').classList.toggle('tab-active',    name==='live');
+  document.getElementById('tabAdmin').classList.toggle('tab-active',   name==='admin');
 }
 async function loadHistory() {
   try {
@@ -4338,6 +4431,140 @@ function togglePause() {
     btn.textContent='Pause'; btn.classList.remove('paused');
   }
   fetch('/pause?state='+(paused?'1':'0'));
+}
+
+// ── Summary tab renderer ──────────────────────────────────────────────────────
+function renderSummary(d) {
+  const cpu  = (d.cpu_hist  ||[]).at(-1)??0;
+  const mem  = (d.mem_hist  ||[]).at(-1)??0;
+  const swap = (d.swap_hist ||[]).at(-1)??0;
+  const disk = d.disk_pct??0;
+  const cpuC = colorFor(cpu,60,80,'var(--cpu)');
+  const memC = colorFor(mem,60,80,'var(--mem)');
+  const swpC = swap>50?'var(--yellow)':'var(--swap)';
+  const dskC = disk>90?'var(--red)':disk>80?'var(--yellow)':'var(--blue)';
+  const sv = (id,t,c) => { const e=document.getElementById(id); if(!e)return; e.textContent=t; if(c)e.style.color=c; };
+
+  // Quick stat cards
+  sv('sumRamVal',  mem.toFixed(0)+'%',  memC);
+  sv('sumRamSub',  (memTotalGb*mem/100).toFixed(1)+' / '+memTotalGb.toFixed(1)+' GB');
+  sv('sumCpuVal',  cpu.toFixed(0)+'%',  cpuC);
+  sv('sumSwapVal', swap.toFixed(0)+'%', swpC);
+  sv('sumSwapSubCard', (swapTotalGb*swap/100).toFixed(2)+' GB');
+  sv('sumDiskVal', d.disk_free_gb?d.disk_free_gb.toFixed(1)+' GB':'—', dskC);
+
+  // Status pills
+  sv('sumUptimePill', '⏱ '+fmtUp(d.uptime_s||0));
+  const ppEl=document.getElementById('sumPowerPill');
+  if(ppEl){ppEl.textContent=d.on_battery?'🔋 Battery':'⚡ AC';ppEl.className=d.on_battery?'pill on-battery':'pill';}
+  const mpl=d.mem_pressure_level||'normal';
+  const mpMap={normal:['🧠 Normal','pill'],warn:['🧠 Warn','pill mem-warn'],critical:['🧠 Critical','pill mem-critical']};
+  const [mpt,mpc]=mpMap[mpl]||mpMap.normal;
+  const mpbEl=document.getElementById('sumMemPressBadge');if(mpbEl){mpbEl.textContent=mpt;mpbEl.className=mpc;}
+
+  // Forecast pill
+  const fcPill=document.getElementById('sumFcPill');
+  const fc=d.mem_forecast_min??-1;
+  if(fcPill){
+    if(fc===0){fcPill.textContent='⚠ Memory exhausted';fcPill.className='mem-forecast fc-critical';}
+    else if(fc>0){fcPill.textContent='↑ ~'+fc+'m to 95%';fcPill.className='mem-forecast '+(fc<5?'fc-critical':fc<15?'fc-warn':'fc-stable');}
+    else{fcPill.textContent='✓ Stable';fcPill.className='mem-forecast fc-stable';}
+  }
+
+  // Health score + tier
+  const ps=d.performance_score, etier=d.effective_tier||0;
+  const tierLabels=['All Good','Watching','Intervening','Rescue Mode','Emergency'];
+  const tierColors=['var(--green)','var(--blue)','var(--yellow)','var(--orange)','var(--red)'];
+  const tc=tierColors[etier]||'var(--muted)';
+  if(ps!=null&&ps>=0){sv('sumScore',String(ps),tc);}
+  const sb=document.getElementById('sumScoreBlock');if(sb)sb.style.borderColor=tc;
+  const stb=document.getElementById('sumTierBadge');if(stb)stb.className='tier-badge t'+etier;
+  sv('sumTierLabel',tierLabels[etier]||('Tier '+etier));
+
+  // Plain-language status line
+  const statusLines=['Your Mac is running smoothly. No action needed.',
+    'Memory is being monitored. Everything under control.',
+    'The bot is actively managing memory pressure.',
+    'High memory pressure — bot in rescue mode.',
+    'Critical pressure. Emergency protocols active.'];
+  const rc=d.causal_diagnosis||'normal';
+  const rcExtra=rc==='leak'?' A memory leak was detected.'
+    :rc==='compressor_collapse'?' The memory compressor is overloaded.'
+    :rc==='cpu_collision'?' CPU and memory are competing.'
+    :'';
+  sv('sumStatusLine',(statusLines[etier]||'')+rcExtra);
+
+  // Issue alert banner
+  const iw=document.getElementById('sumIssueAlert');
+  const rcMap={
+    leak:['⚠ Memory Leak Detected','A process is growing without releasing memory. Check Top Memory Consumers below.'],
+    compressor_collapse:['⚠ Memory Compressor Overloaded','Your Mac is running out of room to compress inactive memory. Close unused apps.'],
+    cpu_collision:['⚠ CPU & Memory Competing','High CPU is competing with memory. The bot is throttling the top offender.'],
+  };
+  if(iw){
+    if(rcMap[rc]){
+      const [it,ia]=rcMap[rc];
+      sv('sumIssueTitle',it);sv('sumIssueAction',ia);
+      const itEl=document.getElementById('sumIssueTitle');if(itEl)itEl.style.color='var(--red)';
+      iw.style.display='block';
+    }else{iw.style.display='none';}
+  }
+
+  // AI Recommendations (top 3)
+  const recs=d.npa_recs||[], nh=d.npa_next_hour||{}, trained=d.npa_trained||false;
+  const snb=document.getElementById('sumNpaBadge');
+  if(snb){snb.textContent=trained?'AI Active':'Warming Up';snb.className='npa-badge '+(trained?'npa-badge-on':'npa-badge-warm');}
+  const sfc=document.getElementById('sumNpaFc');
+  if(sfc&&nh.mem!=null){
+    const mc2=nh.mem>87?'var(--red)':nh.mem>80?'var(--orange)':'var(--mem)';
+    const cc2=nh.cpu>75?'var(--orange)':'var(--cpu)';
+    sfc.innerHTML='Next hour: <span style="color:'+mc2+'">'+nh.mem.toFixed(0)+'% RAM</span> · <span style="color:'+cc2+'">'+nh.cpu.toFixed(0)+'% CPU</span>';
+  }
+  const sr=document.getElementById('sumNpaRecs');
+  if(sr&&recs.length){
+    const pc=['npa-p0','npa-p1','npa-p2','npa-p3','npa-p4'];
+    sr.innerHTML=recs.slice(0,3).map(r=>{
+      const cls=pc[Math.min(r.priority==null?3:r.priority,4)];
+      return '<div class="npa-rec '+cls+'"><div class="npa-ico">'+(r.icon||'·')+'</div>'+
+        '<div class="npa-body"><div class="npa-ttl">'+(r.title||'')+'</div>'+
+        '<div class="npa-det">'+(r.detail||'')+'</div>'+
+        (r.action?'<div class="npa-act">→ '+r.action+'</div>':'')+
+        '</div></div>';
+    }).join('');
+  }
+
+  // Bot activity
+  const va=d.value_add||{}, vaT=va.total||0, vaF=va.ram_saved_mb||0;
+  sv('sumInterventions',String(vaT),vaT>0?'var(--text)':'var(--muted)');
+  sv('sumRamFreed',vaF>0?(vaF>=1024?(vaF/1024).toFixed(1)+' GB':vaF.toFixed(0)+' MB'):'0 MB');
+  const vasr=va.success_rate;
+  sv('sumSuccessRate',vasr!=null&&vaT>0?(vasr*100).toFixed(0)+'%':'—',
+     vasr!=null&&vasr>=0.7?'var(--green)':vasr>=0.4?'var(--yellow)':'var(--muted)');
+
+  // Top memory consumers (simplified)
+  const procs=d.top_procs||[];
+  const spl=document.getElementById('sumProcList');
+  if(spl&&procs.length){
+    spl.innerHTML=procs.slice(0,6).map(([,m,pid,name])=>{
+      const mc3=m>=10?'var(--red)':m>=4?'var(--yellow)':'var(--mem)';
+      const bw=Math.min(m*8,100);
+      return '<div class="sum-proc-row">'+
+        '<div class="sum-proc-name">'+name+'</div>'+
+        '<div class="sum-proc-bar-wrap"><div class="sum-proc-bar">'+
+        '<div class="sum-proc-bar-fill" style="width:'+bw.toFixed(1)+'%;background:'+mc3+'"></div></div></div>'+
+        '<div class="sum-proc-pct" style="color:'+mc3+'">'+m.toFixed(1)+'%</div></div>';
+    }).join('');
+  }
+}
+
+// ── Collapsible admin sections ─────────────────────────────────────────────────
+function toggleAdmSection(id) {
+  const el=document.getElementById(id); if(!el) return;
+  const hdr=el.previousElementSibling;
+  const chev=hdr?hdr.querySelector('.vmchev'):null;
+  const collapsed=el.style.display==='none';
+  el.style.display=collapsed?'':'none';
+  if(chev) chev.style.transform=collapsed?'':'rotate(-90deg)';
 }
 
 // ── Poll loop ──────────────────────────────────────────────────────────────────
@@ -4722,6 +4949,7 @@ async function poll() {
 
       buildProcTable(d.top_procs||[], thrKeys.map(Number));
       renderNpa(d);
+      renderSummary(d);
       document.getElementById('lastUpdate').textContent='Last update: '+new Date().toLocaleTimeString();
     }
     (d.events||[]).forEach(ev=>addEvent(ev));
