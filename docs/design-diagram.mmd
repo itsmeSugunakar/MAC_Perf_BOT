@@ -1,107 +1,139 @@
-flowchart TD
-  LA[LaunchAgent\nlogin autostart] --> GUI[performance_gui.py]
+%%{init: {"theme": "base", "themeVariables": {"primaryColor": "#E8F4FD", "primaryTextColor": "#0D1117", "primaryBorderColor": "#1F6FEB", "lineColor": "#1F6FEB", "secondaryColor": "#FFF8E7", "tertiaryColor": "#F0FFF4", "clusterBkg": "#FAFBFC", "clusterBorder": "#D0D7DE", "edgeLabelBackground": "#FFFFFF", "fontFamily": "Segoe UI, Arial, sans-serif", "fontSize": "13px"}}}%%
+flowchart TB
 
-  subgraph APP[performance_gui.py Runtime]
-    BE[BotEngine\n1 s tick]
-    HTTP[HTTP Handler\n127.0.0.1:8765]
-
-    subgraph STORE[SQLite — 90-day Disk Cache]
-      DM[(metrics\n1 row per 10 s)]
-      DRO[(remediation_outcomes)]
-      DSW[(signal_weights)]
+    %% ═══════════════════════════════════════════════
+    %% EXTERNAL: Inputs
+    %% ═══════════════════════════════════════════════
+    subgraph SRC ["macOS System  ·  Signal Sources"]
+        direction LR
+        PS["psutil\nprocess_iter()\n1 Hz"]
+        SYS["sysctl\nkern.memorystatus\n5 s"]
+        VM["vm_stat\nVM anatomy\n5 s"]
+        PM["pmset\nthermal + power\n30–60 s"]
     end
 
-    BE -->|snapshot| HTTP
-    BE -->|cache.record + flush| DM
-    DM -->|aggregates| BE
-  end
+    LA["LaunchAgent\nLogin autostart\nKeepAlive · ThrottleInterval 30 s"]
 
-  subgraph OS[macOS Signals and Metrics]
-    PS[psutil.process_iter\n1 scan per second]
-    SYS[sysctl\nkern.memorystatus — 5 s]
-    VM[vm_stat\n5 s]
-    PM[pmset thermal / power\n30–60 s]
-  end
+    %% ═══════════════════════════════════════════════
+    %% PROCESSING CORE — BotEngine
+    %% ═══════════════════════════════════════════════
+    subgraph ENGINE ["BotEngine  ·  Autonomous 1 Hz Processing Loop  ·  performance_gui.py"]
+        direction TB
 
-  PS --> BE
-  SYS --> BE
-  VM --> BE
-  PM --> BE
+        %% ── Layer 1 ──────────────────────────────────
+        subgraph L1 ["Layer 1  ·  Signal Sensing"]
+            direction LR
+            SIE["SIE\nSignal Integrity Estimator\nz-score confidence per signal"]
+            MEG["MEG\nModel Ensemble Governance\nResidual meta-weighting (MMAF)"]
+        end
 
-  subgraph L1[Signal Processing Layer]
-    SIE[SIE — Signal Integrity Estimator\nz-score anomaly confidence per signal]
-    MEG[MEG — Model Ensemble Governance\nmeta-weight historical residuals over MMAF models]
-  end
+        %% ── Layer 2 ──────────────────────────────────
+        subgraph L2 ["Layer 2  ·  Predictive Modeling"]
+            direction LR
+            MMAF["MMAF\nMulti-Model Adaptive Forecaster\nLinear · Quadratic · Exponential\nBest-RSS model → TTE to 95 %"]
+            CEO["CEO\nCompression Efficiency Oracle\nCPI = compressed / (compressed + purgeable)"]
+            TMCP["TMCP\nThermal-Memory Coupling Predictor\nEMA-learned TTE shortening under throttle"]
+            CTRE["CTRE\nChronothermal Regression Engine\nHour-of-day × thermal OLS stability score"]
+            AIP["AIP\nAncestral Impact Propagation\nRecursive ppid-tree RSS depth scoring"]
+        end
 
-  subgraph L2[Forecasting and Pressure]
-    MMAF[MMAF — Multi-Model Adaptive Forecaster\nlinear + quadratic + exponential\nbest-RSS model wins — TTE to 95%]
-    CEO[CEO — Compression Efficiency Oracle\nCPI = compressed / compressed+purgeable]
-    TMCP[TMCP — Thermal-Memory Coupling Predictor\nEMA-learned thermal coeff — shortens TTE under throttle]
-    AIP[AIP — Ancestral Impact Propagation\nrecursive RSS depth scoring — cascade risk detection]
-  end
+        %% ── Layer 3 ──────────────────────────────────
+        subgraph L3 ["Layer 3  ·  Consensus  &  Decision"]
+            direction LR
+            ACN["ACN + MSCEE\nAdaptive Consensus Network\n6-signal RWA-weighted quorum\nEffective Tier 0 – 4  ·  Quorum ≥ 0.55"]
+            BRL["BRL\nBayesian Reasoning Layer\nBeta prior + posterior\nTier confidence 0 – 1"]
+            PSM["PSM\nPredictive State Machine\nMarkov chain over tier transitions\nNext tier + dwell prediction"]
+            RWA["RWA\nReinforcement-Weighted Arbitration\nHourly EMA weight updates\nfrom remediation outcomes"]
+        end
 
-  subgraph L3[Tier Decision Layer]
-    ACN[ACN / MSCEE — Adaptive Consensus Network\n6-signal RWA-weighted quorum — effective tier 0–4\nquorum threshold 0.55]
-    RWA[RWA — Reinforcement-Weighted Arbitration\nhourly EMA weight update from remediation_outcomes]
-    BRL[BRL — Bayesian Reasoning Layer\nBeta prior + likelihood posterior — tier confidence 0–1]
-    PSM[PSM — Predictive State Machine\nMarkov chain over tier transitions — next tier + dwell]
-  end
+        %% ── Layer 4 ──────────────────────────────────
+        subgraph L4 ["Layer 4  ·  Adaptive Calibration  &  AI"]
+            direction LR
+            ATCE["ATCE\nAdaptive Threshold Calibration Engine\n75th → T2  ·  85th → T3  ·  93rd → T4\nHourly self-tuning from 30-day cache"]
+            CMPE["CMPE\nCircadian Memory Pattern Engine\nHour-of-day SQL aggregate\nProactive pre-freeze on peak hours"]
+            NPA["NPA\nNeural Performance Analyzer\n3-layer MLP  11→12→6→3\nNext-60 s RAM + CPU + anomaly score\nRetrained every 6 h · Up to 5 AI recs"]
+        end
 
-  subgraph L4[Calibration Layer]
-    ATCE[ATCE — Adaptive Threshold Calibration Engine\nhourly self-tuning from 30-day cache percentiles\n75th → T2  85th → T3  93rd → T4]
-    CMPE[CMPE — Circadian Memory Pattern Engine\nhour-of-day SQL aggregate — proactive pre-freeze]
-    CTRE[CTRE — Chronothermal Regression Engine\nper-hour OLS variance stability score 0–1]
-  end
+        %% ── Layer 5 ──────────────────────────────────
+        subgraph L5 ["Layer 5  ·  Remediation  &  Reinforcement Learning"]
+            direction LR
+            RVMS["RVMS\nRSS Velocity Momentum Scorer\nVelocity boost 1 × – 2 × on freeze score"]
+            GTS["GTS\nGraduated Thaw Sequencer\nRSS-ascending SIGCONT\n2 s gap  ·  RAM-gate abort"]
+            ASZM["ASZM\nAdaptive Safety Zone Mapping\nCriticality scoring\nDynamic PROTECTED set"]
+            RAC["RAC\nReinforcement Action Coordinator\n120 s delayed outcome evaluation\nSuccess = RAM drop ≥ 2 %"]
+            XG["XPC Respawn Guard\nNo-kill blocklist\nlaunchd-managed services"]
+        end
 
-  subgraph L5[Remediation and Safety Layer]
-    RVMS[RVMS — RSS Velocity Momentum Scorer\nvelocity boost 1×–2× on freeze composite score]
-    GTS[GTS — Graduated Thaw Sequencer\nRSS-ascending SIGCONT — 2 s gap — RAM gate abort]
-    XG[XPC Respawn Guard\nno-kill blocklist for launchd-managed services]
-    ASZM[ASZM — Adaptive Safety Zone Mapping\ncriticality scoring — dynamic PROTECTED set]
-    RAC[RAC — Reinforcement Action Coordinator\n30 s delayed outcome evaluation — success / failure]
-  end
+        %% ── Layer 6 ──────────────────────────────────
+        subgraph L6 ["Layer 6  ·  Causal Intelligence"]
+            direction LR
+            CDA["CDA\nCausal Diagnostic Agent\nRule-based + ONNX softmax classifier\nnormal  ·  leak  ·  compressor_collapse  ·  cpu_collision\nAuto-trains from 90-day cache (200+ samples)"]
+        end
 
-  subgraph L6[Diagnostics Layer]
-    CDA[CDA — Causal Diagnostic Agent\nrule-based + optional ONNX softmax\nnormal, leak, compressor_collapse, cpu_collision]
-  end
+    end
 
-  BE --> SIE
-  BE --> MMAF
-  BE --> CEO
-  BE --> AIP
-  BE --> CDA
+    %% ═══════════════════════════════════════════════
+    %% STORAGE — SQLite 90-Day Cache
+    %% ═══════════════════════════════════════════════
+    subgraph STORE ["Persistent Storage  ·  SQLite  ·  ~/Library/Application Support/performance-bot/metrics.db"]
+        direction LR
+        DM[("metrics\n1 row / 10 s  ·  90-day rolling\n~8 640 rows/day  ·  35–45 MB max")]
+        DRO[("remediation_outcomes\nper-action tier · pre/post RAM\nsuccess/failure classification")]
+        DSW[("signal_weights\nACN weight snapshot history")]
+    end
 
-  MEG --> MMAF
-  TMCP --> MMAF
+    %% ═══════════════════════════════════════════════
+    %% SERVICE — HTTP on loopback
+    %% ═══════════════════════════════════════════════
+    subgraph SVC ["HTTP Service  ·  127.0.0.1:8765  ·  Loopback only"]
+        HTTP["HTTP Handler\nGET /              → HTML PWA\nGET /stats         → JSON snapshot  (< 12 KB)\nGET /history       → 7-day hourly aggregates\nGET /pause?state=  → engine control\nGET /manifest.json → PWA manifest"]
+    end
 
-  SIE -->|signal confidence| ACN
-  MMAF -->|TTE signal S2| ACN
-  CEO -->|CPI signal S4| ACN
-  RWA -->|adaptive weights| ACN
-  ATCE -->|calibrated thresholds| ACN
-  CMPE -->|circadian signal S6| ACN
-  CTRE -->|stability score| ACN
-  ASZM -->|dynamic PROTECTED set| ACN
+    %% ═══════════════════════════════════════════════
+    %% CLIENT — Browser Dashboard
+    %% ═══════════════════════════════════════════════
+    subgraph DASH ["Browser Dashboard  ·  Chart.js PWA  ·  Poll /stats every 1 s"]
+        direction LR
+        TAB1["Summary Tab  (default)\nHealth Score 0–100  ·  Active Tier\nRoot Cause banner  ·  AI Recommendations\nQuick-stat cards  ·  Top consumers"]
+        TAB2["Live Tab\nCPU + Swap 90 s sparklines\nMemory arc + composition\nProcess table + Activity log"]
+        TAB3["Admin Tab\nEngine vmrows (Simple / Expert)\nSystem · Engine State · Forecast\nIntelligence · 7-Day History"]
+    end
 
-  ACN -->|tier 3 freeze| RVMS
-  RVMS --> GTS
-  ACN --> XG
-  ACN --> PSM
-  ACN --> BRL
-  ACN -->|action taken| RAC
+    MB["macOS Menu Bar\nTier icon + RAM %\nOptional — requires rumps\nUpdates every 3 s via engine state"]
 
-  RAC -->|outcome record| DRO
-  DRO -->|accuracy history| RWA
-  DSW <-->|persist / restore| RWA
+    %% ═══════════════════════════════════════════════
+    %% EDGES — Inputs → Engine
+    %% ═══════════════════════════════════════════════
+    LA              -->|"start + keepalive restart"| ENGINE
+    PS              -->|"CPU · RAM · top procs · swap velocity"| ENGINE
+    SYS             -->|"kernel pressure oracle"| ENGINE
+    VM              -->|"wired · active · inactive · compressed · free"| ENGINE
+    PM              -->|"thermal throttle % · battery vs AC"| ENGINE
 
-  DM -->|30-day percentiles| ATCE
-  DM -->|hour-of-day avgs| CMPE
-  DM -->|throttled rows| TMCP
-  DM -->|hour × thermal rows| CTRE
-  DM -->|tier frequency| BRL
-  DM -->|uptime + CPU rows| ASZM
-  DM -->|MMAF residuals| MEG
+    %% ═══════════════════════════════════════════════
+    %% EDGES — Layer flows (within Engine)
+    %% ═══════════════════════════════════════════════
+    L1              -->|"signal confidence per metric"| L3
+    L2              -->|"TTE · CPI · thermal coupling · cascade risk"| L3
+    L3              -->|"effective tier + calibrated weights"| L5
+    L3              -->|"tier + raw signals"| L4
+    L3              -->|"causal trigger"| L6
+    L4              -->|"calibrated thresholds\ncircadian profile\nNPA recommendations"| L3
 
-  BR[Browser PWA v2.1\nChart.js — polls /stats every 1 s\nPerformance Score 0-100 · Tier labels user language\nRoot Cause Banner · RAM Recommendation\nSimple/Expert toggle · Activity Log filter\n7-Day History tab via /history] -->|GET / GET /stats GET /history| HTTP
-  HTTP -->|JSON snapshot + history| BR
-  MB[macOS Menu Bar\nrumps optional\ntier icon + RAM percent\nupdates every 3 s] --> BE
+    %% ═══════════════════════════════════════════════
+    %% EDGES — Storage reads / writes
+    %% ═══════════════════════════════════════════════
+    ENGINE          -->|"cache.record() every 10 s\ncache.flush() every 60 s"| DM
+    DM              -->|"30-day percentiles → ATCE\nhour-of-day avgs → CMPE\nMMEG residuals → MEG\nthermal rows → TMCP\nhour × thermal → CTRE\n30-day strides → NPA training\ntier frequency → BRL\nuptime rows → ASZM"| L4
+    DM              -->|"tier distribution → BRL"| L3
+    RAC             -->|"outcome record (tier · pre/post RAM · success)"| DRO
+    DRO             -->|"accuracy history per action"| RWA
+    DSW             <-->|"persist / restore"| RWA
+
+    %% ═══════════════════════════════════════════════
+    %% EDGES — Service
+    %% ═══════════════════════════════════════════════
+    ENGINE          -->|"snapshot() on every request"| HTTP
+    HTTP            -->|"JSON snapshot + 7-day history"| DASH
+    DASH            -->|"GET /stats every 1 s"| HTTP
+    MB              -->|"reads engine state every 3 s"| ENGINE

@@ -5,94 +5,139 @@
 > Standalone diagram files: [`design-diagram.mmd`](design-diagram.mmd) · [`design-diagram.png`](design-diagram.png)
 
 ```mermaid
-flowchart TD
-  LA[LaunchAgent\nlogin autostart] --> GUI[performance_gui.py]
+%%{init: {"theme": "base", "themeVariables": {"primaryColor": "#E8F4FD", "primaryTextColor": "#0D1117", "primaryBorderColor": "#1F6FEB", "lineColor": "#1F6FEB", "secondaryColor": "#FFF8E7", "tertiaryColor": "#F0FFF4", "clusterBkg": "#FAFBFC", "clusterBorder": "#D0D7DE", "edgeLabelBackground": "#FFFFFF", "fontFamily": "Segoe UI, Arial, sans-serif", "fontSize": "13px"}}}%%
+flowchart TB
 
-  subgraph APP[performance_gui.py Runtime]
-    BE[BotEngine\n1 second tick]
-    HTTP[HTTP Handler\n127.0.0.1:8765]
-    DB[(SQLite Metrics Cache\n90 days)]
+    %% ═══════════════════════════════════════════════
+    %% EXTERNAL: Inputs
+    %% ═══════════════════════════════════════════════
+    subgraph SRC ["macOS System  ·  Signal Sources"]
+        direction LR
+        PS["psutil\nprocess_iter()\n1 Hz"]
+        SYS["sysctl\nkern.memorystatus\n5 s"]
+        VM["vm_stat\nVM anatomy\n5 s"]
+        PM["pmset\nthermal + power\n30–60 s"]
+    end
 
-    BE -->|snapshot| HTTP
-    BE -->|cache.record + flush| DB
-    DB -->|aggregates| BE
-  end
+    LA["LaunchAgent\nLogin autostart\nKeepAlive · ThrottleInterval 30 s"]
 
-  subgraph OS[macOS Signals and Metrics]
-    PS[psutil.process_iter]
-    SYS[sysctl kern.memorystatus]
-    VM[vm_stat]
-    PM[pmset thermal and power]
-  end
+    %% ═══════════════════════════════════════════════
+    %% PROCESSING CORE — BotEngine
+    %% ═══════════════════════════════════════════════
+    subgraph ENGINE ["BotEngine  ·  Autonomous 1 Hz Processing Loop  ·  performance_gui.py"]
+        direction TB
 
-  PS --> BE
-  SYS --> BE
-  VM --> BE
-  PM --> BE
+        subgraph L1 ["Layer 1  ·  Signal Sensing"]
+            direction LR
+            SIE["SIE\nSignal Integrity Estimator\nz-score confidence per signal"]
+            MEG["MEG\nModel Ensemble Governance\nResidual meta-weighting (MMAF)"]
+        end
 
-  subgraph L1[Layer 1 — Signal Sensing]
-    SIE[SIE\nSignal Integrity Estimator\nz-score confidence per signal]
-  end
-  subgraph L2[Layer 2 — Model Layer]
-    MMAF[MMAF\n3-model adaptive forecaster\nlinear + quadratic + exponential]
-    MEG[MEG\nModel Ensemble Governance\nmeta-weight historical residuals]
-    CEO[CEO\nCompression Efficiency Oracle\nCPI signal]
-    TMCP[TMCP\nThermal-Memory Coupling\nEMA-learned TTE adjustment]
-    CTRE[CTRE\nChronothermal Regression\nhour × thermal stability]
-    AIP[AIP\nAncestral Impact Propagation\nfamily tree RSS scoring]
-  end
-  subgraph L3[Layer 3 — Consensus and Decision]
-    ACN[ACN\nAdaptive Consensus Network\nRWA-driven adaptive weights]
-    MSCEE[MSCEE\n6-signal weighted quorum\neffective tier 0 to 4]
-    PSM[PSM\nPredictive State Machine\nMarkov next-tier prediction]
-    BRL[BRL\nBayesian Reasoning Layer\nposterior tier confidence]
-  end
-  subgraph L4[Layer 4 — Action and Learning]
-    ATCE[ATCE\nAdaptive Threshold Calibration\nhourly self-tuning]
-    CMPE[CMPE\nCircadian Pattern Engine\nhour-of-day pre-freeze]
-    RVMS[RVMS\nRSS Velocity Scorer\nfreeze boost 1x to 2x]
-    GTS[GTS\nGraduated Thaw Sequencer\nRSS-ascending SIGCONT]
-    ASZM[ASZM\nAdaptive Safety Zone Mapping\ndynamic PROTECTED set]
-    RAC[RAC\nReinforcement Action Coordinator\noutcome recording]
-    RWA[RWA\nReinforcement-Weighted Arbitration\nweight updates from outcomes]
-    XG[XPC Respawn Guard\nno-kill blocklist]
-  end
-  subgraph L5[Layer 5 — Causal Intelligence]
-    CDA[CDA\nCausal Diagnostic Agent\nrule-based or ONNX softmax\nnormal, leak, compressor_collapse, cpu_collision]
-  end
+        subgraph L2 ["Layer 2  ·  Predictive Modeling"]
+            direction LR
+            MMAF["MMAF\nMulti-Model Adaptive Forecaster\nLinear · Quadratic · Exponential\nBest-RSS model → TTE to 95 %"]
+            CEO["CEO\nCompression Efficiency Oracle\nCPI = compressed / (compressed + purgeable)"]
+            TMCP["TMCP\nThermal-Memory Coupling Predictor\nEMA-learned TTE shortening under throttle"]
+            CTRE["CTRE\nChronothermal Regression Engine\nHour-of-day × thermal OLS stability score"]
+            AIP["AIP\nAncestral Impact Propagation\nRecursive ppid-tree RSS depth scoring"]
+        end
 
-  BE --> SIE
-  SIE --> ACN
-  BE --> MMAF
-  BE --> CEO
-  MMAF --> MEG
-  MEG --> ACN
-  CEO --> ACN
-  TMCP --> MMAF
-  CTRE --> ACN
-  AIP --> ACN
-  ACN --> MSCEE
-  ATCE --> MSCEE
-  CMPE --> MSCEE
-  MSCEE --> PSM
-  MSCEE --> BRL
-  MSCEE -->|tier 3| RVMS
-  RVMS --> GTS
-  MSCEE --> ASZM
-  MSCEE --> RAC
-  RAC --> RWA
-  RWA --> ACN
-  MSCEE --> XG
-  MSCEE --> CDA
-  DB -->|30-day percentiles| ATCE
-  DB -->|hour-of-day avgs| CMPE
-  DB -->|throttled rows| TMCP
-  DB -->|tier distribution| BRL
-  DB -->|outcome history| RWA
-  DB -->|training data| CDA
+        subgraph L3 ["Layer 3  ·  Consensus  &  Decision"]
+            direction LR
+            ACN["ACN + MSCEE\nAdaptive Consensus Network\n6-signal RWA-weighted quorum\nEffective Tier 0 – 4  ·  Quorum ≥ 0.55"]
+            BRL["BRL\nBayesian Reasoning Layer\nBeta prior + posterior\nTier confidence 0 – 1"]
+            PSM["PSM\nPredictive State Machine\nMarkov chain over tier transitions\nNext tier + dwell prediction"]
+            RWA["RWA\nReinforcement-Weighted Arbitration\nHourly EMA weight updates\nfrom remediation outcomes"]
+        end
 
-  BR[Browser PWA\nChart.js dashboard] -->|GET / and GET /stats| HTTP
-  HTTP -->|JSON metrics| BR
+        subgraph L4 ["Layer 4  ·  Adaptive Calibration  &  AI"]
+            direction LR
+            ATCE["ATCE\nAdaptive Threshold Calibration Engine\n75th → T2  ·  85th → T3  ·  93rd → T4\nHourly self-tuning from 30-day cache"]
+            CMPE["CMPE\nCircadian Memory Pattern Engine\nHour-of-day SQL aggregate\nProactive pre-freeze on peak hours"]
+            NPA["NPA\nNeural Performance Analyzer\n3-layer MLP  11→12→6→3\nNext-60 s RAM + CPU + anomaly score\nRetrained every 6 h · Up to 5 AI recs"]
+        end
+
+        subgraph L5 ["Layer 5  ·  Remediation  &  Reinforcement Learning"]
+            direction LR
+            RVMS["RVMS\nRSS Velocity Momentum Scorer\nVelocity boost 1 × – 2 × on freeze score"]
+            GTS["GTS\nGraduated Thaw Sequencer\nRSS-ascending SIGCONT\n2 s gap  ·  RAM-gate abort"]
+            ASZM["ASZM\nAdaptive Safety Zone Mapping\nCriticality scoring\nDynamic PROTECTED set"]
+            RAC["RAC\nReinforcement Action Coordinator\n120 s delayed outcome evaluation\nSuccess = RAM drop ≥ 2 %"]
+            XG["XPC Respawn Guard\nNo-kill blocklist\nlaunchd-managed services"]
+        end
+
+        subgraph L6 ["Layer 6  ·  Causal Intelligence"]
+            direction LR
+            CDA["CDA\nCausal Diagnostic Agent\nRule-based + ONNX softmax classifier\nnormal  ·  leak  ·  compressor_collapse  ·  cpu_collision\nAuto-trains from 90-day cache (200+ samples)"]
+        end
+
+    end
+
+    %% ═══════════════════════════════════════════════
+    %% STORAGE — SQLite 90-Day Cache
+    %% ═══════════════════════════════════════════════
+    subgraph STORE ["Persistent Storage  ·  SQLite  ·  ~/Library/Application Support/performance-bot/metrics.db"]
+        direction LR
+        DM[("metrics\n1 row / 10 s  ·  90-day rolling\n~8 640 rows/day  ·  35–45 MB max")]
+        DRO[("remediation_outcomes\nper-action tier · pre/post RAM\nsuccess/failure classification")]
+        DSW[("signal_weights\nACN weight snapshot history")]
+    end
+
+    %% ═══════════════════════════════════════════════
+    %% SERVICE — HTTP on loopback
+    %% ═══════════════════════════════════════════════
+    subgraph SVC ["HTTP Service  ·  127.0.0.1:8765  ·  Loopback only"]
+        HTTP["HTTP Handler\nGET /              → HTML PWA\nGET /stats         → JSON snapshot  (< 12 KB)\nGET /history       → 7-day hourly aggregates\nGET /pause?state=  → engine control\nGET /manifest.json → PWA manifest"]
+    end
+
+    %% ═══════════════════════════════════════════════
+    %% CLIENT — Browser Dashboard
+    %% ═══════════════════════════════════════════════
+    subgraph DASH ["Browser Dashboard  ·  Chart.js PWA  ·  Poll /stats every 1 s"]
+        direction LR
+        TAB1["Summary Tab  (default)\nHealth Score 0–100  ·  Active Tier\nRoot Cause banner  ·  AI Recommendations\nQuick-stat cards  ·  Top consumers"]
+        TAB2["Live Tab\nCPU + Swap 90 s sparklines\nMemory arc + composition\nProcess table + Activity log"]
+        TAB3["Admin Tab\nEngine vmrows (Simple / Expert)\nSystem · Engine State · Forecast\nIntelligence · 7-Day History"]
+    end
+
+    MB["macOS Menu Bar\nTier icon + RAM %\nOptional — requires rumps\nUpdates every 3 s via engine state"]
+
+    %% ═══════════════════════════════════════════════
+    %% EDGES — Inputs → Engine
+    %% ═══════════════════════════════════════════════
+    LA              -->|"start + keepalive restart"| ENGINE
+    PS              -->|"CPU · RAM · top procs · swap velocity"| ENGINE
+    SYS             -->|"kernel pressure oracle"| ENGINE
+    VM              -->|"wired · active · inactive · compressed · free"| ENGINE
+    PM              -->|"thermal throttle % · battery vs AC"| ENGINE
+
+    %% ═══════════════════════════════════════════════
+    %% EDGES — Layer flows (within Engine)
+    %% ═══════════════════════════════════════════════
+    L1              -->|"signal confidence per metric"| L3
+    L2              -->|"TTE · CPI · thermal coupling · cascade risk"| L3
+    L3              -->|"effective tier + calibrated weights"| L5
+    L3              -->|"tier + raw signals"| L4
+    L3              -->|"causal trigger"| L6
+    L4              -->|"calibrated thresholds\ncircadian profile\nNPA recommendations"| L3
+
+    %% ═══════════════════════════════════════════════
+    %% EDGES — Storage reads / writes
+    %% ═══════════════════════════════════════════════
+    ENGINE          -->|"cache.record() every 10 s\ncache.flush() every 60 s"| DM
+    DM              -->|"30-day percentiles → ATCE\nhour-of-day avgs → CMPE\nMMEG residuals → MEG\nthermal rows → TMCP\nhour × thermal → CTRE\n30-day strides → NPA training\ntier frequency → BRL\nuptime rows → ASZM"| L4
+    DM              -->|"tier distribution → BRL"| L3
+    RAC             -->|"outcome record (tier · pre/post RAM · success)"| DRO
+    DRO             -->|"accuracy history per action"| RWA
+    DSW             <-->|"persist / restore"| RWA
+
+    %% ═══════════════════════════════════════════════
+    %% EDGES — Service
+    %% ═══════════════════════════════════════════════
+    ENGINE          -->|"snapshot() on every request"| HTTP
+    HTTP            -->|"JSON snapshot + 7-day history"| DASH
+    DASH            -->|"GET /stats every 1 s"| HTTP
+    MB              -->|"reads engine state every 3 s"| ENGINE
 ```
 
 ## Data Flow
@@ -148,9 +193,18 @@ BotEngine (background thread, 1 Hz)
       │   ├── performance_score (int)            ← 0–100 daily score; -1 = warming up (<10 min data)
       │   │                                         formula: 100 − (0.5×avg_mem + 0.3×avg_cpu + 0.2×avg_swap)
       │   │                                         refreshed every 5 min from MetricsCache
-      │   ├── longterm_avg_mem (float)           ← 30-day average RAM %; drives upgrade recommendation
+      │   ├── longterm_avg_mem (float)           ← 30-day average RAM %; pre-loaded from DB at startup;
+      │   │                                         drives upgrade recommendation
       │   └── _leak_pids (set[int])              ← PIDs currently flagged as memory leaks;
       │                                             kept in sync with _warned_leaks by _track_memory_leaks()
+      │
+      ├── v2.2 Value-add metrics
+      │   ├── freed_mb (float)                   ← MB reclaimed by actual process termination only
+      │   ├── suspended_mb (float)               ← MB of SIGSTOP'd processes (RSS held, not freed)
+      │   ├── crises_averted (int)               ← session count: RAC-confirmed rescues (tier ≥ 2,
+      │   │                                         delta_pct ≥ 2 %) incremented in _evaluate_rac_outcomes()
+      │   └── value_add (dict)                   ← interventions_today() snapshot: today + all-time
+      │                                             remediation_outcomes aggregates
       │
       └── MetricsCache (disk)
           └── ~/Library/Application Support/performance-bot/metrics.db
@@ -184,6 +238,7 @@ BotEngine (background thread, 1 Hz)
             ├── Tab bar           — Live | 7-Day History tabs              [v2.1]
             ├── Performance Score — 0–100 headline metric in tab bar         [v2.1]
             ├── Metric strip      — ring gauges: CPU / MEM / Swap / Disk
+            │   + Achievement banner: Crises Averted / Total RAM Saved / Time <87% / Biggest Save  [v2.2]
             ├── Root Cause Banner — prominent plain-English alert when non-normal [v2.1]
             ├── RAM Recommendation — "add RAM" advisory when 30d avg > 80%   [v2.1]
             ├── Memory Intelligence panel — arc gauge, vm_stat breakdown,
@@ -488,6 +543,10 @@ Analysis methods (all run aggregate SQL — zero raw rows loaded into Python):
   daily_performance_score(24h)   → int 0–100; -1 if < 60 rows  [v2.1]
   longterm_avg_mem(30d)          → float avg RAM %; 0.0 if < 100 rows  [v2.1]
   hourly_history(7d)             → [{hour, mem, cpu, swap}] for /history  [v2.1]
+  interventions_today()          → {total, succeeded, success_rate, ram_saved_mb,  [v2.2]
+                                    pct_below_87, alltime_interventions,
+                                    alltime_success_rate, alltime_ram_saved_gb,
+                                    alltime_best_save_mb}
   record_outcome(...)            → RAC outcome INSERT
   query_signal_accuracy(sig, 24h)→ float success rate for RWA
   query_tier_distribution(30d)   → {tier: count} for BRL

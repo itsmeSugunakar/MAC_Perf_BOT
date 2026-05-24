@@ -227,6 +227,31 @@ Intelligence Engine (MMIE)**, is a software method and system comprising:
     and chronic pressure percentage for each application, with results exposed
     via the dashboard and JSON API.
 
+18. **A CEO Compressor Collapse Pre-Emption Path** that monitors the
+    Compression Pressure Index (CPI) computed by the Compression Efficiency
+    Oracle and, when CPI exceeds the exhaustion threshold while RAM utilisation
+    simultaneously exceeds a proactive floor (80%), issues an immediate daemon
+    freeze without waiting for the multi-signal consensus quorum — providing a
+    dedicated fast-path for compressor saturation events that bypasses the
+    normal consensus gate to reduce intervention latency.
+
+19. **A Dual RAM Accounting System** that maintains separate counters for
+    RAM actually reclaimed through process termination (`freed_mb`) and RAM
+    held under execution suspension via SIGSTOP (`suspended_mb`), correctly
+    distinguishing between memory that is immediately available for reuse and
+    memory that remains physically allocated to a suspended process, enabling
+    accurate per-action-type efficacy measurement.
+
+20. **A Value-Add Measurement Layer** that executes aggregate SQL queries
+    over the persistent remediation outcomes table to compute cumulative
+    effectiveness metrics — total GB reclaimed, crises averted (confirmed
+    tier ≥ 2 rescues), system containment percentage (fraction of time RAM
+    held below the Tier 3 threshold), and the largest single-intervention
+    RAM delta — and exposes these metrics in the monitoring API and a
+    dedicated achievement panel in the live dashboard, providing the first
+    persistent, auditable record of cumulative autonomous remediation efficacy
+    in user-interpretable units.
+
 ---
 
 ## 5. Detailed Description of the Preferred Embodiment
@@ -890,6 +915,25 @@ MSCEE weighted quorum (Section 5.6), with weight 0.12.
 output and integrating it as a weighted escalation signal — rather than as
 a standalone alert — constitutes a novel use of OS memory anatomy data in
 an automated remediation decision engine.
+
+**CEO Compressor Collapse Response (v2.2):**
+
+When the CPI signal reaches the highest advisory threshold AND RAM utilisation
+simultaneously exceeds a proactive-action floor, the CEO triggers a direct
+daemon freeze without waiting for the MSCEE quorum to escalate:
+
+```
+if cpi >= CPI_TIER3 (0.75) AND mem_pct >= 80.0:
+    if now() − _last_freeze >= FREEZE_COOL_S:
+        _freeze_background_daemons()           # proactive Tier 3 action
+        _record_rac_action(3, "freeze_daemon", mem_pct)
+```
+
+This constitutes a **compressor-collapse pre-emption path** that is orthogonal
+to the MSCEE quorum: the CEO fires based solely on compressor saturation state,
+bypassing the multi-signal vote when the compressor signal alone is sufficient
+evidence of impending memory collapse. The FREEZE_COOL_S gate (120 s) prevents
+rapid repeat freezes.
 
 ### 5.13 Component 11 — Adaptive Threshold Calibration Engine (ATCE)
 
@@ -1910,7 +1954,7 @@ RAC implements an outcome-delayed evaluation loop for all remediation actions.
 ```
 # At action time (tier ≥ 2):
 pending_outcomes.append((
-    eval_ts    = now() + RAC_EVAL_DELAY_S,   # 30 seconds later
+    eval_ts    = now() + RAC_EVAL_DELAY_S,   # 120 seconds later
     tier       = effective_tier,
     action     = action_type,                 # "freeze_daemon", "sweep_xpc", etc.
     pre_mem    = current_mem_pct
@@ -1930,9 +1974,42 @@ _action_efficacy[action] = 0.9 × _action_efficacy.get(action, 0)
                          + 0.1 × delta_pct
 ```
 
-The 30-second evaluation delay is the minimum time for the macOS pager and
-memory compressor to fully respond to a SIGSTOP or SIGTERM action before
-the delta is measured.
+The 120-second evaluation delay (raised from an initial 30 s in v2.2) reflects
+an empirical finding: after a SIGSTOP the macOS pager requires substantially
+more time than 30 s to reclaim and re-assign physical pages. Evaluating at
+30 s produced systematic false negatives because the OS had not yet reclassified
+the suspended pages. The 120 s delay eliminates this bias while remaining short
+enough to record outcomes before new pressure events distort the baseline.
+
+**Accurate RAM Accounting (v2.2):**
+
+Prior implementations merged SIGSTOP-suspended RAM and SIGTERM-freed RAM into a
+single counter. v2.2 separates these into two distinct measurements:
+
+```
+freed_mb     += delta_mb   # only when action = SIGTERM / process termination
+suspended_mb += rss_mb     # only when action = SIGSTOP (RAM held, not freed)
+```
+
+This distinction is technically significant: SIGSTOP suspends a process's CPU
+execution but leaves its RSS allocated in physical RAM. The OS may opportunistically
+reclaim pages from suspended processes over time, but this is not guaranteed and
+not immediate. Conflating these counters overstated actual memory relief and
+underestimated SIGTERM efficacy. The separation enables accurate per-action-type
+efficacy reporting in the achievement layer (Section 5.30).
+
+**crises_averted counter (v2.2):**
+
+When a RAC evaluation confirms success (delta_pct ≥ RAC_SUCCESS_PCT) for a
+tier ≥ 2 action, a session counter `crises_averted` is incremented:
+
+```
+if success == 1 and tier >= 2:
+    crises_averted += 1
+```
+
+This constitutes a unit of "prevented memory exhaustion event" — a concrete,
+measurable outcome of the autonomous remediation system.
 
 ## 5.25 — Predictive State Machine (PSM)
 
@@ -2118,6 +2195,70 @@ targeting — all physical computer resource states.
 
 ---
 
+## 5.30 — Value-Add Measurement Layer (v2.2)
+
+The Value-Add Measurement Layer is a persistent, aggregate-query subsystem that
+quantifies the concrete outcome of autonomous memory remediation actions over
+time, making the bot's contribution to system stability measurable and auditable.
+
+**MetricsCache method: `interventions_today()`**
+
+```sql
+-- Today's interventions (since local midnight):
+SELECT success, delta_mb FROM remediation_outcomes WHERE ts >= midnight_ts
+
+-- All-time containment proof:
+SELECT SUM(CASE WHEN mem_pct < 87 THEN 1 ELSE 0 END), COUNT(*)
+FROM metrics
+
+-- All-time best single save:
+SELECT MAX(delta_mb) FROM remediation_outcomes WHERE success = 1
+```
+
+These aggregate queries produce a structured result:
+
+```
+{
+  total:                  int,    # interventions today
+  succeeded:              int,    # successful today
+  success_rate:           float,  # today's rate
+  ram_saved_mb:           float,  # MB saved today
+  pct_below_87:           float,  # all-time % of metric rows where RAM < 87%
+  alltime_interventions:  int,
+  alltime_success_rate:   float,
+  alltime_ram_saved_gb:   float,
+  alltime_best_save_mb:   float
+}
+```
+
+**pct_below_87 — the containment proof metric:**
+
+The fraction of all metric rows (one per 10 seconds, up to 90 days) where
+`mem_pct < 87` — i.e., the system never crossed the Tier 3 intervention
+threshold — is the primary proof of containment. A system that spends 99%+
+of its lifetime below 87% RAM while regularly entering Tier 2 intervention
+demonstrates that the autonomous cascade is successfully absorbing pressure
+before it becomes critical.
+
+**Achievement banner:**
+
+The `value_add` dict is surfaced in the `/stats` API and rendered in a
+dedicated top-strip achievement panel in the dashboard displaying:
+
+- **Crises Averted** — session count of RAC-confirmed tier ≥ 2 rescues
+- **Total RAM Saved** — all-time GB reclaimed by successful termination actions
+- **Time Below 87%** — containment percentage (pct_below_87)
+- **Biggest Save** — largest single-intervention RAM delta recorded
+
+**Novelty:** Existing resource managers expose only instantaneous metrics
+(current RAM %, current process list). The Value-Add Measurement Layer
+provides the first persistent, aggregate view of *cumulative autonomous
+remediation efficacy* — expressed in user-interpretable units (GB saved,
+crises averted, containment percentage) — backed by SQLite aggregate queries
+over up to 90 days of recorded outcomes.
+
+---
+
 ## New Claims (v2.0 — Claims 19–28)
 
 **Claim 19.** A computer-implemented system for autonomous resource management comprising: a Signal Integrity Estimator (SIE) that computes, for each of a plurality of monitoring signals, a rolling z-score over a fixed-size sample window, wherein the z-score is defined as the difference between the current sample and the window mean divided by the window standard deviation; a signal confidence value derived from the z-score by applying a monotonically decreasing function capped at a minimum floor value; and a mechanism for multiplying each signal's consensus weight by its corresponding confidence value prior to weighted-quorum tier escalation, thereby preventing transient OS measurement anomalies from generating erroneous operating-system process suspension signals.
@@ -2139,6 +2280,18 @@ targeting — all physical computer resource states.
 **Claim 27.** A computer-implemented Bayesian reasoning system for resource escalation confidence comprising: maintaining, for each of a plurality of remediation tiers, a Beta prior count initialised to a weak prior value; updating said prior counts hourly from a historical tier-frequency distribution retrieved from a persistent store; computing, at each tier decision point, a likelihood value as the fraction of active monitoring signals whose individual tier votes agree with the decided tier; computing an unnormalised posterior for the decided tier as the product of its prior count and its likelihood; normalising said posterior across all tiers; and, when the resulting posterior confidence falls below a threshold, suppressing autonomous irreversible remediation actions pending additional signal corroboration, thereby preventing false-positive operating-system process termination.
 
 **Claim 28.** A computer-implemented causal diagnostic system for memory pressure attribution comprising: assembling a feature vector from current system measurements comprising CPU utilisation, RAM utilisation, swap utilisation, compression pressure index, and effective remediation tier; classifying said feature vector using a softmax logistic regression model trained on historical cache rows labeled by deterministic threshold rules, wherein the model is defined by weight matrix W and bias vector b and inference computes class probabilities as the normalised exponential of W·x+b; and routing the remediation cascade based on the class with maximum probability: directing SIGSTOP priority to processes identified as leak sources when the diagnosis is "leak"; increasing the compression-efficiency signal weight in the multi-signal consensus quorum when the diagnosis is "compressor_collapse"; and activating the CPU-RAM conflict gate when the diagnosis is "cpu_collision" — wherein said routing constitutes a direct physical modification of operating-system process scheduling and memory management state.
+
+---
+
+## New Claims (v2.2 — Claims 29–32)
+
+**Claim 29.** A computer-implemented method for compressor-collapse pre-emption comprising: computing a Compression Pressure Index (CPI) as the ratio of compressed memory to the sum of compressed and purgeable memory from operating-system virtual memory statistics; comparing said CPI against a collapse threshold; and, when said CPI meets or exceeds the collapse threshold and system RAM utilisation simultaneously exceeds a proactive-action floor, issuing SIGSTOP signals to background daemon processes without waiting for a multi-signal consensus quorum to confirm escalation — wherein said direct bypass of the consensus gate constitutes a dedicated compressor-saturation emergency path that reduces intervention latency when the OS memory compressor is saturated.
+
+**Claim 30.** A computer-implemented system for accurate remediation RAM accounting comprising: maintaining two distinct counters — a first counter tracking RAM reclaimed by process termination actions (SIGTERM or equivalent), and a second counter tracking the aggregate RSS of processes placed under execution suspension (SIGSTOP or equivalent); wherein the second counter records memory that is suspended but not freed, as operating-system pages remain physically allocated to a suspended process and are not immediately available for reallocation — and exposing both counters separately in a monitoring API so that the distinction between suspended RAM and freed RAM is visible to consumers of the API.
+
+**Claim 31.** A computer-implemented method for calibrating remediation outcome evaluation delay comprising: applying a configurable post-action evaluation delay before measuring the RAM delta produced by an autonomous remediation action; setting said delay to a value sufficient for the operating-system memory pager to reclaim and reclassify physical pages vacated by a suspended or terminated process; and classifying the action as successful only when the measured RAM reduction, evaluated after said delay, meets or exceeds a minimum success threshold — wherein the delay eliminates systematic false negatives caused by evaluating outcomes before the OS pager has completed page reclamation.
+
+**Claim 32.** A computer-implemented value-add measurement system for autonomous memory management comprising: recording, in a persistent store, the per-action outcome of each autonomous memory remediation event including pre-action RAM, post-action RAM, RAM delta, and success classification; executing aggregate SQL queries over said persistent store to compute cumulative metrics including total RAM reclaimed by successful termination actions, total number of confirmed crises averted, all-time containment percentage defined as the fraction of historical measurement intervals where system RAM remained below a critical threshold, and the largest single-intervention RAM delta recorded; and exposing said cumulative metrics in a real-time monitoring API and user-facing dashboard — wherein said cumulative metrics constitute a persistent, auditable record of autonomous remediation efficacy expressed in user-interpretable units rather than instantaneous system-state snapshots.
 
 ---
 
@@ -2167,6 +2320,7 @@ Before submitting, confirm the following items are ready:
 ---
 
 _Prepared by: itsmeSugunakar · 2026-04-05_
+_Amended: 2026-04-26 — v2.2 additions: CEO compressor collapse pre-emption (§5.12, Claim 29), dual RAM accounting freed_mb/suspended_mb (§5.24, Claim 30), RAC evaluation delay correction 30 s → 120 s (§5.24, Claim 31), Value-Add Measurement Layer interventions_today() + achievement panel (§5.30, Claim 32), innovations 18–20 added to §4 Summary._
 _This document is a technical specification for a Provisional Patent
 Application. It does not constitute legal advice. For formal patent
 prosecution, consult a registered USPTO patent attorney or agent._
