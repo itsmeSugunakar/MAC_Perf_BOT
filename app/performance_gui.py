@@ -362,6 +362,25 @@ class MetricsCache:
                     "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_successes": 0,
                     "alltime_success_rate": 0.0, "alltime_ram_saved_gb": 0.0, "alltime_best_save_mb": 0.0}
 
+    def recent_outcomes(self, n: int = 5) -> list:
+        """Return the n most recent remediation outcomes (newest first)."""
+        if not self._ok:
+            return []
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT ts, tier, action, pre_mem, post_mem, delta_mb, success "
+                    "FROM remediation_outcomes ORDER BY ts DESC LIMIT ?", (n,)
+                ).fetchall()
+            return [
+                {"ts": r[0], "tier": r[1], "action": r[2],
+                 "pre_mem": r[3], "post_mem": r[4],
+                 "delta_mb": round(r[5] or 0, 0), "success": bool(r[6])}
+                for r in rows
+            ]
+        except Exception:
+            return []
+
     def query_signal_accuracy(self, signal: str, hours: int = 24) -> float:
         """
         Return fraction of outcomes in last `hours` hours where `signal` voted high
@@ -803,19 +822,42 @@ class NeuralPerformanceAnalyzer:
         recs     = []
         add      = recs.append
 
+        # Throttled process info (injected by _run_npa from self.throttled)
+        throttled_names = bot_state.get('throttled_names', [])
+        throttled_pids  = bot_state.get('throttled_pids',  [])
+
+        # 0-pre. TTE velocity — fires when memory isn't critical yet but closing fast
+        tte = bot_state.get('tte_min', -1)
+        if 0 < tte < 15 and pred_mem < 90:
+            add({'priority': 1, 'icon': '⏱',
+                 'title': f'Memory filling fast — ~{tte:.0f} min to danger zone',
+                 'detail': f'At current rate RAM will hit 95% in about {tte:.0f} minutes.',
+                 'action': 'Close browser tabs and background apps now to avoid slowdown.',
+                 'confidence': round(float(pred[2]), 2),
+                 'pid': None, 'action_type': None})
+        elif 15 <= tte < 30 and pred_mem >= 80:
+            add({'priority': 2, 'icon': '⏳',
+                 'title': f'Steady memory growth — ~{tte:.0f} min runway',
+                 'detail': 'No immediate action needed, but keep an eye on it.',
+                 'action': 'Wrap up heavy tasks before the buffer runs out.',
+                 'confidence': round(float(pred[2]), 2),
+                 'pid': None, 'action_type': None})
+
         # 0. Critical — imminent RAM exhaustion
         if pred_mem >= 90:
             add({'priority': 0, 'icon': '🔴',
                  'title': f'RAM will reach {pred_mem:.0f}% in ~60 min',
                  'detail': 'Close the largest apps now before the bot has to intervene.',
                  'action': 'Activity Monitor → sort by Memory → quit top apps',
-                 'confidence': round(min(1.0, (pred_mem - 85) / 15), 2)})
+                 'confidence': round(min(1.0, (pred_mem - 85) / 15), 2),
+                 'pid': None, 'action_type': 'remediate'})
         elif pred_mem >= 85:
             add({'priority': 1, 'icon': '🟠',
                  'title': f'Memory pressure building: {pred_mem:.0f}% forecast',
                  'detail': 'AI predicts RAM will exceed 87% threshold within the hour.',
                  'action': 'Pre-emptively close unused browser tabs and background apps',
-                 'confidence': round((pred_mem - 80) / 20, 2)})
+                 'confidence': round((pred_mem - 80) / 20, 2),
+                 'pid': None, 'action_type': 'remediate'})
 
         # 1. Warning — anomalous usage pattern for this time of day
         if anomaly >= 0.70:
@@ -824,7 +866,8 @@ class NeuralPerformanceAnalyzer:
                  'title': f'Unusual pattern detected ({anomaly:.0%} anomaly)',
                  'detail': f'Resource usage is significantly above normal for {hour}:00.',
                  'action': 'Check Activity Monitor for unexpected background processes',
-                 'confidence': round(anomaly, 2)})
+                 'confidence': round(anomaly, 2),
+                 'pid': None, 'action_type': None})
 
         # 1. Warning — active memory leaks (up to 2)
         leak_pids = bot_state.get('leak_pids_list', [])
@@ -833,9 +876,10 @@ class NeuralPerformanceAnalyzer:
             name = pid_names.get(pid, f'PID {pid}')
             add({'priority': 1, 'icon': '💧',
                  'title': f'Memory leak: {name}',
-                 'detail': f'{name} is growing >50 MB/min. Restart it to reclaim RAM.',
-                 'action': f'Activity Monitor → select {name} → Force Quit (✕)',
-                 'confidence': 0.85})
+                 'detail': f'{name} is growing >50 MB/min. Freeze it to pause the growth.',
+                 'action': f'Freeze {name} to pause it — the bot will resume it when safe',
+                 'confidence': 0.85,
+                 'pid': pid, 'action_type': 'freeze'})
 
         # 1. Warning — thermal throttle
         thermal = bot_state.get('thermal_pct', 100)
@@ -844,15 +888,21 @@ class NeuralPerformanceAnalyzer:
                  'title': f'Thermal throttle active — CPU at {thermal}% speed',
                  'detail': 'Your Mac is running hot and has reduced CPU clock speed.',
                  'action': 'Elevate Mac for airflow or use an external cooling pad',
-                 'confidence': 0.95})
+                 'confidence': 0.95,
+                 'pid': None, 'action_type': None})
 
         # 2. Info — high CPU predicted
         if pred_cpu >= 75 and thermal >= 90:
+            cpu_name = throttled_names[0] if throttled_names else None
+            cpu_pid  = throttled_pids[0]  if throttled_pids  else None
             add({'priority': 2, 'icon': '🔥',
-                 'title': f'High CPU forecast: {pred_cpu:.0f}%',
+                 'title': (f'CPU spike — {cpu_name} using heavy resources'
+                           if cpu_name else f'High CPU forecast: {pred_cpu:.0f}%'),
                  'detail': 'AI expects sustained CPU load over the next hour.',
-                 'action': 'Defer Spotlight indexing, iCloud sync, or software updates',
-                 'confidence': round(min(1.0, (pred_cpu - 60) / 40), 2)})
+                 'action': ('Defer Spotlight indexing, iCloud sync, or software updates'
+                            if not cpu_name else f'Throttle {cpu_name} to free up CPU'),
+                 'confidence': round(min(1.0, (pred_cpu - 60) / 40), 2),
+                 'pid': cpu_pid, 'action_type': 'throttle' if cpu_pid else None})
 
         # 2. Info — disk nearly full
         disk = bot_state.get('disk_pct', 0)
@@ -861,13 +911,15 @@ class NeuralPerformanceAnalyzer:
                  'title': f'Disk nearly full ({disk:.0f}%)',
                  'detail': 'Low disk reduces swap space and can cause system slowdowns.',
                  'action': 'Empty Trash · clear ~/Downloads · run "brew cleanup"',
-                 'confidence': 0.98})
+                 'confidence': 0.98,
+                 'pid': None, 'action_type': None})
         elif disk >= 80:
             add({'priority': 3, 'icon': '💿',
                  'title': f'Disk at {disk:.0f}% — watch space',
                  'detail': 'Under 20% free disk may affect virtual memory performance.',
                  'action': 'Review ~/Library/Caches and remove large unused files',
-                 'confidence': 0.90})
+                 'confidence': 0.90,
+                 'pid': None, 'action_type': None})
 
         # 3. Tip — circadian peak hour (from CMPE profile)
         hour = datetime.now().hour
@@ -882,7 +934,8 @@ class NeuralPerformanceAnalyzer:
                      'detail': f'Historical data shows high memory pressure at this time. '
                                f'Off-peak: {next_low}:00.',
                      'action': f'Schedule heavy tasks before {next_low}:00 tomorrow',
-                     'confidence': 0.75})
+                     'confidence': 0.75,
+                     'pid': None, 'action_type': None})
 
         # 3. Tip — chronic RAM pressure → hardware upgrade
         longterm = bot_state.get('longterm_avg_mem', 0)
@@ -891,7 +944,8 @@ class NeuralPerformanceAnalyzer:
                  'title': f'30-day avg RAM: {longterm:.0f}% — upgrade recommended',
                  'detail': 'Your Mac is chronically memory-constrained over the past month.',
                  'action': 'Consider a Mac with more unified memory on your next upgrade',
-                 'confidence': 0.90})
+                 'confidence': 0.90,
+                 'pid': None, 'action_type': None})
 
         # 4. All clear
         if not recs:
@@ -899,7 +953,8 @@ class NeuralPerformanceAnalyzer:
                  'title': 'System healthy — no action needed',
                  'detail': f'AI forecasts {pred_mem:.0f}% RAM and {pred_cpu:.0f}% CPU next hour.',
                  'action': 'Keep doing what you\'re doing',
-                 'confidence': round(max(0.0, 1.0 - anomaly), 2)})
+                 'confidence': round(max(0.0, 1.0 - anomaly), 2),
+                 'pid': None, 'action_type': None})
 
         recs.sort(key=lambda r: r['priority'])
         return recs[:5]
@@ -1092,6 +1147,13 @@ class BotEngine(threading.Thread):
         except Exception:
             return False
 
+    def trigger_remediation(self, tier: int):
+        """User-initiated remediation at the requested tier (1–4), bypassing threshold gates."""
+        tier = max(1, min(4, tier))
+        with self._lock:
+            mem_pct = self.mem_hist[-1] if self.mem_hist else 85.0
+        self._tiered_memory_remediation(mem_pct, effective_tier=tier)
+
     def snapshot(self):
         with self._lock:
             return {
@@ -1152,6 +1214,7 @@ class BotEngine(threading.Thread):
                 "npa_trained":          self._npa._trained,
                 "npa_next_hour":        dict(self._npa_next_hour),
                 "npa_recs":             list(self._npa_recs),
+                "recent_actions":       self._cache.recent_outcomes(5),
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
@@ -3143,6 +3206,7 @@ class BotEngine(threading.Thread):
             return
         pred = self._npa.predict_from_rows(recent)
         with self._lock:
+            throttled_procs = list(self.throttled.items())  # [(pid_str, name), ...]
             bot_state = {
                 'thermal_pct':       self.thermal_pct,
                 'leak_pids_list':    list(self._leak_pids),
@@ -3150,6 +3214,9 @@ class BotEngine(threading.Thread):
                 'longterm_avg_mem':  self.longterm_avg_mem,
                 'disk_pct':          self.disk_pct,
                 'circadian_profile': dict(self._circadian_profile),
+                'tte_min':           self.mem_forecast_min,
+                'throttled_names':   [name for _, name in throttled_procs],
+                'throttled_pids':    [int(pid) for pid, _ in throttled_procs],
             }
         recs = self._npa.generate_recommendations(pred, bot_state)
         with self._lock:
@@ -3596,10 +3663,29 @@ HTML = r"""<!DOCTYPE html>
   .npa-p2{border-left:3px solid var(--blue)}
   .npa-p3{border-left:3px solid var(--muted2)}
   .npa-p4{border-left:3px solid var(--green)}
+  .npa-btn{display:inline-block;margin-top:5px;padding:3px 9px;font-size:9px;font-weight:700;
+    border:1px solid var(--border);border-radius:4px;background:var(--surface);
+    color:#4a86e8;cursor:pointer;transition:background .15s}
+  .npa-btn:hover{background:rgba(74,134,232,.1)}
+  .npa-btn:disabled{opacity:.6;cursor:default}
+
+  /* ── Summary recent actions list ── */
+  .sum-actions-hdr{padding:6px 12px;font-size:9px;font-weight:700;text-transform:uppercase;
+    letter-spacing:.5px;color:var(--muted);border-top:1px solid var(--border)}
+  .sum-action-row{display:flex;align-items:center;gap:7px;padding:5px 12px;
+    border-bottom:1px solid var(--border);font-size:9px}
+  .sum-action-row:last-child{border-bottom:none}
+  .sum-action-ico{flex-shrink:0;font-size:11px}
+  .sum-action-body{flex:1;color:var(--text);line-height:1.3}
+  .sum-action-ts{color:var(--muted);flex-shrink:0;font-size:8px}
 
   /* ── Summary tab ── */
   .sum-wrap{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
-  .sum-hero-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;display:flex;align-items:center;gap:16px;flex-shrink:0}
+  .sum-top-row{display:flex;gap:10px;align-items:stretch;flex-shrink:0}
+  .sum-hero-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;display:flex;align-items:center;gap:16px;flex:0 0 auto;min-width:220px}
+  .sum-ai-panel{flex:1;min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;display:flex;flex-direction:column}
+  .sum-ai-hdr{padding:8px 12px;border-bottom:1px solid var(--border);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.55px;color:var(--muted);display:flex;align-items:center;flex-shrink:0}
+  .sum-ai-body{flex:1;overflow-y:auto}
   .sum-score-block{display:flex;align-items:baseline;gap:2px;flex-shrink:0;width:88px;justify-content:center;flex-direction:column;align-items:center;padding:8px;border:3px solid var(--green);border-radius:50%;width:80px;height:80px;justify-content:center}
   .sum-score-num{font-size:30px;font-weight:800;line-height:1;transition:color .3s}
   .sum-score-denom{font-size:11px;color:var(--muted);font-weight:500;line-height:1}
@@ -3622,6 +3708,36 @@ HTML = r"""<!DOCTYPE html>
   .sum-bot-cell{background:var(--surface);padding:10px 14px}
   .sum-bot-cell-lbl{font-size:9px;color:var(--muted);margin-bottom:3px}
   .sum-bot-cell-val{font-size:18px;font-weight:700;transition:color .3s}
+  .sum-bot-cell-sub{font-size:9px;color:var(--muted);margin-top:2px}
+  /* ── What the Bot Did rows ── */
+  .sum-did-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;flex-shrink:0}
+  .sum-did-hdr{padding:9px 14px;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px}
+  .sum-did-hdr-sub{font-size:9px;font-weight:400;color:var(--muted);margin-left:auto}
+  .sum-did-row{display:flex;align-items:flex-start;gap:11px;padding:10px 14px;border-bottom:1px solid var(--border)}
+  .sum-did-row:last-of-type{border-bottom:none}
+  .sum-did-ico{font-size:17px;flex-shrink:0;width:24px;text-align:center;margin-top:1px}
+  .sum-did-body{flex:1;min-width:0}
+  .sum-did-title{font-size:12px;font-weight:600;color:var(--text);line-height:1.3}
+  .sum-did-sub{font-size:9px;color:var(--muted);margin-top:2px;line-height:1.4}
+  .sum-did-val{font-size:14px;font-weight:700;flex-shrink:0;font-family:'SF Mono',monospace;min-width:56px;text-align:right;align-self:center}
+  .sum-smart-line{padding:9px 14px;font-size:10px;color:var(--text);line-height:1.5;border-top:1px solid var(--border);background:var(--bg);font-style:italic}
+  /* ── Health Record ── */
+  .sum-health-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;flex-shrink:0}
+  .sum-health-hdr{padding:9px 14px;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--text)}
+  .sum-contain-wrap{padding:12px 14px;border-bottom:1px solid var(--border)}
+  .sum-contain-label{display:flex;justify-content:space-between;font-size:10px;color:var(--text);font-weight:600;margin-bottom:6px}
+  .sum-contain-bar-bg{height:8px;border-radius:4px;background:var(--border);overflow:hidden}
+  .sum-contain-bar-fill{height:100%;border-radius:4px;transition:width .7s}
+  .sum-contain-caption{font-size:9px;color:var(--muted);margin-top:5px}
+  .sum-stat-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--border)}
+  .sum-stat-cell{background:var(--surface);padding:10px 14px}
+  .sum-stat-lbl{font-size:9px;color:var(--muted);margin-bottom:3px}
+  .sum-stat-val{font-size:18px;font-weight:700;transition:color .3s}
+  .sum-stat-sub{font-size:9px;color:var(--muted);margin-top:2px}
+  .sum-perf-line{padding:9px 14px;font-size:10px;color:var(--text);line-height:1.5;border-top:1px solid var(--border);background:var(--bg)}
+  /* ── legacy compat (kept so old refs still resolve) ── */
+  .sum-inference{padding:8px 14px;font-size:9px;color:var(--muted);line-height:1.5;border-top:1px solid var(--border);background:var(--bg)}
+  .sum-contain-fill{height:100%;border-radius:3px;transition:width .5s}
   .sum-proc-row{display:flex;align-items:center;gap:10px;padding:6px 14px;border-bottom:1px solid var(--border);font-size:11px}
   .sum-proc-row:last-child{border-bottom:none}
   .sum-proc-name{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
@@ -3686,26 +3802,51 @@ HTML = r"""<!DOCTYPE html>
 <!-- ═══ Summary tab panel ═══════════════════════════════════════════════ -->
 <div id="panelSummary" class="sum-wrap">
 
-  <!-- Health Hero -->
-  <div class="sum-hero-card">
-    <div class="sum-score-block" id="sumScoreBlock" style="border-color:var(--green)">
-      <span class="sum-score-num" id="sumScore" style="color:var(--green)">—</span>
-      <span class="sum-score-denom">/100</span>
-    </div>
-    <div class="sum-hero-info">
-      <div class="sum-hero-top">
-        <span class="sum-hero-title">System Health</span>
-        <span class="tier-badge t0" id="sumTierBadge"><div class="tier-dot"></div><span id="sumTierLabel">All Good</span></span>
+  <!-- Top row: Health Hero + AI Recommendations side by side -->
+  <div class="sum-top-row">
+
+    <!-- Health Hero -->
+    <div class="sum-hero-card">
+      <div class="sum-score-block" id="sumScoreBlock" style="border-color:var(--green)">
+        <span class="sum-score-num" id="sumScore" style="color:var(--green)">—</span>
+        <span class="sum-score-denom">/100</span>
       </div>
-      <div class="sum-hero-status" id="sumStatusLine">Initializing…</div>
-      <div class="sum-hero-pills">
-        <span id="sumUptimePill" class="pill">⏱ 0s</span>
-        <span id="sumPowerPill"  class="pill">⚡ AC</span>
-        <span id="sumMemPressBadge" class="pill">🧠 Normal</span>
-        <span id="sumFcPill" class="mem-forecast fc-stable" style="font-size:10px;padding:2px 8px;border-radius:20px;border:1px solid var(--border)">✓ Stable</span>
+      <div class="sum-hero-info">
+        <div class="sum-hero-top">
+          <span class="sum-hero-title">System Health</span>
+          <span class="tier-badge t0" id="sumTierBadge"><div class="tier-dot"></div><span id="sumTierLabel">All Good</span></span>
+        </div>
+        <div class="sum-hero-status" id="sumStatusLine">Initializing…</div>
+        <div class="sum-hero-pills">
+          <span id="sumUptimePill" class="pill">⏱ 0s</span>
+          <span id="sumPowerPill"  class="pill">⚡ AC</span>
+          <span id="sumMemPressBadge" class="pill">🧠 Normal</span>
+          <span id="sumFcPill" class="mem-forecast fc-stable" style="font-size:10px;padding:2px 8px;border-radius:20px;border:1px solid var(--border)">✓ Stable</span>
+        </div>
       </div>
     </div>
-  </div>
+
+    <!-- AI Recommendations (beside hero) -->
+    <div class="sum-ai-panel">
+      <div class="sum-ai-hdr">
+        🤖 AI Recommendations
+        <span class="npa-badge npa-badge-warm" id="sumNpaBadge" style="margin-left:6px">Warming Up</span>
+        <span class="npa-fc" id="sumNpaFc" style="margin-left:auto;font-size:9px"></span>
+      </div>
+      <div class="sum-ai-body" id="sumNpaRecs">
+        <div class="npa-rec npa-p3">
+          <div class="npa-ico">⏳</div>
+          <div class="npa-body">
+            <div class="npa-ttl">Neural model training…</div>
+            <div class="npa-det">Needs ≥150 rows of history. Recommendations appear after the first training run.</div>
+          </div>
+        </div>
+      </div>
+      <div class="sum-actions-hdr" id="sumActionsHdr" style="display:none">🗂 Recent Actions</div>
+      <div id="sumRecentActions"></div>
+    </div>
+
+  </div><!-- /sum-top-row -->
 
   <!-- Quick Stats (4 cards) -->
   <div class="sum-cards">
@@ -3737,49 +3878,97 @@ HTML = r"""<!DOCTYPE html>
     <div class="sum-issue-action" id="sumIssueAction"></div>
   </div>
 
-  <!-- AI Recommendations -->
-  <div class="sum-section">
-    <div class="sum-section-hdr">
-      🤖 AI Recommendations
-      <span class="npa-badge npa-badge-warm" id="sumNpaBadge" style="margin-left:6px">Warming Up</span>
-      <span class="npa-fc" id="sumNpaFc" style="margin-left:auto"></span>
+  <!-- What the Bot Did For You -->
+  <div class="sum-did-section">
+    <div class="sum-did-hdr">
+      ✨ What the Bot Did For You
+      <span class="sum-did-hdr-sub" id="sumDidSub">today</span>
     </div>
-    <div id="sumNpaRecs">
-      <div class="npa-rec npa-p3">
-        <div class="npa-ico">⏳</div>
-        <div class="npa-body">
-          <div class="npa-ttl">Neural model training…</div>
-          <div class="npa-det">Needs ≥150 rows of history. Recommendations appear after first training run.</div>
-        </div>
+    <!-- Row 1: freed -->
+    <div class="sum-did-row" id="sumDidRowFreed">
+      <div class="sum-did-ico">🧹</div>
+      <div class="sum-did-body">
+        <div class="sum-did-title" id="sumDidTitleFreed">No idle services cleared yet</div>
+        <div class="sum-did-sub" id="sumDidSubFreed">Your Mac is managing on its own</div>
       </div>
+      <div class="sum-did-val" id="sumRelFreed" style="color:var(--muted)">—</div>
     </div>
+    <!-- Row 2: paused/frozen -->
+    <div class="sum-did-row" id="sumDidRowPaused">
+      <div class="sum-did-ico">❄️</div>
+      <div class="sum-did-body">
+        <div class="sum-did-title" id="sumDidTitlePaused">No background tasks paused</div>
+        <div class="sum-did-sub" id="sumDidSubPaused">Memory pressure was not high enough to need it</div>
+      </div>
+      <div class="sum-did-val" id="sumRelSuspended" style="color:var(--muted)">—</div>
+    </div>
+    <!-- Row 3: confirmed savings -->
+    <div class="sum-did-row" id="sumDidRowConfirmed">
+      <div class="sum-did-ico">✅</div>
+      <div class="sum-did-body">
+        <div class="sum-did-title" id="sumDidTitleConfirmed">No recovery measured yet</div>
+        <div class="sum-did-sub" id="sumDidSubConfirmed">Measurements appear 2 min after each intervention</div>
+      </div>
+      <div class="sum-did-val" id="sumRelConfirmed" style="color:var(--muted)">—</div>
+    </div>
+    <!-- Smart one-liner -->
+    <div class="sum-smart-line" id="sumMemInference">Bot is watching. Waiting for the first intervention to report.</div>
   </div>
 
-  <!-- Bot Activity Today -->
-  <div class="sum-section">
-    <div class="sum-section-hdr">Bot Activity — Today</div>
-    <div class="sum-bot-grid">
-      <div class="sum-bot-cell">
-        <div class="sum-bot-cell-lbl">Interventions</div>
-        <div class="sum-bot-cell-val" id="sumInterventions">—</div>
+  <!-- Mac Health Record -->
+  <div class="sum-health-section">
+    <div class="sum-health-hdr">📊 Your Mac's Health Record</div>
+
+    <!-- Big containment bar -->
+    <div class="sum-contain-wrap">
+      <div class="sum-contain-label">
+        <span>Kept below the danger zone</span>
+        <span id="sumContainPct" style="color:var(--green);font-size:14px;font-weight:700">—</span>
       </div>
-      <div class="sum-bot-cell">
-        <div class="sum-bot-cell-lbl">RAM Freed</div>
-        <div class="sum-bot-cell-val" id="sumRamFreed" style="color:var(--green)">—</div>
+      <div class="sum-contain-bar-bg">
+        <div id="sumContainBar" class="sum-contain-bar-fill" style="width:0%;background:var(--green)"></div>
       </div>
-      <div class="sum-bot-cell">
-        <div class="sum-bot-cell-lbl">Success Rate</div>
-        <div class="sum-bot-cell-val" id="sumSuccessRate">—</div>
+      <div class="sum-contain-caption" id="sumContainMsg">Warming up — needs a few minutes of data</div>
+    </div>
+
+    <!-- 3-cell stat row -->
+    <div class="sum-stat-row">
+      <div class="sum-stat-cell">
+        <div class="sum-stat-lbl">Crises Averted</div>
+        <div class="sum-stat-val" id="sumCrisesVal" style="color:var(--green)">—</div>
+        <div class="sum-stat-sub" id="sumCrisesSub">all-time</div>
+      </div>
+      <div class="sum-stat-cell">
+        <div class="sum-stat-lbl">Bot Success Rate</div>
+        <div class="sum-stat-val" id="sumSuccessRate">—</div>
+        <div class="sum-stat-sub" id="sumRateSub">today</div>
+      </div>
+      <div class="sum-stat-cell">
+        <div class="sum-stat-lbl">Apps Slowed Down</div>
+        <div class="sum-stat-val" id="sumThrottledNow" style="color:var(--orange)">0</div>
+        <div class="sum-stat-sub">right now, to help others</div>
       </div>
     </div>
+
+    <!-- Plain-language perf line -->
+    <div class="sum-perf-line" id="sumPerfInference">Collecting data…</div>
   </div>
+
+  <!-- Hidden compat ids -->
+  <span id="sumRamFreed"     style="display:none"></span>
+  <span id="sumInterventions" style="display:none"></span>
+  <span id="sumIntSub"       style="display:none"></span>
 
   <!-- Top Memory Consumers -->
   <div class="sum-section">
-    <div class="sum-section-hdr">Top Memory Consumers</div>
-    <div id="sumProcList">
-      <div style="padding:12px 14px;color:var(--muted);font-size:10px">Loading processes…</div>
+    <div class="sum-section-hdr">
+      🔥 Top Memory Eaters
+      <span style="margin-left:auto;font-size:9px;font-weight:400;color:var(--muted)">tap a name to learn more</span>
     </div>
+    <div id="sumProcList">
+      <div style="padding:12px 14px;color:var(--muted);font-size:10px">Loading…</div>
+    </div>
+    <div style="padding:7px 14px;font-size:9px;color:var(--muted);border-top:1px solid var(--border)" id="sumProcHint"></div>
   </div>
 
 </div><!-- /panelSummary -->
@@ -4304,16 +4493,50 @@ function renderNpa(d) {
   cont.innerHTML = recs.map(r => {
     const cls  = pc[Math.min(r.priority == null ? 3 : r.priority, 4)];
     const conf = r.confidence != null ? Math.round(r.confidence * 100) + '%' : '';
+    const btn  = r.action_type
+      ? '<button class="npa-btn" data-pid="'+(r.pid||'')+'" data-atype="'+r.action_type+'" onclick="handleRecAction(this)">'
+          + (r.action_type==='freeze'    ? '🧊 Freeze Now'
+           : r.action_type==='terminate' ? '❌ Terminate'
+           : r.action_type==='remediate' ? '⚡ Free Memory Now'
+           : r.action_type==='throttle'  ? '🐢 Throttle It' : '')
+          + '</button>'
+      : '';
     return '<div class="npa-rec ' + cls + '">' +
       '<div class="npa-ico">' + (r.icon || '·') + '</div>' +
       '<div class="npa-body">' +
         '<div class="npa-ttl">' + (r.title  || '') + '</div>' +
         '<div class="npa-det">' + (r.detail || '') + '</div>' +
         (r.action ? '<div class="npa-act">→ ' + r.action + '</div>' : '') +
+        btn +
       '</div>' +
       (conf ? '<div class="npa-conf">' + conf + '</div>' : '') +
       '</div>';
   }).join('');
+}
+
+// ── Recommendation action handler ────────────────────────────────────────────
+async function handleRecAction(btn) {
+  const atype = btn.dataset.atype;
+  const pid   = parseInt(btn.dataset.pid) || 0;
+  btn.disabled = true;
+  btn.textContent = '⏳ Working…';
+  try {
+    let resp;
+    if (atype === 'remediate') {
+      resp = await fetch('/remediate', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({tier: 3})});
+    } else {
+      resp = await fetch('/action', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({pid, action: atype})});
+    }
+    const ok = (await resp.json()).ok;
+    btn.textContent = ok ? '✅ Done — outcome in 2 min' : '❌ Failed';
+    btn.style.color = ok ? 'var(--green)' : 'var(--red)';
+  } catch(e) {
+    btn.textContent = '❌ Error';
+  }
 }
 
 // ── Expert / Simple mode ───────────────────────────────────────────────────────
@@ -4525,35 +4748,217 @@ function renderSummary(d) {
     const pc=['npa-p0','npa-p1','npa-p2','npa-p3','npa-p4'];
     sr.innerHTML=recs.slice(0,3).map(r=>{
       const cls=pc[Math.min(r.priority==null?3:r.priority,4)];
+      const conf=r.confidence!=null?Math.round(r.confidence*100)+'%':'';
+      const btn=r.action_type
+        ?'<button class="npa-btn" data-pid="'+(r.pid||'')+'" data-atype="'+r.action_type+'" onclick="handleRecAction(this)">'
+            +(r.action_type==='freeze'    ?'🧊 Freeze Now'
+             :r.action_type==='terminate' ?'❌ Terminate'
+             :r.action_type==='remediate' ?'⚡ Free Memory Now'
+             :r.action_type==='throttle'  ?'🐢 Throttle It':'')
+            +'</button>'
+        :'';
       return '<div class="npa-rec '+cls+'"><div class="npa-ico">'+(r.icon||'·')+'</div>'+
         '<div class="npa-body"><div class="npa-ttl">'+(r.title||'')+'</div>'+
         '<div class="npa-det">'+(r.detail||'')+'</div>'+
         (r.action?'<div class="npa-act">→ '+r.action+'</div>':'')+
-        '</div></div>';
+        btn+
+        '</div>'+(conf?'<div class="npa-conf">'+conf+'</div>':'')+
+        '</div>';
     }).join('');
   }
 
-  // Bot activity
-  const va=d.value_add||{}, vaT=va.total||0, vaF=va.ram_saved_mb||0;
-  sv('sumInterventions',String(vaT),vaT>0?'var(--text)':'var(--muted)');
-  sv('sumRamFreed',vaF>0?(vaF>=1024?(vaF/1024).toFixed(1)+' GB':vaF.toFixed(0)+' MB'):'0 MB');
-  const vasr=va.success_rate;
-  sv('sumSuccessRate',vasr!=null&&vaT>0?(vasr*100).toFixed(0)+'%':'—',
-     vasr!=null&&vasr>=0.7?'var(--green)':vasr>=0.4?'var(--yellow)':'var(--muted)');
+  // ── Recent Bot Actions ────────────────────────────────────────────────────
+  const acts=d.recent_actions||[];
+  const rah=document.getElementById('sumActionsHdr');
+  const rac=document.getElementById('sumRecentActions');
+  if(rac){
+    if(acts.length){
+      if(rah)rah.style.display='';
+      const ago=ts=>{const s=Math.round(Date.now()/1000-ts);return s<120?s+'s ago':s<3600?Math.round(s/60)+'m ago':Math.round(s/3600)+'h ago';};
+      rac.innerHTML=acts.map(a=>{
+        const icon=a.success?'✅':'❌';
+        const mb=a.delta_mb>0?' — freed '+a.delta_mb.toFixed(0)+' MB':'';
+        const lbl=a.action.replace(/_/g,' ');
+        return '<div class="sum-action-row">'
+          +'<span class="sum-action-ico">'+icon+'</span>'
+          +'<span class="sum-action-body">'+lbl+mb+'</span>'
+          +'<span class="sum-action-ts">'+ago(a.ts)+'</span>'
+          +'</div>';
+      }).join('');
+    } else {
+      if(rah)rah.style.display='none';
+      rac.innerHTML='';
+    }
+  }
 
-  // Top memory consumers (simplified)
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function fmtMem(mb){ return mb>=1024?(mb/1024).toFixed(1)+' GB':mb.toFixed(0)+' MB'; }
+  function setText(id,t){const e=document.getElementById(id);if(e)e.textContent=t;}
+  function setCol(id,c){const e=document.getElementById(id);if(e)e.style.color=c;}
+
+  // ── What the Bot Did For You ──────────────────────────────────────────────
+  const va=d.value_add||{}, vaT=va.total||0;
+  const freedMb     = d.freed_mb     || 0;
+  const suspendedMb = d.suspended_mb || 0;
+  const confirmedMb = va.ram_saved_mb|| 0;
+  const frozenNow   = d.frozen_count || 0;
+
+  // sub-header: show uptime context
+  const upS=d.uptime_s||0;
+  const upStr=upS<120?'just started':upS<3600?Math.round(upS/60)+' min session':Math.floor(upS/3600)+'h session';
+  setText('sumDidSub', upStr);
+
+  // Row 1 — cleared/freed
+  sv('sumRelFreed', freedMb>0?fmtMem(freedMb):'—', freedMb>0?'var(--green)':'var(--muted)');
+  if(freedMb>0){
+    setText('sumDidTitleFreed','Cleared idle services & stale apps');
+    setText('sumDidSubFreed','Your Mac has more breathing room — '+fmtMem(freedMb)+' returned to the system');
+    setCol('sumRelFreed','var(--green)');
+  } else {
+    setText('sumDidTitleFreed','No apps needed clearing');
+    setText('sumDidSubFreed','All running apps are actively being used');
+    setCol('sumRelFreed','var(--muted)');
+  }
+
+  // Row 2 — paused/frozen
+  sv('sumRelSuspended', suspendedMb>0?fmtMem(suspendedMb):'—', suspendedMb>0?'var(--yellow)':'var(--muted)');
+  if(frozenNow>0){
+    setText('sumDidTitlePaused', frozenNow+' background task'+(frozenNow>1?'s':'')+ ' paused right now');
+    setText('sumDidSubPaused','They are sleeping to ease memory pressure — will resume automatically when safe');
+  } else if(suspendedMb>0){
+    setText('sumDidTitlePaused','Paused background tasks when needed');
+    setText('sumDidSubPaused',fmtMem(suspendedMb)+' eased during high-pressure moments — all resumed safely');
+  } else {
+    setText('sumDidTitlePaused','No background tasks needed pausing');
+    setText('sumDidSubPaused','Memory pressure stayed low enough that nothing had to be put to sleep');
+  }
+
+  // Row 3 — confirmed real savings
+  sv('sumRelConfirmed', confirmedMb>0?fmtMem(confirmedMb):'—', confirmedMb>0?'var(--blue)':'var(--muted)');
+  if(confirmedMb>0){
+    setText('sumDidTitleConfirmed', fmtMem(confirmedMb)+' of real memory recovered');
+    setText('sumDidSubConfirmed','Measured 2 minutes after each action — this is actual improvement, not an estimate');
+    setCol('sumRelConfirmed','var(--blue)');
+  } else if(vaT>0){
+    setText('sumDidTitleConfirmed','Recovery measurement in progress');
+    setText('sumDidSubConfirmed','Bot acted recently — results are verified 2 min after each intervention');
+  } else {
+    setText('sumDidTitleConfirmed','No interventions yet — nothing to measure');
+    setText('sumDidSubConfirmed','Measurements appear automatically after the bot steps in');
+  }
+
+  // Smart one-liner
+  const miEl=document.getElementById('sumMemInference');
+  if(miEl){
+    const atSavedGb=va.alltime_ram_saved_gb||0;
+    if(vaT===0 && freedMb===0 && suspendedMb===0){
+      miEl.textContent='Your Mac is running cleanly on its own. The bot is watching and ready to step in if needed.';
+    } else if(confirmedMb>0 && freedMb>0){
+      miEl.textContent='Great session — the bot freed '+fmtMem(freedMb)+' permanently and confirmed '+fmtMem(confirmedMb)+' of actual memory recovery.';
+    } else if(confirmedMb>0){
+      miEl.textContent='The bot confirmed '+fmtMem(confirmedMb)+' of real memory recovery today — measured, not estimated.';
+    } else if(freedMb>0){
+      miEl.textContent='The bot cleared '+fmtMem(freedMb)+' by closing idle services. Your Mac has more room to breathe.';
+    } else if(suspendedMb>0){
+      miEl.textContent='The bot paused '+fmtMem(suspendedMb)+' of background processes to ease pressure. They auto-resume when memory is healthy.';
+    } else if(atSavedGb>0){
+      miEl.textContent='All-time: '+atSavedGb.toFixed(1)+' GB saved across '+(va.alltime_interventions||0)+' interventions. Today looks stable so far.';
+    } else {
+      miEl.textContent='Bot is active. Interventions recorded — waiting for measurement window to close.';
+    }
+  }
+
+  // ── Mac Health Record ─────────────────────────────────────────────────────
+  const vasr=va.success_rate;
+  const throttledCount=Object.keys(d.throttled||{}).length;
+  const contain=va.pct_below_87!=null?va.pct_below_87:null;
+  const allCrises=va.alltime_interventions||0;
+  const allSucc=va.alltime_successes||0;
+  const atSaved=va.alltime_ram_saved_gb||0;
+
+  // Containment bar
+  if(contain!=null){
+    const cColor=contain>=99?'var(--green)':contain>=95?'var(--yellow)':'var(--orange)';
+    const cb=document.getElementById('sumContainBar');
+    if(cb){cb.style.width=contain.toFixed(1)+'%';cb.style.background=cColor;}
+    const cpEl=document.getElementById('sumContainPct');
+    if(cpEl){cpEl.textContent=contain.toFixed(1)+'%';cpEl.style.color=cColor;}
+    const cmEl=document.getElementById('sumContainMsg');
+    if(cmEl){
+      cmEl.textContent=contain>=99
+        ?'Your Mac never hit the danger zone — the bot kept a clean lid on memory all-time.'
+        :contain>=95
+        ?'Occasionally nudged the limit, but quickly brought back under control.'
+        :'Memory crossed the critical threshold more than expected — consider closing unused apps.';
+    }
+  }
+
+  // Crises averted
+  sv('sumCrisesVal', allSucc>0?String(allSucc):'0', allSucc>0?'var(--green)':'var(--muted)');
+  setText('sumCrisesSub', allSucc>0?'times your Mac could have slowed down':'no crises yet');
+
+  // Success rate
+  sv('sumSuccessRate', vasr!=null&&vaT>0?(vasr*100).toFixed(0)+'%':'—',
+     vasr!=null&&vasr>=0.7?'var(--green)':vasr>=0.4?'var(--yellow)':'var(--muted)');
+  setText('sumRateSub', vasr!=null&&vaT>0
+    ?(vasr>=0.7?'working great':vasr>=0.4?'mostly working':'building up data')
+    :'system stable');
+
+  // CPU throttled now
+  sv('sumThrottledNow', String(throttledCount), throttledCount>0?'var(--orange)':'var(--muted)');
+
+  // Plain-language performance line
+  const piEl=document.getElementById('sumPerfInference');
+  if(piEl){
+    if(vaT===0 && throttledCount===0){
+      piEl.textContent='Everything is running smoothly. The bot has not needed to step in yet today.';
+    } else {
+      let parts=[];
+      if(throttledCount>0) parts.push(throttledCount+' app'+(throttledCount>1?'s are':' is')+' being slowed down right now so your other apps stay snappy');
+      if(vasr!=null&&vaT>0){
+        if(vasr>=0.7) parts.push('interventions working well — '+Math.round(vasr*100)+'% success rate today');
+        else if(vasr>=0.4) parts.push('most interventions helped — '+Math.round(vasr*100)+'% success today');
+      }
+      if(atSaved>=0.1) parts.push('all-time: '+atSaved.toFixed(1)+' GB of RAM saved across '+allCrises+' rescues');
+      piEl.textContent=parts.length?parts.map((p,i)=>i===0?p.charAt(0).toUpperCase()+p.slice(1):p).join('; ')+'.'
+        :'Bot is active and monitoring.';
+    }
+  }
+
+  // ── Top Memory Eaters (actionable) ───────────────────────────────────────
   const procs=d.top_procs||[];
+  const leakSet=new Set(d.leak_pids_list||[]);
+  const throttledSet=new Set(Object.keys(d.throttled||{}).map(Number));
   const spl=document.getElementById('sumProcList');
   if(spl&&procs.length){
-    spl.innerHTML=procs.slice(0,6).map(([,m,pid,name])=>{
-      const mc3=m>=10?'var(--red)':m>=4?'var(--yellow)':'var(--mem)';
-      const bw=Math.min(m*8,100);
-      return '<div class="sum-proc-row">'+
-        '<div class="sum-proc-name">'+name+'</div>'+
+    const topProcs=procs.slice(0,6);
+    const topMem=topProcs[0]?topProcs[0][1]:1;
+    spl.innerHTML=topProcs.map(([cpu,m,pid,name,status])=>{
+      const mc3=m>=12?'var(--red)':m>=5?'var(--yellow)':'var(--mem)';
+      const bw=Math.min((m/Math.max(topMem,1))*100,100);
+      const isLeak=leakSet.has(pid);
+      const isThrottled=throttledSet.has(pid);
+      const badge=isLeak?'<span style="font-size:8px;background:var(--red);color:#fff;border-radius:3px;padding:1px 4px;margin-left:5px">LEAK</span>'
+        :isThrottled?'<span style="font-size:8px;background:var(--orange);color:#fff;border-radius:3px;padding:1px 4px;margin-left:5px">THROTTLED</span>':'';
+      const hint=isLeak?' — restarting it would free memory'
+        :isThrottled?' — slowed down to protect other apps'
+        :m>=12?' — using a lot of RAM; close if you\'re not using it'
+        :m>=5?' — moderate usage, normal'
+        :'';
+      return '<div class="sum-proc-row" title="'+name+hint+'">'+
+        '<div class="sum-proc-name">'+name+badge+'</div>'+
         '<div class="sum-proc-bar-wrap"><div class="sum-proc-bar">'+
         '<div class="sum-proc-bar-fill" style="width:'+bw.toFixed(1)+'%;background:'+mc3+'"></div></div></div>'+
         '<div class="sum-proc-pct" style="color:'+mc3+'">'+m.toFixed(1)+'%</div></div>';
     }).join('');
+    // hint footer
+    const hintEl=document.getElementById('sumProcHint');
+    if(hintEl){
+      const top=topProcs[0];
+      if(top&&top[1]>=12) hintEl.textContent='⚠ '+top[3]+' is your biggest memory consumer right now.';
+      else if(leakSet.size>0) hintEl.textContent='💡 A process is growing continuously — consider restarting it.';
+      else hintEl.textContent='✓ No single app is dominating memory right now.';
+    }
   }
 }
 
@@ -5186,10 +5591,26 @@ class Handler(BaseHTTPRequestHandler):
                 pid    = int(body.get("pid", 0))
                 action = body.get("action", "")
                 ok = False
-                if   action == "freeze" and pid: ok = _engine.freeze_pid(pid)
-                elif action == "thaw"   and pid: ok = _engine.thaw_pid(pid)
-                elif action == "kill"   and pid: ok = _engine.kill_pid(pid)
+                if   action == "freeze"   and pid: ok = _engine.freeze_pid(pid)
+                elif action == "thaw"     and pid: ok = _engine.thaw_pid(pid)
+                elif action == "kill"     and pid: ok = _engine.kill_pid(pid)
+                elif action == "throttle" and pid:
+                    try:
+                        import psutil as _ps
+                        _ps.Process(pid).nice(10)
+                        ok = True
+                    except Exception:
+                        ok = False
                 self._send(200, "application/json", json.dumps({"ok": ok}).encode())
+            except Exception as e:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
+        elif path == "/remediate":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length))
+                tier = int(body.get("tier", 3))
+                _engine.trigger_remediation(tier)
+                self._send(200, "application/json", b'{"ok":true}')
             except Exception as e:
                 self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
         else:

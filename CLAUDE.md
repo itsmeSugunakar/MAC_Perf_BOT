@@ -13,7 +13,7 @@
 |--------------------|-----------------------------------------------------|
 | **App Name**       | MAC Performance Bot                                 |
 | **Short Name**     | mac-perf-bot                                        |
-| **Version**        | 2.3.0                                               |
+| **Version**        | 2.4.0                                               |
 | **Owner**          | itsmeSugunakar                                      |
 | **Contact**        | sugun.sr@gmail.com                                  |
 | **Repository**     | https://github.com/itsmeSugunakar/MAC_Perf_BOT      |
@@ -49,7 +49,7 @@ A lightweight, always-on macOS daemon that:
 18. **Measures remediation efficacy** via Reinforcement Action Coordinator (RAC) — 30 s delayed outcome evaluation; RAM delta classified as success/failure and stored for RWA
 19. **Maintains a dynamic protection zone** via Adaptive Safety Zone Mapping (ASZM) — criticality-scored long-running system daemons are automatically elevated to the PROTECTED set
 20. **Diagnoses root causes** via Causal Diagnostic Agent (CDA) — rule-based or ONNX softmax classifier (normal / leak / compressor_collapse / cpu_collision); ONNX model auto-trains from 90-day cache after 200 labeled samples
-21. **Surfaces AI-driven recommendations** via the Neural Performance Analyzer (NPA) — a pure-Python 3-layer MLP (11→12→6→3) trained every 6 hours on a stratified sample of the full 30-day cache; predicts next-60-second RAM and CPU levels plus an anomaly score, then generates up to 5 prioritised plain-English recommendations displayed in the dashboard "AI Insights" panel
+21. **Surfaces AI-driven recommendations** via the Neural Performance Analyzer (NPA) — a pure-Python 3-layer MLP (11→12→6→3) trained every 6 hours on a stratified sample of the full 30-day cache; predicts next-60-second RAM and CPU levels plus an anomaly score, then generates up to 5 prioritised plain-English recommendations displayed in the dashboard "AI Insights" panel; each actionable recommendation (memory leak, RAM pressure, CPU hog) carries a one-click button that fires directly into the remediation cascade via `POST /remediate` or `POST /action`; recent bot action outcomes (MB freed, success/fail) surface in the AI panel as a "Recent Actions" feed
 
 ---
 
@@ -175,7 +175,7 @@ MAC_Perf_BOT/
 | **BRL**                          | `app/performance_gui.py` | `_update_brl()` + `_compute_brl_confidence()` — Bayesian posterior confidence for tier decisions |
 | **ASZM**                         | `app/performance_gui.py` | `_update_aszm()` — criticality scoring; adds long-lived low-CPU daemons to dynamic PROTECTED set |
 | **CDA**                          | `app/performance_gui.py` | `_diagnose_root_cause()` — rule-based or ONNX softmax: normal \| leak \| compressor_collapse \| cpu_collision |
-| **NPA**                          | `app/performance_gui.py` | `_run_npa()` + `NeuralPerformanceAnalyzer` class — 3-layer MLP trained on stratified 30-day cache sample; `fetch_training_data()` / `fetch_recent_window()` on `MetricsCache`; `generate_recommendations()` combines NN predictions with live bot state |
+| **NPA**                          | `app/performance_gui.py` | `_run_npa()` + `NeuralPerformanceAnalyzer` class — 3-layer MLP trained on stratified 30-day cache sample; `fetch_training_data()` / `fetch_recent_window()` on `MetricsCache`; `generate_recommendations()` combines NN predictions with live bot state; every rec now carries `pid` + `action_type` (`"freeze"` / `"remediate"` / `"throttle"` / `None`) so the dashboard can render actionable buttons; `_run_npa()` injects `tte_min`, `throttled_names`, `throttled_pids` into `bot_state`; `BotEngine.trigger_remediation(tier)` is the user-initiated entry point |
 
 ---
 
@@ -465,6 +465,8 @@ Dashboard server listens on `http://127.0.0.1:8765`.
 | `/icon.svg`      | GET    | `image/svg+xml`                | PWA app icon                   |
 | `/pause?state=1` | GET    | `{"ok":true}`                  | Pause the bot engine           |
 | `/pause?state=0` | GET    | `{"ok":true}`                  | Resume the bot engine          |
+| `/action`        | POST   | `{"ok":bool}`                  | Process action: `{pid, action: "freeze"\|"thaw"\|"kill"\|"throttle"}` |
+| `/remediate`     | POST   | `{"ok":true}`                  | User-initiated remediation: `{tier: 1–4}` — calls `trigger_remediation(tier)` directly |
 
 ### `/stats` JSON schema
 ```json
@@ -575,12 +577,27 @@ Dashboard server listens on `http://127.0.0.1:8765`.
   },
   "npa_recs": [                      // Up to 5 ranked recommendations; empty [] until trained
     {
-      "priority":   int,             // 0=critical 1=warning 2=info 3=tip 4=all-clear
-      "icon":       str,             // Emoji icon for the recommendation
-      "title":      str,             // Short headline
-      "detail":     str,             // Explanatory sentence
-      "action":     str,             // Actionable next step for the user
-      "confidence": float            // Model confidence 0–1
+      "priority":    int,            // 0=critical 1=warning 2=info 3=tip 4=all-clear
+      "icon":        str,            // Emoji icon for the recommendation
+      "title":       str,            // Short headline
+      "detail":      str,            // Explanatory sentence
+      "action":      str,            // Plain-English next step shown as "→ …" text
+      "confidence":  float,          // Model confidence 0–1
+      "pid":         int|null,       // Target process PID for actionable recs; null for informational
+      "action_type": str|null        // "freeze"|"terminate"|"remediate"|"throttle"|null
+                                     // Drives dashboard button: null = informational only
+    }
+  ],
+  // ── v2.4 actionable recs + recent actions feed ─────────────────────────────
+  "recent_actions": [                // Last 5 RAC-evaluated remediation outcomes (newest first)
+    {
+      "ts":       int,               // Unix timestamp of the action
+      "tier":     int,               // Remediation tier (1–4)
+      "action":   str,               // "freeze_daemon"|"sweep_xpc"|"purgeable_advisory"
+      "pre_mem":  float,             // RAM % before action
+      "post_mem": float,             // RAM % 120 s after action
+      "delta_mb": float,             // MB freed (positive = improvement)
+      "success":  bool               // delta_mb ≥ RAC_SUCCESS_PCT (2 %)
     }
   ]
 }
@@ -722,6 +739,7 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 | 2026-04-10 | 1.5.0   | itsmeSugunakar | 8 patent-level engine innovations: **MMAF** — 3-model adaptive forecaster (linear/quadratic/exponential, best-RSS selection); **CEO** — Compression Efficiency Oracle (CPI signal); **MSCEE** — 6-signal weighted quorum replaces 2-signal `max()` (signals: RAM %, TTE, kernel oracle, CPI, swap velocity, circadian); **GTS** — Graduated Thaw Sequencing (RSS-ascending SIGCONT, 2 s gap, RAM gate); **RVMS** — RSS Velocity Momentum Scorer (1×–2× freeze boost); **ATCE** — Adaptive Threshold Calibration Engine (hourly self-tuning from 30-day cache percentiles); **CMPE** — Circadian Memory Pattern Engine (hour-of-day SQL profile, proactive pre-freeze); **TMCP** — Thermal-Memory Coupling Predictor (EMA-learned TTE shortening under thermal throttle); `MetricsCache` schema extended with `thermal_pct` column (auto-migrates); 4 new dashboard vmrows (Forecast Model, CPI, Swap Velocity, Thermal Coupling); `/stats` extended with 6 new fields |
 | 2026-04-18 | 2.1.0   | itsmeSugunakar | **Product UX Layer** — 10 user-outcome improvements on top of the v2.0 engine: **Performance Score** (0–100 daily, `daily_performance_score()` from 24h SQLite); **Memory Paused** (accurate label for SIGSTOP — was "RAM Freed"); **Tier labels** renamed to user language (All Good / Watching / Intervening / Rescue Mode / Emergency); **Root Cause Banner** (plain-English, prominent, hidden when normal); **Simple/Expert mode** toggle (10 engine-telemetry rows hidden by default, `localStorage` persisted); **Activity Log filter** (`category="bot"` on calibration `_emit()` calls, "Bot Logs" toggle in titlebar); **7-Day History tab** (`hourly_history()` MetricsCache method, `/history` HTTP endpoint, Chart.js multi-line chart); **RAM Recommendation** (`longterm_avg_mem()` 30d query, advisory card when avg > 80%); **Leak hints** in process table (LEAK badge + 💡 Restart? for leak-flagged processes); **macOS Menu Bar** (`_start_menubar()` via `rumps`, daemon thread, optional); LaunchAgent path updated to `~/Documents/performance-bot/` |
 | 2026-04-26 | 2.2.0   | itsmeSugunakar | **Value-Add Metrics + Reliability Fixes** — **Achievement banner** replaces Actions/Issues cards in metric strip (Crises Averted / Total RAM Saved / Time Below 87% / Biggest Save); **`interventions_today()`** MetricsCache method aggregates today's and all-time remediation_outcomes; **`crises_averted`** session counter (RAC-confirmed rescues at tier ≥ 2); **`suspended_mb`** split from `freed_mb` — SIGSTOP RSS tracked separately from actual termination reclamation; **`RAC_EVAL_DELAY_S` 30 s → 120 s** to give OS time to reclaim pages post-SIGSTOP; **CEO collapse response** — CPI ≥ 0.75 AND RAM ≥ 80 % now triggers proactive daemon freeze; **`longterm_avg_mem`** pre-loaded from DB at startup (was 0.0 until first hourly update); **LaunchAgent `KeepAlive: true` + `ThrottleInterval: 30`** — bot now survives crashes/kills without 5-day gaps; **JS null-guard on `set()` helper** + **duplicate `const contain` SyntaxError fixed** (caused "no metrics showing" on dashboard); `/stats` extended with `suspended_mb`, `crises_averted`, `value_add` |
+| 2026-05-29 | 2.4.0   | itsmeSugunakar | **Actionable AI Recommendations + Remediation Integration** — bridged NPA recommendations to the remediation cascade: every rec dict now carries `pid` (target process) and `action_type` (`"freeze"` / `"remediate"` / `"throttle"` / `None`); dashboard buttons fire `POST /action` or new `POST /remediate {tier}` endpoint; `BotEngine.trigger_remediation(tier)` is the user-initiated entry point bypassing threshold gates; `throttle` action added to `/action` handler (`nice(10)`); **TTE velocity recommendations** — two new NPA rec types fire when memory is growing fast: `⏱ Memory filling fast — ~N min` (warning, TTE < 15 min) and `⏳ Steady memory growth — ~N min runway` (info, TTE 15–30 min); CPU rec now names the specific throttled process from `self.throttled`; `_run_npa()` injects `tte_min`, `throttled_names`, `throttled_pids` into `bot_state`; **Recent Bot Actions feed** — `MetricsCache.recent_outcomes(n)` queries `remediation_outcomes` table; `recent_actions` added to `/stats` JSON; Summary AI panel shows last 5 outcomes (✅/❌, action label, MB freed, timestamp) in a "Recent Actions" section below recommendations; **confidence % now shown in Summary tab** recommendation cards (was Live-tab only); CSS `.npa-btn`, `.sum-actions-hdr`, `.sum-action-row` added |
 | 2026-05-04 | 2.3.0   | itsmeSugunakar | **Neural Performance Analyzer (NPA)** — pure-Python 3-layer MLP (11→12→6→3, no external deps) trained every 6 h on a stratified stride-sample of the full 30-day SQLite cache; predicts next-60s RAM and CPU; anomaly score flags unusual hour-of-day patterns; `generate_recommendations()` produces up to 5 prioritised plain-English cards (critical / warning / info / tip / all-clear) shown in a new "AI Insights" panel on the dashboard; `MetricsCache.fetch_training_data()` fetches all 30-day rows and strides to ≤600 representative samples (fixes prior bug where only the oldest 11-minute burst was used); gradient uses post-clip output `out − target` (bounded [-1,1], prevents explosion); pre-update weight snapshots fix backprop correctness; LR reduced 0.008 → 0.002; `/stats` extended with `npa_trained`, `npa_next_hour`, `npa_recs` |
 | 2026-04-12 | 2.0.0   | itsmeSugunakar | **Autonomous Dynamic Resource Management Agent** — 11 new cognitive engines across a 5-layer governed control model: **SIE** — Signal Integrity Estimator (z-score anomaly confidence per signal); **MEG** — Model Ensemble Governance (meta-weight historical residuals over MMAF models); **ACN** — Adaptive Consensus Network (RWA-driven adaptive weights replace static MSCEE weights); **RWA** — Reinforcement-Weighted Arbitration (hourly EMA weight update from `remediation_outcomes` table); **CTRE** — Chronothermal Regression Engine (per-hour variance stability from 30-day cache); **AIP** — Ancestral Impact Propagation (family-tree RSS depth scoring + cascade risk detection); **RAC** — Reinforcement Action Coordinator (records and evaluates remediation outcomes via new SQLite table); **PSM** — Predictive State Machine (Markov next-tier prediction + dwell estimation); **BRL** — Bayesian Reasoning Layer (Beta prior tier-frequency + likelihood posterior confidence); **ASZM** — Adaptive Safety Zone Mapping (criticality scoring → dynamic `_dynamic_protected` set); **CDA** — Causal Diagnostic Agent (pure-Python softmax LR + optional ONNX export: normal \| leak \| compressor_collapse \| cpu_collision); new SQLite tables `remediation_outcomes` + `signal_weights` (auto-migrates existing DB); 8 new dashboard vmrows (Root Cause, BRL Confidence, ACN Weights, Signal Integrity, PSM Next Tier, CTRE Zone, Action Efficacy, ASZM Protected+); `/stats` extended with 10 new fields |
 
