@@ -91,8 +91,15 @@ class MetricsCache:
         self._buf  = []   # [(ts, cpu, mem, swap, disk, pressure, tier, tte, therm)]
         self._last_prune = 0.0
         self._ok   = False
+        self._iv_cache    = None   # interventions_today() result cache (~20s TTL)
+        self._iv_cache_ts = 0.0
         try:
             with sqlite3.connect(self._db, timeout=5) as cx:
+                # WAL lets the once-a-second /stats reader run concurrently with the
+                # once-daily prune() writer instead of blocking it — see prune()'s
+                # wal_checkpoint call below, which was a silent no-op without this.
+                cx.execute("PRAGMA journal_mode=WAL")
+                cx.execute("PRAGMA synchronous=NORMAL")
                 cx.executescript(self._SCHEMA)
                 # Migrate existing databases missing the thermal_pct column
                 try:
@@ -146,8 +153,16 @@ class MetricsCache:
             return
         cutoff = int(now - retention_days * 86400)
         try:
-            with sqlite3.connect(self._db, timeout=5) as cx:
+            # Longer timeout than other queries — prune is a once-a-day background job,
+            # not latency-sensitive, so it can afford to wait out residual lock contention.
+            with sqlite3.connect(self._db, timeout=15) as cx:
                 cx.execute("DELETE FROM metrics WHERE ts < ?", (cutoff,))
+                # Must commit before checkpointing — running wal_checkpoint while this
+                # DELETE's transaction is still open reliably raises "database table is
+                # locked" (reproduced directly: identical statements each succeed alone,
+                # but only fail when chained in one uncommitted transaction). WAL mode
+                # alone did not fix this; this ordering is the actual fix.
+                cx.commit()
                 cx.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except Exception as e:
             print(f"[cache] prune failed: {e}", file=sys.stderr)
@@ -312,11 +327,17 @@ class MetricsCache:
         Return today's intervention summary from remediation_outcomes,
         plus all-time 'time below critical' proof of containment.
         'Today' = since local midnight.
+
+        Result is cached for ~20s — this is called on every /stats poll (once/second
+        from the dashboard), and its two full-table scans were the main thing holding
+        a read lock long enough to starve the once-daily prune() writer.
         """
         if not self._ok:
             return {"total": 0, "succeeded": 0, "success_rate": 0.0, "ram_saved_mb": 0.0,
                     "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_successes": 0,
                     "alltime_success_rate": 0.0, "alltime_ram_saved_gb": 0.0, "alltime_best_save_mb": 0.0}
+        if self._iv_cache is not None and time.time() - self._iv_cache_ts < 20:
+            return self._iv_cache
         import datetime as _dt
         now_dt = _dt.datetime.now()
         midnight_ts = int(now_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -345,7 +366,7 @@ class MetricsCache:
                 "SELECT MAX(delta_mb) FROM remediation_outcomes WHERE success=1"
             ).fetchone()
             pct_below   = round((contain[0] or 0) / max(contain[1], 1) * 100, 1)
-            return {
+            result = {
                 "total":                 total,
                 "succeeded":             succeeded,
                 "success_rate":          round(succeeded / total, 2) if total else 0.0,
@@ -357,6 +378,8 @@ class MetricsCache:
                 "alltime_ram_saved_gb":   round(all_saved / 1024, 1),
                 "alltime_best_save_mb":   round((best_save[0] or 0), 0),
             }
+            self._iv_cache, self._iv_cache_ts = result, time.time()
+            return result
         except Exception:
             return {"total": 0, "succeeded": 0, "success_rate": 0.0, "ram_saved_mb": 0.0,
                     "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_successes": 0,
@@ -986,6 +1009,9 @@ class BotEngine(threading.Thread):
         self._terminated      = set()
         self._rss_history     = {}     # pid → [(ts, rss_mb), ...]
         self._warned_leaks    = set()  # pids already flagged this session
+        self._seen_crash_reports  = set()   # .ips filenames already noticed
+        self._crash_reports_seeded = False  # True after the first backlog seed pass
+        self._cpu_warned_ts   = {}     # pid → last "High CPU" warning timestamp (60s cooldown)
         self._cache_warned    = False
         self.performance_score: int  = -1    # 0–100 daily score; -1 = warming up
         self._leak_pids: set         = set() # PIDs currently flagged as leaks
@@ -1240,6 +1266,7 @@ class BotEngine(threading.Thread):
                     if tick % 30 == 0: self._detect_xpc_respawn()           # 0.03 Hz (was 0.1 Hz)
                     if tick % 60 == 0: self._check_thermal()                # 0.016 Hz — pmset subprocess
                     if tick % 60 == 0: self._check_zombies()
+                    if tick % 60 == 0: self._check_crash_reports()
                     if tick % 60 == 0: self._track_memory_leaks()
                     if tick % 60 == 0: self._run_npa()
                     if tick % IDLE_SWEEP_S == 0: self._sweep_idle_services()
@@ -1307,31 +1334,54 @@ class BotEngine(threading.Thread):
                 info  = p.info
                 name  = info["name"][:30]
                 pid   = info["pid"]
-                c     = (info["cpu_percent"] or 0.0) / ncpu
+                # raw_c matches psutil/ps/Activity Monitor convention (100% = one full
+                # core, multi-threaded processes can exceed 100%) — this is what a user
+                # visually compares against Activity Monitor, and what the dashboard table
+                # displays/sorts by. c (normalized by core count, "% of total system
+                # capacity") is kept separately only for the system-wide throttle decision
+                # below — dividing by ncpu made a process pegging a single core on this
+                # 8-core Mac show as ~12%, so it could never cross CPU_WARN=70 no matter
+                # how busy it actually was; reproduced directly with `yes` at 98.7% raw
+                # (12.4% normalized) never triggering a warning before this fix.
+                raw_c = info["cpu_percent"] or 0.0
+                c     = raw_c / ncpu
                 mem_p = info["memory_percent"] or 0.0
                 stat  = info["status"]
 
                 # Stale-app tracker: record last time this PID had CPU activity
-                if c > 0.1:
+                if raw_c > 0.1:
                     self._app_last_active[pid] = _now_active
                 elif pid not in self._app_last_active:
                     self._app_last_active[pid] = _now_active  # first seen → grace period
 
-                rows.append((c, mem_p, pid, name, stat))
+                rows.append((raw_c, mem_p, pid, name, stat))
 
-                # CPU throttle detection — inline, no second iteration
-                if sys_cpu >= CPU_WARN and name not in PROTECTED \
-                        and pid not in throttled:
-                    if c >= CPU_THROTTLE:
-                        to_throttle.append((p, name, pid, c))
-                    elif c >= CPU_WARN:
+                # CPU throttle detection — inline, no second iteration.
+                # Visibility (warn) and action (throttle) are gated differently on purpose:
+                # warning fires on the process's own per-core CPU (raw_c) regardless of
+                # system load — purely informational, matches what Activity Monitor already
+                # shows. Throttling stays on the normalized, system-wide-gated value (c),
+                # unchanged from before — auto-renicing a process doing legitimate one-core
+                # work while the rest of the Mac has headroom is a bigger behavioral call
+                # than just telling the user about it, and still requires heavy multi-core
+                # saturation plus overall system load, exactly as originally designed.
+                if name not in PROTECTED and pid not in throttled:
+                    if sys_cpu >= CPU_WARN and c >= CPU_THROTTLE:
+                        to_throttle.append((p, name, pid, raw_c))
+                    elif raw_c >= CPU_WARN and _now_active - self._cpu_warned_ts.get(pid, 0) >= 60:
+                        self._cpu_warned_ts[pid] = _now_active
                         self.issues += 1
                         self._emit("warn",
-                            f"High CPU: {name} (PID {pid}) using {c:.0f}%")
+                            f"High CPU: {name} (PID {pid}) using {raw_c:.0f}%")
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
         rows.sort(key=lambda x: (x[1], x[0]), reverse=True)  # memory first, CPU as tiebreaker
+        # A CPU-heavy but memory-light process (e.g. a helper pegging one core) could be
+        # sorted out of a memory-only top 12 entirely — union in the top-by-CPU processes
+        # too so a live CPU spike is never invisible in the table, same as Activity Monitor.
+        _top_by_cpu = sorted(rows, key=lambda x: x[0], reverse=True)[:4]
+        _top_procs  = rows[:9] + [r for r in _top_by_cpu if r not in rows[:9]]
 
         # Restore calmed throttled procs (tiny loop — usually 0–3 items)
         self._restore_calmed_procs(ram_lock)
@@ -1360,7 +1410,7 @@ class BotEngine(threading.Thread):
             self.cpu_hist.append(cpu)
             self.mem_hist.append(vm.percent)
             self.swap_hist.append(swap_pct)
-            self.top_procs = rows[:12]
+            self.top_procs = _top_procs[:12]
             # stash vm/swap for _check_memory() — avoids a second virtual_memory() call
             self._last_vm   = vm
             self._last_swap = swap
@@ -1522,6 +1572,46 @@ class BotEngine(threading.Thread):
             for pid, name in zombies[:5]:
                 self._emit("warn",
                     f"Zombie process: {name} (PID {pid}) — parent process may be hung")
+
+    def _check_crash_reports(self):
+        """
+        Surface real app crash/exception reports from macOS's own crash reporter —
+        the same class of "error" Activity Monitor / Console.app shows, which this bot
+        otherwise never looks at (it only sees live psutil metrics, not crash history).
+
+        Reads only the lightweight first-line JSON header of each .ips file (app_name,
+        timestamp, bug_type) — never the full multi-KB stack-trace body. Only alerts on
+        reports that appear *after* the bot started watching; the pre-existing backlog is
+        seeded into _seen_crash_reports on the first call without emitting for it, so a
+        restart doesn't dump a history of old crashes into the Activity Log.
+        """
+        reports_dir = Path.home() / "Library" / "Logs" / "DiagnosticReports"
+        if not reports_dir.is_dir():
+            return
+        try:
+            files = list(reports_dir.glob("*.ips")) + list(reports_dir.glob("Retired/*.ips"))
+        except OSError:
+            return
+
+        first_run = not self._crash_reports_seeded
+        for f in files:
+            key = f.name
+            if key in self._seen_crash_reports:
+                continue
+            self._seen_crash_reports.add(key)
+            if first_run:
+                continue  # seed silently — don't alert on pre-existing backlog
+            try:
+                with open(f, "r") as fh:
+                    header = json.loads(fh.readline())
+                app_name  = header.get("app_name", f.stem)
+                timestamp = header.get("timestamp", "")
+            except Exception:
+                continue  # malformed or legacy plain-text .crash-style file — skip, not fatal
+            self.issues += 1
+            self._emit("issue", f"{app_name} crashed at {timestamp}")
+
+        self._crash_reports_seeded = True
 
     def _track_memory_leaks(self):
         """Flag processes whose RSS is growing rapidly (potential leaks)."""
