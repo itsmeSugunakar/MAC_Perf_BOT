@@ -519,6 +519,8 @@ NEVER_TERMINATE = {
     "CredentialProviderExtensionHelper",
     "Keychain Circle Notification",
     "com.apple.iCloud.Keychain",
+    "SoftwareUpdateSettingsExtension",
+    "SoftwareUpdateSettingsWidgetExtension",
 }
 IDLE_SERVICE_PATTERNS = (
     "Widget", "Extension", "XPCService", "HelperService",
@@ -1329,7 +1331,7 @@ class BotEngine(threading.Thread):
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-        rows.sort(reverse=True)
+        rows.sort(key=lambda x: (x[1], x[0]), reverse=True)  # memory first, CPU as tiebreaker
 
         # Restore calmed throttled procs (tiny loop — usually 0–3 items)
         self._restore_calmed_procs(ram_lock)
@@ -3649,25 +3651,27 @@ HTML = r"""<!DOCTYPE html>
   .npa-badge-warm{background:rgba(228,179,65,.15);color:var(--orange)}
   .npa-badge-on{background:rgba(63,185,80,.15);color:var(--green)}
   .npa-fc{font-size:9px;color:var(--muted);margin-left:auto}
-  .npa-rec{display:flex;gap:8px;padding:6px 10px;border-bottom:1px solid var(--border);
+  .npa-rec{display:flex;gap:10px;padding:8px 12px;border-bottom:1px solid var(--border);
     align-items:flex-start}
   .npa-rec:last-child{border-bottom:none}
-  .npa-ico{font-size:14px;flex-shrink:0;line-height:1.6}
+  .npa-ico{font-size:15px;flex-shrink:0;line-height:1.7}
   .npa-body{flex:1;min-width:0}
-  .npa-ttl{font-size:10px;font-weight:700;color:var(--text);margin-bottom:2px}
-  .npa-det{font-size:9px;color:var(--muted);line-height:1.4;margin-bottom:2px}
-  .npa-act{font-size:9px;color:var(--blue);font-weight:600}
+  .npa-ttl{font-size:11px;font-weight:700;color:var(--text);margin-bottom:2px}
+  .npa-det{font-size:10px;color:var(--muted);line-height:1.4;margin-bottom:2px}
+  .npa-act{font-size:10px;color:var(--blue);font-weight:600}
   .npa-conf{font-size:8px;color:var(--muted2);margin-left:auto;flex-shrink:0;align-self:center}
   .npa-p0{border-left:3px solid var(--red)}
   .npa-p1{border-left:3px solid var(--orange)}
   .npa-p2{border-left:3px solid var(--blue)}
   .npa-p3{border-left:3px solid var(--muted2)}
   .npa-p4{border-left:3px solid var(--green)}
-  .npa-btn{display:inline-block;margin-top:5px;padding:3px 9px;font-size:9px;font-weight:700;
-    border:1px solid var(--border);border-radius:4px;background:var(--surface);
-    color:#4a86e8;cursor:pointer;transition:background .15s}
-  .npa-btn:hover{background:rgba(74,134,232,.1)}
-  .npa-btn:disabled{opacity:.6;cursor:default}
+  .npa-btn{display:inline-flex;align-items:center;gap:4px;margin-top:7px;
+    padding:5px 13px;font-size:11px;font-weight:600;
+    border:1px solid #4a86e8;border-radius:6px;background:rgba(74,134,232,.08);
+    color:#4a86e8;cursor:pointer;transition:all .15s;letter-spacing:.01em}
+  .npa-btn:hover{background:rgba(74,134,232,.18);border-color:#3a76d8;transform:translateY(-1px)}
+  .npa-btn:active{transform:translateY(0)}
+  .npa-btn:disabled{opacity:.5;cursor:default;transform:none}
 
   /* ── Summary recent actions list ── */
   .sum-actions-hdr{padding:6px 12px;font-size:9px;font-weight:700;text-transform:uppercase;
@@ -3681,37 +3685,37 @@ HTML = r"""<!DOCTYPE html>
 
   /* ── Summary tab ── */
   .sum-wrap{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
-  .sum-top-row{display:flex;gap:10px;align-items:stretch;flex-shrink:0}
-  .sum-hero-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;display:flex;align-items:center;gap:16px;flex:0 0 auto;min-width:220px}
-  .sum-ai-panel{flex:1;min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;display:flex;flex-direction:column}
-  .sum-ai-hdr{padding:8px 12px;border-bottom:1px solid var(--border);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.55px;color:var(--muted);display:flex;align-items:center;flex-shrink:0}
+  .sum-top-row{display:flex;gap:12px;align-items:stretch;flex-shrink:0}
+  .sum-hero-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;display:flex;align-items:center;gap:16px;flex:0 0 300px}
+  .sum-ai-panel{flex:1;min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;min-height:260px;max-height:460px}
+  .sum-ai-hdr{padding:9px 14px;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.55px;color:var(--muted);display:flex;align-items:center;flex-shrink:0;background:rgba(74,134,232,.04)}
   .sum-ai-body{flex:1;overflow-y:auto}
-  .sum-score-block{display:flex;align-items:baseline;gap:2px;flex-shrink:0;width:88px;justify-content:center;flex-direction:column;align-items:center;padding:8px;border:3px solid var(--green);border-radius:50%;width:80px;height:80px;justify-content:center}
-  .sum-score-num{font-size:30px;font-weight:800;line-height:1;transition:color .3s}
-  .sum-score-denom{font-size:11px;color:var(--muted);font-weight:500;line-height:1}
+  .sum-score-block{display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0;width:84px;height:84px;border:3px solid var(--green);border-radius:50%;padding:8px;transition:border-color .3s}
+  .sum-score-num{font-size:28px;font-weight:800;line-height:1;transition:color .3s}
+  .sum-score-denom{font-size:10px;color:var(--muted);font-weight:500;line-height:1.4}
   .sum-hero-info{flex:1;min-width:0}
   .sum-hero-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:5px}
   .sum-hero-title{font-size:15px;font-weight:700;color:var(--text)}
   .sum-hero-status{font-size:11px;color:var(--muted);line-height:1.5;margin-bottom:6px}
   .sum-hero-pills{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
-  .sum-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;flex-shrink:0}
-  .sum-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
-  .sum-card-lbl{font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.55px;color:var(--muted);margin-bottom:3px}
-  .sum-card-val{font-size:22px;font-weight:700;line-height:1.1;transition:color .3s}
-  .sum-card-sub{font-size:9px;color:var(--muted);margin-top:2px}
-  .sum-issue-alert{background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.3);border-radius:8px;padding:10px 14px;flex-shrink:0;display:none}
-  .sum-issue-title{font-size:11px;font-weight:700;color:var(--red);margin-bottom:3px}
+  .sum-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;flex-shrink:0}
+  .sum-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+  .sum-card-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:4px}
+  .sum-card-val{font-size:24px;font-weight:700;line-height:1.1;transition:color .3s}
+  .sum-card-sub{font-size:9px;color:var(--muted);margin-top:3px}
+  .sum-issue-alert{background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.3);border-radius:12px;padding:12px 16px;flex-shrink:0;display:none}
+  .sum-issue-title{font-size:12px;font-weight:700;color:var(--red);margin-bottom:4px}
   .sum-issue-action{font-size:10px;color:var(--muted)}
-  .sum-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;flex-shrink:0}
-  .sum-section-hdr{padding:8px 14px;border-bottom:1px solid var(--border);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.55px;color:var(--muted);display:flex;align-items:center}
+  .sum-section{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;flex-shrink:0}
+  .sum-section-hdr{padding:10px 16px;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);display:flex;align-items:center}
   .sum-bot-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border)}
   .sum-bot-cell{background:var(--surface);padding:10px 14px}
   .sum-bot-cell-lbl{font-size:9px;color:var(--muted);margin-bottom:3px}
   .sum-bot-cell-val{font-size:18px;font-weight:700;transition:color .3s}
   .sum-bot-cell-sub{font-size:9px;color:var(--muted);margin-top:2px}
   /* ── What the Bot Did rows ── */
-  .sum-did-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;flex-shrink:0}
-  .sum-did-hdr{padding:9px 14px;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px}
+  .sum-did-section{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;flex-shrink:0}
+  .sum-did-hdr{padding:10px 16px;border-bottom:1px solid var(--border);font-size:11px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px}
   .sum-did-hdr-sub{font-size:9px;font-weight:400;color:var(--muted);margin-left:auto}
   .sum-did-row{display:flex;align-items:flex-start;gap:11px;padding:10px 14px;border-bottom:1px solid var(--border)}
   .sum-did-row:last-of-type{border-bottom:none}
@@ -3722,8 +3726,8 @@ HTML = r"""<!DOCTYPE html>
   .sum-did-val{font-size:14px;font-weight:700;flex-shrink:0;font-family:'SF Mono',monospace;min-width:56px;text-align:right;align-self:center}
   .sum-smart-line{padding:9px 14px;font-size:10px;color:var(--text);line-height:1.5;border-top:1px solid var(--border);background:var(--bg);font-style:italic}
   /* ── Health Record ── */
-  .sum-health-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;flex-shrink:0}
-  .sum-health-hdr{padding:9px 14px;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--text)}
+  .sum-health-section{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;flex-shrink:0}
+  .sum-health-hdr{padding:10px 16px;border-bottom:1px solid var(--border);font-size:11px;font-weight:700;color:var(--text)}
   .sum-contain-wrap{padding:12px 14px;border-bottom:1px solid var(--border)}
   .sum-contain-label{display:flex;justify-content:space-between;font-size:10px;color:var(--text);font-weight:600;margin-bottom:6px}
   .sum-contain-bar-bg{height:8px;border-radius:4px;background:var(--border);overflow:hidden}
@@ -3817,6 +3821,7 @@ HTML = r"""<!DOCTYPE html>
           <span class="tier-badge t0" id="sumTierBadge"><div class="tier-dot"></div><span id="sumTierLabel">All Good</span></span>
         </div>
         <div class="sum-hero-status" id="sumStatusLine">Initializing…</div>
+        <div id="sumScoreTip" style="font-size:10px;color:var(--muted);margin-bottom:5px;line-height:1.4"></div>
         <div class="sum-hero-pills">
           <span id="sumUptimePill" class="pill">⏱ 0s</span>
           <span id="sumPowerPill"  class="pill">⚡ AC</span>
@@ -3848,6 +3853,12 @@ HTML = r"""<!DOCTYPE html>
 
   </div><!-- /sum-top-row -->
 
+  <!-- Issue Alert (shown when root cause is active — before stat cards for visual priority) -->
+  <div id="sumIssueAlert" class="sum-issue-alert">
+    <div class="sum-issue-title" id="sumIssueTitle"></div>
+    <div class="sum-issue-action" id="sumIssueAction"></div>
+  </div>
+
   <!-- Quick Stats (4 cards) -->
   <div class="sum-cards">
     <div class="sum-card">
@@ -3870,12 +3881,6 @@ HTML = r"""<!DOCTYPE html>
       <div class="sum-card-val" id="sumDiskVal" style="color:var(--blue)">—</div>
       <div class="sum-card-sub">available</div>
     </div>
-  </div>
-
-  <!-- Issue Alert (shown when root cause is active) -->
-  <div id="sumIssueAlert" class="sum-issue-alert">
-    <div class="sum-issue-title" id="sumIssueTitle"></div>
-    <div class="sum-issue-action" id="sumIssueAction"></div>
   </div>
 
   <!-- What the Bot Did For You -->
@@ -4531,9 +4536,17 @@ async function handleRecAction(btn) {
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({pid, action: atype})});
     }
-    const ok = (await resp.json()).ok;
-    btn.textContent = ok ? '✅ Done — outcome in 2 min' : '❌ Failed';
-    btn.style.color = ok ? 'var(--green)' : 'var(--red)';
+    const d = await resp.json();
+    if (d.ok && d.gone) {
+      btn.textContent = '✅ Already ended — resolved';
+    } else if (d.ok) {
+      btn.textContent = atype === 'freeze' ? '❄️ Frozen — watch 2 min'
+                      : atype === 'remediate' ? '⚡ Running…'
+                      : '✅ Done';
+    } else {
+      btn.textContent = '❌ Failed (protected process)';
+    }
+    btn.style.color = d.ok ? 'var(--green)' : 'var(--red)';
   } catch(e) {
     btn.textContent = '❌ Error';
   }
@@ -4704,6 +4717,16 @@ function renderSummary(d) {
   const stb=document.getElementById('sumTierBadge');if(stb)stb.className='tier-badge t'+etier;
   sv('sumTierLabel',tierLabels[etier]||('Tier '+etier));
 
+  // Score interpretation tip under status line (Fix 8)
+  const stEl=document.getElementById('sumScoreTip');
+  if(stEl){
+    if(ps<0) stEl.textContent='Warming up — score available after a few minutes';
+    else if(ps>=80) stEl.textContent='Running well today ('+ps+'/100)';
+    else if(ps>=60) stEl.textContent='Some memory pressure today ('+ps+'/100)';
+    else if(ps>=40) stEl.textContent='Above-average load — bot is actively helping ('+ps+'/100)';
+    else stEl.textContent='Heavy load day — bot is working hard to keep things running ('+ps+'/100)';
+  }
+
   // Plain-language status line
   const statusLines=['Your Mac is running smoothly. No action needed.',
     'Memory is being monitored. Everything under control.',
@@ -4746,7 +4769,7 @@ function renderSummary(d) {
   const sr=document.getElementById('sumNpaRecs');
   if(sr&&recs.length){
     const pc=['npa-p0','npa-p1','npa-p2','npa-p3','npa-p4'];
-    sr.innerHTML=recs.slice(0,3).map(r=>{
+    sr.innerHTML=recs.map(r=>{
       const cls=pc[Math.min(r.priority==null?3:r.priority,4)];
       const conf=r.confidence!=null?Math.round(r.confidence*100)+'%':'';
       const btn=r.action_type
@@ -4812,11 +4835,11 @@ function renderSummary(d) {
   sv('sumRelFreed', freedMb>0?fmtMem(freedMb):'—', freedMb>0?'var(--green)':'var(--muted)');
   if(freedMb>0){
     setText('sumDidTitleFreed','Cleared idle services & stale apps');
-    setText('sumDidSubFreed','Your Mac has more breathing room — '+fmtMem(freedMb)+' returned to the system');
+    setText('sumDidSubFreed',fmtMem(freedMb)+' freed up — your Mac can breathe again');
     setCol('sumRelFreed','var(--green)');
   } else {
     setText('sumDidTitleFreed','No apps needed clearing');
-    setText('sumDidSubFreed','All running apps are actively being used');
+    setText('sumDidSubFreed','Everything running is actively being used — nothing to clean up');
     setCol('sumRelFreed','var(--muted)');
   }
 
@@ -4824,47 +4847,52 @@ function renderSummary(d) {
   sv('sumRelSuspended', suspendedMb>0?fmtMem(suspendedMb):'—', suspendedMb>0?'var(--yellow)':'var(--muted)');
   if(frozenNow>0){
     setText('sumDidTitlePaused', frozenNow+' background task'+(frozenNow>1?'s':'')+ ' paused right now');
-    setText('sumDidSubPaused','They are sleeping to ease memory pressure — will resume automatically when safe');
+    setText('sumDidSubPaused','Paused temporarily — they\'ll wake up once memory calms down');
   } else if(suspendedMb>0){
     setText('sumDidTitlePaused','Paused background tasks when needed');
-    setText('sumDidSubPaused',fmtMem(suspendedMb)+' eased during high-pressure moments — all resumed safely');
+    setText('sumDidSubPaused',fmtMem(suspendedMb)+' held back during peak pressure — all safely resumed after');
   } else {
     setText('sumDidTitlePaused','No background tasks needed pausing');
-    setText('sumDidSubPaused','Memory pressure stayed low enough that nothing had to be put to sleep');
+    setText('sumDidSubPaused','Memory stayed calm enough — nothing had to be put on hold');
   }
 
   // Row 3 — confirmed real savings
   sv('sumRelConfirmed', confirmedMb>0?fmtMem(confirmedMb):'—', confirmedMb>0?'var(--blue)':'var(--muted)');
   if(confirmedMb>0){
     setText('sumDidTitleConfirmed', fmtMem(confirmedMb)+' of real memory recovered');
-    setText('sumDidSubConfirmed','Measured 2 minutes after each action — this is actual improvement, not an estimate');
+    setText('sumDidSubConfirmed','Verified real savings — not an estimate, measured 2 min after each action');
     setCol('sumRelConfirmed','var(--blue)');
   } else if(vaT>0){
     setText('sumDidTitleConfirmed','Recovery measurement in progress');
-    setText('sumDidSubConfirmed','Bot acted recently — results are verified 2 min after each intervention');
+    setText('sumDidSubConfirmed','Just acted — measuring the result now, check back in 2 minutes');
   } else {
     setText('sumDidTitleConfirmed','No interventions yet — nothing to measure');
     setText('sumDidSubConfirmed','Measurements appear automatically after the bot steps in');
   }
 
-  // Smart one-liner
+  // Smart one-liner — tier-aware, specific (Fix 5b)
   const miEl=document.getElementById('sumMemInference');
   if(miEl){
     const atSavedGb=va.alltime_ram_saved_gb||0;
-    if(vaT===0 && freedMb===0 && suspendedMb===0){
-      miEl.textContent='Your Mac is running cleanly on its own. The bot is watching and ready to step in if needed.';
+    const tierLabels2=['All Good','Watching','Intervening','Rescue Mode','Emergency'];
+    if(etier>=3){
+      miEl.textContent='Your Mac is under serious memory pressure right now. The bot is in '
+        +tierLabels2[etier]+' mode — background tasks are being paused automatically.';
+    } else if(frozenNow>0){
+      miEl.textContent=frozenNow+' background process'+(frozenNow>1?'es are':' is')+' paused right now to free up memory. '
+        +'They\'ll resume automatically when pressure drops.';
     } else if(confirmedMb>0 && freedMb>0){
       miEl.textContent='Great session — the bot freed '+fmtMem(freedMb)+' permanently and confirmed '+fmtMem(confirmedMb)+' of actual memory recovery.';
     } else if(confirmedMb>0){
-      miEl.textContent='The bot confirmed '+fmtMem(confirmedMb)+' of real memory recovery today — measured, not estimated.';
+      miEl.textContent='The bot saved '+fmtMem(confirmedMb)+' of real memory today — verified, not estimated.';
     } else if(freedMb>0){
       miEl.textContent='The bot cleared '+fmtMem(freedMb)+' by closing idle services. Your Mac has more room to breathe.';
     } else if(suspendedMb>0){
       miEl.textContent='The bot paused '+fmtMem(suspendedMb)+' of background processes to ease pressure. They auto-resume when memory is healthy.';
     } else if(atSavedGb>0){
-      miEl.textContent='All-time: '+atSavedGb.toFixed(1)+' GB saved across '+(va.alltime_interventions||0)+' interventions. Today looks stable so far.';
+      miEl.textContent='All-time: '+atSavedGb.toFixed(1)+' GB saved across '+(va.alltime_interventions||0)+' rescues. Everything is calm right now.';
     } else {
-      miEl.textContent='Bot is active. Interventions recorded — waiting for measurement window to close.';
+      miEl.textContent='Everything is calm. Bot is watching in the background.';
     }
   }
 
@@ -4893,9 +4921,13 @@ function renderSummary(d) {
     }
   }
 
-  // Crises averted
+  // Crises averted — contextual sub-text (Fix 5c)
   sv('sumCrisesVal', allSucc>0?String(allSucc):'0', allSucc>0?'var(--green)':'var(--muted)');
-  setText('sumCrisesSub', allSucc>0?'times your Mac could have slowed down':'no crises yet');
+  const crisesCtx=allSucc===0?'nothing needed fixing yet'
+    :allSucc<10?'early days — building history'
+    :allSucc<50?allSucc+' times your Mac was rescued'
+    :allSucc+' rescues — your Mac is well protected';
+  setText('sumCrisesSub', crisesCtx);
 
   // Success rate
   sv('sumSuccessRate', vasr!=null&&vaT>0?(vasr*100).toFixed(0)+'%':'—',
@@ -4931,33 +4963,49 @@ function renderSummary(d) {
   const throttledSet=new Set(Object.keys(d.throttled||{}).map(Number));
   const spl=document.getElementById('sumProcList');
   if(spl&&procs.length){
-    const topProcs=procs.slice(0,6);
+    const topProcs=procs.slice(0,8);  // show top 8, sorted by memory (Fix 7)
     const topMem=topProcs[0]?topProcs[0][1]:1;
+    const totalGb=d.mem_total_gb||16;
     spl.innerHTML=topProcs.map(([cpu,m,pid,name,status])=>{
       const mc3=m>=12?'var(--red)':m>=5?'var(--yellow)':'var(--mem)';
       const bw=Math.min((m/Math.max(topMem,1))*100,100);
       const isLeak=leakSet.has(pid);
       const isThrottled=throttledSet.has(pid);
+      // Show actual MB instead of % (Fix 3)
+      const memMb=Math.round(m/100*totalGb*1024);
+      const memLabel=memMb>=1024?(memMb/1024).toFixed(1)+' GB':memMb+' MB';
       const badge=isLeak?'<span style="font-size:8px;background:var(--red);color:#fff;border-radius:3px;padding:1px 4px;margin-left:5px">LEAK</span>'
         :isThrottled?'<span style="font-size:8px;background:var(--orange);color:#fff;border-radius:3px;padding:1px 4px;margin-left:5px">THROTTLED</span>':'';
-      const hint=isLeak?' — restarting it would free memory'
-        :isThrottled?' — slowed down to protect other apps'
-        :m>=12?' — using a lot of RAM; close if you\'re not using it'
-        :m>=5?' — moderate usage, normal'
-        :'';
-      return '<div class="sum-proc-row" title="'+name+hint+'">'+
+      const hint=isLeak?' — restarting it would free memory ('+memLabel+')'
+        :isThrottled?' — CPU slowed down to protect other apps ('+memLabel+' RAM)'
+        :m>=12?' — using a lot of RAM ('+memLabel+'); close if not needed'
+        :m>=5?' — moderate usage ('+memLabel+')'
+        :'('+memLabel+' RAM, '+m.toFixed(1)+'% CPU)';
+      return '<div class="sum-proc-row" title="'+name+': '+memLabel+' RAM ('+m.toFixed(1)+'%), '+cpu.toFixed(1)+'% CPU'+hint+'">'+
         '<div class="sum-proc-name">'+name+badge+'</div>'+
         '<div class="sum-proc-bar-wrap"><div class="sum-proc-bar">'+
         '<div class="sum-proc-bar-fill" style="width:'+bw.toFixed(1)+'%;background:'+mc3+'"></div></div></div>'+
-        '<div class="sum-proc-pct" style="color:'+mc3+'">'+m.toFixed(1)+'%</div></div>';
+        '<div class="sum-proc-pct" style="color:'+mc3+'">'+memLabel+'</div></div>';
     }).join('');
-    // hint footer
+    // hint footer (Fix 6 — include app risk if available)
     const hintEl=document.getElementById('sumProcHint');
     if(hintEl){
       const top=topProcs[0];
-      if(top&&top[1]>=12) hintEl.textContent='⚠ '+top[3]+' is your biggest memory consumer right now.';
-      else if(leakSet.size>0) hintEl.textContent='💡 A process is growing continuously — consider restarting it.';
-      else hintEl.textContent='✓ No single app is dominating memory right now.';
+      const appPreds=d.app_predictions||[];
+      const highRisk=appPreds.filter(a=>a.risk==='high').sort((a,b)=>b.mb-a.mb);
+      if(highRisk.length>0){
+        const ar=highRisk[0];
+        const trend=ar.trend==='rising'?' and growing ↑':'';
+        hintEl.textContent='⚠️ '+ar.app+' is using '+(ar.mb/1024).toFixed(1)+' GB'+trend+' — your biggest memory load today.';
+      } else if(top&&top[1]>=12){
+        const topMb=Math.round(top[1]/100*totalGb*1024);
+        const topLabel=topMb>=1024?(topMb/1024).toFixed(1)+' GB':topMb+' MB';
+        hintEl.textContent='⚠ '+top[3]+' is your biggest memory consumer ('+topLabel+') right now.';
+      } else if(leakSet.size>0){
+        hintEl.textContent='💡 A process is growing continuously — consider restarting it to free memory.';
+      } else {
+        hintEl.textContent='✓ No single app is dominating memory right now.';
+      }
     }
   }
 }
@@ -5590,8 +5638,17 @@ class Handler(BaseHTTPRequestHandler):
                 body   = json.loads(self.rfile.read(length))
                 pid    = int(body.get("pid", 0))
                 action = body.get("action", "")
-                ok = False
-                if   action == "freeze"   and pid: ok = _engine.freeze_pid(pid)
+                ok   = False
+                gone = False   # True when process no longer exists (threat neutralized)
+                if action == "freeze" and pid:
+                    try:
+                        import psutil as _ps
+                        _ps.Process(pid).name()   # raises NoSuchProcess if gone
+                        ok = _engine.freeze_pid(pid)
+                    except _ps.NoSuchProcess:
+                        ok = True; gone = True    # process already ended — good outcome
+                    except Exception:
+                        ok = False
                 elif action == "thaw"     and pid: ok = _engine.thaw_pid(pid)
                 elif action == "kill"     and pid: ok = _engine.kill_pid(pid)
                 elif action == "throttle" and pid:
@@ -5601,7 +5658,7 @@ class Handler(BaseHTTPRequestHandler):
                         ok = True
                     except Exception:
                         ok = False
-                self._send(200, "application/json", json.dumps({"ok": ok}).encode())
+                self._send(200, "application/json", json.dumps({"ok": ok, "gone": gone}).encode())
             except Exception as e:
                 self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
         elif path == "/remediate":
