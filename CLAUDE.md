@@ -13,7 +13,7 @@
 |--------------------|-----------------------------------------------------|
 | **App Name**       | MAC Performance Bot                                 |
 | **Short Name**     | mac-perf-bot                                        |
-| **Version**        | 2.4.0                                               |
+| **Version**        | 2.5.0                                               |
 | **Owner**          | itsmeSugunakar                                      |
 | **Contact**        | sugun.sr@gmail.com                                  |
 | **Repository**     | https://github.com/itsmeSugunakar/MAC_Perf_BOT      |
@@ -131,6 +131,7 @@ MAC_Perf_BOT/
 | 30 s (IDLE_SWEEP_S) | `_sweep_idle_services()` | Tier 4 idle XPC/widget termination |
 | 60 s | `_check_thermal()` | `pmset` thermal throttle check |
 | 60 s | `_check_zombies()` | Zombie process detection |
+| 60 s | `_check_crash_reports()` | Crash Report Monitor — surfaces new `~/Library/Logs/DiagnosticReports/*.ips` entries into the Activity Log |
 | 60 s | `_track_memory_leaks()` | Per-process RSS growth rate |
 | 60 s | `_check_circadian_pressure()` | CMPE hour-of-day profile refresh + proactive pre-freeze |
 | 60 s | `_run_npa()` | NPA inference — predict next-60s RAM/CPU + generate recommendations; trains from DB on first tick and every 6 h |
@@ -157,7 +158,8 @@ MAC_Perf_BOT/
 | **CPU-RAM Conflict Gate**        | `app/performance_gui.py` | `_restore_calmed_procs()` — defers `nice(0)` for top-RAM families under Tier 3+ lock |
 | **Genealogy Freeze Scoring**     | `app/performance_gui.py` | `_freeze_background_daemons()` — `(family×2 + pattern×1) × velocity_boost` |
 | **XPC Respawn Guard**            | `app/performance_gui.py` | `_detect_xpc_respawn()` — blocklists respawning launchd services            |
-| **MetricsCache**                 | `app/performance_gui.py` | SQLite 90-day disk store; `thermal_pct` column; v2.0 tables: `remediation_outcomes`, `signal_weights` |
+| **Crash Report Monitor**         | `app/performance_gui.py` | `_check_crash_reports()` — reads only the first-line JSON header of new `~/Library/Logs/DiagnosticReports/*.ips` files; seeds pre-existing backlog silently on first run, then emits an `issue` event per new crash via `_emit()` |
+| **MetricsCache**                 | `app/performance_gui.py` | SQLite 90-day disk store; `thermal_pct` column; v2.0 tables: `remediation_outcomes`, `signal_weights`; WAL journal mode (`PRAGMA journal_mode=WAL`) so the once-daily `prune()` writer doesn't block the once-a-second `/stats` reader; `interventions_today()` result cached ~20s for the same reason |
 | `_restore_calmed_procs()`        | `app/performance_gui.py` | CPU priority restore loop — only touches `self.throttled` (0–3 items)      |
 | **App Predictions**              | `app/performance_gui.py` | `_analyse_app_predictions()` — 24 h risk analysis from cache                |
 | `Handler` (HTTP)                 | `app/performance_gui.py` | Serves PWA dashboard + JSON API + manifest + SVG icon                       |
@@ -677,6 +679,7 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 - No credentials, tokens, or secrets in code or config.
 - Renicing and signalling unprivileged processes does not require `sudo`.
 - Disk cache (`metrics.db`) contains only numeric metric values — no process names, file paths, or user-identifiable data are stored.
+- Crash Report Monitor reads `~/Library/Logs/DiagnosticReports/*.ips` — the only place the bot reads files outside its own metrics/log directories. It parses only the first JSON line of each report (app name, timestamp, bug type); the full report (which can contain a stack trace and, rarely, user data referenced in it) is never opened or transmitted anywhere — the parsed summary only ever reaches the local Activity Log.
 
 ---
 
@@ -713,6 +716,8 @@ To manually clear: `rm ~/Library/Application\ Support/performance-bot/metrics.db
 | NPA prediction horizon | Outputs represent the average of the *next 60 seconds*, not the next hour — the label "AI Insights" describes the trend direction. The recommendation text is worded to avoid implying 60-minute precision. |
 | NPA training time | Fetching all 30-day rows (~62K) takes ~0.5 s; 600 samples × 40 epochs of pure-Python SGD takes ~2–3 s. Both run in the engine thread; no perceived dashboard lag because the engine sleeps 1 s/tick. |
 | NPA distribution shift | If the machine undergoes a sustained change in workload type (e.g., new always-on process), predictions drift until the next 6-hour retrain incorporates recent data. |
+| Crash Report Monitor scope | `_check_crash_reports()` only parses the first-line JSON header of `.ips` files (`app_name`, `timestamp`, `bug_type`) — it does not read the stack-trace body, and silently skips legacy plain-text `.crash` files (pre-macOS 12 format) if any are ever present. It also doesn't distinguish severity — every new report emits one `issue` event regardless of `bug_type`. |
+| High-CPU warning cooldown | The per-process "High CPU" warning uses raw (unnormalized) CPU and a 60 s per-pid cooldown (`_cpu_warned_ts`) — a process pegging one core continuously logs one warning per minute, not one per second. The auto-throttle *action* threshold is unchanged and still requires system-wide CPU ≥ `CPU_WARN` as well as the process ≥ `CPU_THROTTLE` (normalized) — so a visible warning does not always mean the bot will act. |
 
 ---
 

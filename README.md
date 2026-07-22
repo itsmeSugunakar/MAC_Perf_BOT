@@ -128,6 +128,7 @@ The bot runs a single `psutil.process_iter()` scan every second and layers auton
 | 30 s | `_detect_xpc_respawn()` | XPC Respawn Guard scan |
 | 30 s | `_sweep_idle_services()` | Tier-4 idle XPC termination window |
 | 60 s | `_check_thermal()` | `pmset` thermal throttle |
+| 60 s | `_check_crash_reports()` | Surfaces new macOS crash/exception reports (`~/Library/Logs/DiagnosticReports/*.ips`) into the Activity Log |
 | 60 s | `_track_memory_leaks()` | Per-process RSS growth rate |
 | 60 s | `_check_circadian_pressure()` | CMPE hour-of-day profile + proactive pre-freeze |
 | 60 s | `_run_npa()` | NPA inference — next-60 s RAM/CPU + anomaly + 5 AI recommendations |
@@ -224,6 +225,8 @@ Expert diagnostics and historical data.
 - **Thermal-memory coupling (TMCP)** — EMA-learned coefficient shortens TTE under CPU throttle
 - **CPU-RAM Conflict Resolution Gate** — blocks CPU priority restoration for top RAM owners under active pressure
 - **XPC Respawn Guard** — blocklists launchd services that respawn within 10 s
+- **Crash Report Monitor** — surfaces real macOS crash/exception reports into the Activity Log, the same class of "error" Activity Monitor / Console.app shows; reads only the lightweight report header, never the full stack trace
+- **Activity-Monitor-accurate CPU visibility** — top-process table unions top-by-memory with top-by-CPU so a single-core spike is never hidden behind a memory-only sort; the "High CPU" warning uses raw per-core CPU (matching `ps`/Activity Monitor's 100%-per-core convention) instead of a system-wide-normalized value
 - **90-day disk cache** — SQLite; batch-flushed every 60 s; pruned daily; powers all engine learning loops
 - **Zero heavy dependencies** — only `psutil` + Python stdlib; optional `onnx` / `onnxruntime` for CDA ONNX export
 - **Lightweight by design** — single `psutil.process_iter()` per second; all syscalls cached; O(1) event ring-buffer
@@ -307,7 +310,7 @@ bash scripts/uninstall.sh
 | Property | Value |
 |----------|-------|
 | Location | `~/Library/Application Support/performance-bot/metrics.db` |
-| Format | SQLite (Python `sqlite3` stdlib — no extra dependency) |
+| Format | SQLite (Python `sqlite3` stdlib — no extra dependency), WAL journal mode |
 | Core schema | `ts, cpu_pct, mem_pct, swap_pct, disk_pct, pressure, eff_tier, tte_min, thermal_pct` |
 | v2.0 tables | `remediation_outcomes` (RAC outcome log) · `signal_weights` (RWA weight history) |
 | Write cadence | Batch `executemany()` every 60 s |
