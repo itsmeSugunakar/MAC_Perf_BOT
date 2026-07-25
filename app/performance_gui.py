@@ -9,8 +9,10 @@ import os, sys, time, json, threading, subprocess, webbrowser, sqlite3, math
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+import llm_engine  # optional — degrades cleanly if mlx-lm isn't installed (see llm_engine.py)
 
 try:
     import psutil
@@ -33,6 +35,10 @@ CACHE_RETENTION_DAYS = 90     # rows older than this are pruned
 CACHE_WRITE_S        = 60     # flush in-memory buffer to disk every N seconds
 CACHE_PRUNE_S        = 86400  # prune expired rows once per day
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─── LLM Insights (offline MLX — optional, see llm_engine.py) ─────────────────
+LLM_DAILY_DIGEST_COOL_S  = 86400   # generate the daily digest at most once/day
+LLM_WEEKLY_DIGEST_COOL_S = 604800  # generate the weekly digest at most once/week
 
 
 class MetricsCache:
@@ -399,6 +405,25 @@ class MetricsCache:
                 {"ts": r[0], "tier": r[1], "action": r[2],
                  "pre_mem": r[3], "post_mem": r[4],
                  "delta_mb": round(r[5] or 0, 0), "success": bool(r[6])}
+                for r in rows
+            ]
+        except Exception:
+            return []
+
+    def outcomes_since(self, cutoff_ts: int) -> list:
+        """Return remediation outcomes at/after cutoff_ts (oldest first) — feeds
+        the LLM digest prompt (see llm_engine.py's _build_digest_prompt)."""
+        if not self._ok:
+            return []
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT ts, tier, action, delta_mb, success "
+                    "FROM remediation_outcomes WHERE ts >= ? ORDER BY ts", (cutoff_ts,)
+                ).fetchall()
+            return [
+                {"ts": r[0], "tier": r[1], "action": r[2],
+                 "delta_mb": round(r[3] or 0, 0), "success": bool(r[4])}
                 for r in rows
             ]
         except Exception:
@@ -1131,6 +1156,11 @@ class BotEngine(threading.Thread):
         self._npa_recs: list  = []   # [{priority, icon, title, detail, action, confidence}]
         self._npa_next_hour: dict = {}  # {mem: float, cpu: float, anomaly: float}
         self._last_npa: float = 0.0
+        # ── LLM Insights: daily/weekly digest cooldowns ───────────────────────
+        # Loaded from the persisted digest (if any) so a restart doesn't
+        # immediately re-enqueue a generation that already ran recently.
+        self._last_daily_digest_ts  = (llm_engine.get_latest_digest("daily")  or {}).get("ts", 0)
+        self._last_weekly_digest_ts = (llm_engine.get_latest_digest("weekly") or {}).get("ts", 0)
 
     # ── public ────────────────────────────────────────────────────────────────
     def stop(self):
@@ -1246,9 +1276,11 @@ class BotEngine(threading.Thread):
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
-    def _emit(self, kind: str, msg: str, category: str = "user"):
+    def _emit(self, kind: str, msg: str, category: str = "user", meta: dict = None):
         ev = {"kind": kind, "msg": msg, "category": category,
               "ts": datetime.now().strftime("%H:%M:%S")}
+        if meta:
+            ev["meta"] = meta
         with self._lock:
             self.events.append(ev)   # deque(maxlen=200) auto-discards oldest
 
@@ -1295,6 +1327,18 @@ class BotEngine(threading.Thread):
                     if tick == 0 or (self._last_cda_train > 0 and
                             time.time() - self._last_cda_train >= CDA_TRAIN_COOL_S):
                         self._cda_train_model()
+                    # LLM Insights: daily/weekly digest — cooldown-gated exactly like CDA
+                    # training above, but this branch only *enqueues* a background job
+                    # (llm_engine's own worker thread does the actual generation); it never
+                    # runs inference inline in this tick loop.
+                    if llm_engine.is_available():
+                        now_ts = time.time()
+                        if now_ts - self._last_daily_digest_ts >= LLM_DAILY_DIGEST_COOL_S:
+                            self._last_daily_digest_ts = now_ts   # set immediately — no duplicate enqueue
+                            self._enqueue_digest("daily")
+                        if now_ts - self._last_weekly_digest_ts >= LLM_WEEKLY_DIGEST_COOL_S:
+                            self._last_weekly_digest_ts = now_ts
+                            self._enqueue_digest("weekly")
                 except Exception as exc:
                     self._emit("warn", f"Engine error: {exc}")
             tick += 1
@@ -1609,9 +1653,27 @@ class BotEngine(threading.Thread):
             except Exception:
                 continue  # malformed or legacy plain-text .crash-style file — skip, not fatal
             self.issues += 1
-            self._emit("issue", f"{app_name} crashed at {timestamp}")
+            self._emit("issue", f"{app_name} crashed at {timestamp}", meta={"crash_key": key})
 
         self._crash_reports_seeded = True
+
+    def _enqueue_digest(self, period: str):
+        """Gather the digest's context and hand it to llm_engine's background
+        worker — called only from the cooldown-gated check in run(), never
+        does any generation itself. `period`: "daily" | "weekly"."""
+        days = 1 if period == "daily" else 7
+        hourly   = self._cache.hourly_history(days=days)
+        outcomes = self._cache.outcomes_since(int(time.time()) - days * 86400)
+
+        def _on_done(job):
+            if job["status"] == "done":
+                self._emit("info", f"{period.capitalize()} summary ready — see Insights tab",
+                            category="llm")
+            elif job["status"] == "error":
+                self._emit("warn", f"{period.capitalize()} summary generation failed: {job['error']}",
+                            category="llm")
+
+        llm_engine.submit_digest(period, {"hourly": hourly, "outcomes": outcomes}, on_done=_on_done)
 
     def _track_memory_leaks(self):
         """Flag processes whose RSS is growing rapidly (potential leaks)."""
@@ -3884,6 +3946,7 @@ HTML = r"""<!DOCTYPE html>
   <button class="btn tab-btn tab-active" id="tabSummary" onclick="showTab('summary')">Summary</button>
   <button class="btn tab-btn" id="tabLive" onclick="showTab('live')">Live</button>
   <button class="btn tab-btn" id="tabAdmin" onclick="showTab('admin')">Admin</button>
+  <button class="btn tab-btn" id="tabInsights" onclick="showTab('insights')">Insights</button>
   <span style="flex:1"></span>
   <!-- Performance Score (24h) -->
   <span id="scoreBanner" style="display:none;font-size:10px;color:var(--muted)">
@@ -4441,6 +4504,61 @@ HTML = r"""<!DOCTYPE html>
 
 </div><!-- /panelAdmin -->
 
+<!-- ═══ Insights tab panel (offline LLM — optional, see llm_engine.py) ══════ -->
+<div id="panelInsights" class="adm-wrap" style="display:none">
+
+  <div id="llmUnavailable" style="display:none;padding:20px;font-size:11px;color:var(--muted);line-height:1.7">
+    Offline LLM not installed — run <code style="color:var(--text)">pip install mlx-lm</code>
+    to enable crash explanations, daily/weekly summaries, and the Ask panel below.
+    First use downloads a ~2GB model (<code style="color:var(--text)">mlx-community/Qwen2.5-3B-Instruct-4bit</code>),
+    cached locally under <code style="color:var(--text)">~/.cache/huggingface</code>;
+    everything after that runs fully offline, on this Mac only.
+  </div>
+
+  <div id="llmAvailableWrap" style="display:none">
+
+    <!-- Ask -->
+    <div class="adm-section">
+      <div class="adm-section-hdr" style="cursor:default">Ask</div>
+      <div style="padding:10px 14px">
+        <div style="display:flex;gap:6px">
+          <input id="askInput" class="log-search" type="text"
+                 placeholder="Ask about this Mac's performance…"
+                 onkeydown="if(event.key==='Enter')submitAsk()">
+          <button class="btn" id="askBtn" onclick="submitAsk()">Ask</button>
+        </div>
+        <div id="askHistory" style="margin-top:10px;display:flex;flex-direction:column;gap:8px;font-size:11px"></div>
+      </div>
+    </div>
+
+    <!-- Digest -->
+    <div class="adm-section">
+      <div class="adm-section-hdr" style="cursor:default">
+        Summary
+        <span style="float:right;font-size:9px;font-weight:400">
+          <a href="#" onclick="loadDigest('daily');return false" id="digestTabDaily" style="margin-right:10px;color:var(--blue)">Daily</a>
+          <a href="#" onclick="loadDigest('weekly');return false" id="digestTabWeekly" style="color:var(--muted)">Weekly</a>
+        </span>
+      </div>
+      <div style="padding:10px 14px">
+        <div id="digestText" style="font-size:11px;line-height:1.6;color:var(--text)">Loading…</div>
+        <div style="margin-top:8px">
+          <button class="btn" id="digestRegenBtn" onclick="regenerateDigest()" style="font-size:9px">🔄 Regenerate</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Crash Explanations -->
+    <div class="adm-section">
+      <div class="adm-section-hdr" style="cursor:default">Recent Crash Explanations</div>
+      <div id="crashExplanations" style="padding:10px 14px;font-size:11px;color:var(--muted)">
+        Click "Explain" on a crash entry in the Activity Log to see it here.
+      </div>
+    </div>
+
+  </div>
+</div><!-- /panelInsights -->
+
 <!-- ── Context menu ── -->
 <div id="ctxMenu">
   <div class="ctx-hd" id="ctxPidLine">PID —</div>
@@ -4520,7 +4638,7 @@ function updateChart(chart, data) {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let evCnt=0, seenEvs=new Set(), paused=false, trendVisible=false, _histLoaded=false;
+let evCnt=0, seenEvs=new Set(), paused=false, trendVisible=false, _histLoaded=false, _insightsLoaded=false;
 let memTotalGb=0, swapTotalGb=0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -4642,6 +4760,135 @@ async function handleRecAction(btn) {
   }
 }
 
+// ── Insights tab (offline LLM — optional, see llm_engine.py) ───────────────────
+// Same request/response + "thinking…" idiom as handleRecAction() above — no
+// streaming, since this is a single-user local tool and a ~1s poll cadence
+// (matching the /stats poll) is more than adequate for a 5-30s generation.
+function pollJob(jobId, onUpdate) {
+  const tick = async () => {
+    let d;
+    try { d = await fetch('/llm/job?id=' + encodeURIComponent(jobId)).then(r => r.json()); }
+    catch (e) { onUpdate({status: 'error', error: String(e)}); return; }
+    if (d.status === 'pending' || d.status === 'running') setTimeout(tick, 1000);
+    else onUpdate(d);
+  };
+  tick();
+}
+
+async function loadInsights() {
+  let status;
+  try { status = await fetch('/llm/status').then(r => r.json()); }
+  catch (e) { status = {available: false}; }
+  document.getElementById('llmUnavailable').style.display   = status.available ? 'none' : '';
+  document.getElementById('llmAvailableWrap').style.display = status.available ? '' : 'none';
+  if (status.available) loadDigest('daily');
+}
+
+async function loadDigest(period) {
+  document.getElementById('digestTabDaily').style.color  = period === 'daily'  ? 'var(--blue)' : 'var(--muted)';
+  document.getElementById('digestTabWeekly').style.color = period === 'weekly' ? 'var(--blue)' : 'var(--muted)';
+  const el = document.getElementById('digestText');
+  el.dataset.period = period;
+  el.textContent = 'Loading…';
+  try {
+    const d = await fetch('/llm/digest?period=' + period).then(r => r.json());
+    el.textContent = d.status === 'not_yet_generated'
+      ? 'No ' + period + ' summary yet — it generates automatically ' +
+        (period === 'daily' ? 'once a day' : 'once a week') + ', or click Regenerate below.'
+      : (d.text || '(empty)');
+  } catch (e) {
+    el.textContent = 'Failed to load summary.';
+  }
+}
+
+async function regenerateDigest() {
+  const btn = document.getElementById('digestRegenBtn');
+  const period = document.getElementById('digestText').dataset.period || 'daily';
+  btn.disabled = true;
+  btn.textContent = '⏳ Working…';
+  try {
+    const resp = await fetch('/llm/digest/regenerate', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({period})});
+    const d = await resp.json();
+    if (d.ok) {
+      document.getElementById('digestText').textContent = 'Generating a fresh summary — this can take up to 30s…';
+      setTimeout(() => { loadDigest(period); btn.disabled = false; btn.textContent = '🔄 Regenerate'; }, 20000);
+    } else {
+      btn.disabled = false; btn.textContent = '❌ ' + (d.error || 'Failed');
+    }
+  } catch (e) {
+    btn.disabled = false; btn.textContent = '❌ Error';
+  }
+}
+
+function renderCrashExplanation(crashKey, text) {
+  const cont = document.getElementById('crashExplanations');
+  if (cont.dataset.seeded !== 'true') { cont.innerHTML = ''; cont.dataset.seeded = 'true'; }
+  const div = document.createElement('div');
+  div.style.cssText = 'padding:6px 0;border-bottom:1px solid var(--border)';
+  const safeKey = crashKey.replace(/</g, '&lt;');
+  div.innerHTML = '<div style="color:var(--muted);font-size:9px;margin-bottom:2px">' + safeKey + '</div>' +
+                   '<div>' + text.replace(/</g, '&lt;') + '</div>';
+  cont.prepend(div);
+}
+
+async function explainCrash(crashKey, btn) {
+  btn.disabled = true;
+  btn.textContent = '🤔 Explaining…';
+  try {
+    const resp = await fetch('/llm/crash-explain', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({crash_key: crashKey})});
+    const d = await resp.json();
+    if (!d.ok) { btn.textContent = '❌ ' + (d.error || 'Failed'); return; }
+    if (d.cached) { btn.textContent = '✅ Explained'; renderCrashExplanation(crashKey, d.explanation); return; }
+    pollJob(d.job_id, (job) => {
+      if (job.status === 'done') {
+        btn.textContent = '✅ Explained';
+        renderCrashExplanation(crashKey, job.result.explanation);
+      } else {
+        btn.textContent = '❌ ' + (job.error || 'Failed');
+      }
+    });
+  } catch (e) {
+    btn.textContent = '❌ Error';
+  }
+}
+
+async function submitAsk() {
+  const input = document.getElementById('askInput');
+  const question = input.value.trim();
+  if (!question) return;
+  const btn  = document.getElementById('askBtn');
+  const hist = document.getElementById('askHistory');
+  input.value = '';
+  btn.disabled = true;
+  btn.textContent = '🤔';
+  const entry = document.createElement('div');
+  entry.innerHTML = '<div style="color:var(--blue);font-weight:600">' + question.replace(/</g,'&lt;') + '</div>' +
+                     '<div style="color:var(--muted)" id="askPending">Thinking…</div>';
+  hist.prepend(entry);
+  const finish = (text, ok) => {
+    const p = entry.querySelector('#askPending');
+    if (p) { p.textContent = text; p.removeAttribute('id'); if (ok) p.style.color = 'var(--text)'; }
+    btn.disabled = false; btn.textContent = 'Ask';
+  };
+  try {
+    const resp = await fetch('/llm/ask', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question})});
+    const d = await resp.json();
+    if (!d.ok) { finish(d.error || 'Failed', false); return; }
+    pollJob(d.job_id, (job) => {
+      if (job.status === 'done') finish(job.result, true);
+      else finish(job.error || 'Failed', false);
+    });
+  } catch (e) {
+    finish('Error contacting the bot.', false);
+  }
+}
+
 // ── Expert / Simple mode ───────────────────────────────────────────────────────
 const EXPERT_ROW_IDS = ['vsAcnWeights','vsSigConf','vsPsmNext','vsCtreZone',
                         'vsEfficacy','vsAszm','vsFcModel','vsThermalCoupling',
@@ -4672,12 +4919,15 @@ function toggleBotLogs() {
 // ── Tab switching ──────────────────────────────────────────────────────────────
 let histChart = null;
 function showTab(name) {
-  document.getElementById('panelSummary').style.display = name==='summary' ? ''         : 'none';
-  document.getElementById('panelLive').style.display    = name==='live'    ? 'contents' : 'none';
-  document.getElementById('panelAdmin').style.display   = name==='admin'   ? ''         : 'none';
-  document.getElementById('tabSummary').classList.toggle('tab-active', name==='summary');
-  document.getElementById('tabLive').classList.toggle('tab-active',    name==='live');
-  document.getElementById('tabAdmin').classList.toggle('tab-active',   name==='admin');
+  document.getElementById('panelSummary').style.display  = name==='summary'  ? ''         : 'none';
+  document.getElementById('panelLive').style.display     = name==='live'     ? 'contents' : 'none';
+  document.getElementById('panelAdmin').style.display    = name==='admin'    ? ''         : 'none';
+  document.getElementById('panelInsights').style.display = name==='insights' ? ''         : 'none';
+  document.getElementById('tabSummary').classList.toggle('tab-active',  name==='summary');
+  document.getElementById('tabLive').classList.toggle('tab-active',     name==='live');
+  document.getElementById('tabAdmin').classList.toggle('tab-active',    name==='admin');
+  document.getElementById('tabInsights').classList.toggle('tab-active', name==='insights');
+  if (name === 'insights' && !_insightsLoaded) { _insightsLoaded = true; loadInsights(); }
 }
 async function loadHistory() {
   try {
@@ -4727,7 +4977,11 @@ function addEvent(ev) {
   document.getElementById('evCount').textContent = evCnt;
   const div=document.createElement('div'); div.className='ev '+ev.kind;
   div.dataset.kind=ev.kind;
-  div.innerHTML=`<span class="ev-ts">${ev.ts}</span><span class="ev-badge">${BADGE[ev.kind]||'?'}</span><span class="ev-msg">${ev.msg}</span>`;
+  const crashKey = ev.meta && ev.meta.crash_key;
+  const explainBtn = crashKey
+    ? ' <button class="npa-btn" style="font-size:8px;padding:1px 6px" onclick="explainCrash(\''+crashKey.replace(/'/g,"\\'")+'\', this)">Explain</button>'
+    : '';
+  div.innerHTML=`<span class="ev-ts">${ev.ts}</span><span class="ev-badge">${BADGE[ev.kind]||'?'}</span><span class="ev-msg">${ev.msg}${explainBtn}</span>`;
   document.getElementById('feedBody').prepend(div);
   maybeToast(ev);
   applyLogFilters();
@@ -5678,6 +5932,20 @@ poll();
 _engine: BotEngine = None
 
 
+def _resolve_crash_report_path(crash_key: str):
+    """crash_key is the .ips filename (the same dedup key BotEngine._seen_crash_reports
+    uses) — resolve it against the two locations _check_crash_reports() itself
+    globs (top-level + Retired/), guarding against path traversal since this
+    is reachable from an HTTP request body."""
+    if not crash_key or "/" in crash_key or ".." in crash_key or not crash_key.endswith(".ips"):
+        return None
+    reports_dir = Path.home() / "Library" / "Logs" / "DiagnosticReports"
+    for candidate in (reports_dir / crash_key, reports_dir / "Retired" / crash_key):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass   # suppress access logs
@@ -5717,6 +5985,20 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 _engine.resume()
             self._send(200, "application/json", b'{"ok":true}')
+        elif path == "/llm/status":
+            self._send(200, "application/json",
+                        json.dumps({"available": llm_engine.is_available()}).encode())
+        elif path == "/llm/job":
+            job_id = (parse_qs(q).get("id") or [""])[0]
+            self._send(200, "application/json", json.dumps(llm_engine.get_job(job_id)).encode())
+        elif path == "/llm/digest":
+            period = (parse_qs(q).get("period") or ["daily"])[0]
+            if period not in ("daily", "weekly"):
+                self._send(400, "application/json", b'{"error":"period must be daily or weekly"}')
+            else:
+                digest = llm_engine.get_latest_digest(period)
+                body = digest if digest else {"status": "not_yet_generated"}
+                self._send(200, "application/json", json.dumps(body).encode())
         else:
             self._send(404, "text/plain", b"Not found")
 
@@ -5758,6 +6040,74 @@ class Handler(BaseHTTPRequestHandler):
                 tier = int(body.get("tier", 3))
                 _engine.trigger_remediation(tier)
                 self._send(200, "application/json", b'{"ok":true}')
+            except Exception as e:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
+        elif path == "/llm/crash-explain":
+            if not llm_engine.is_available():
+                self._send(200, "application/json", b'{"ok":false,"error":"LLM not available"}')
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length))
+                crash_key = body.get("crash_key", "")
+                cached = llm_engine.get_cached_crash_explanation(crash_key) if crash_key else None
+                if cached:
+                    self._send(200, "application/json",
+                                json.dumps({"ok": True, "cached": True, "explanation": cached}).encode())
+                    return
+                ips_path = _resolve_crash_report_path(crash_key)
+                if not ips_path:
+                    self._send(400, "application/json",
+                                b'{"ok":false,"error":"crash report not found"}')
+                    return
+
+                def _on_done(job):
+                    if job["status"] == "done":
+                        result = job["result"] or {}
+                        summary = (result.get("explanation") or "")[:120]
+                        _engine._emit("info", f"Crash explained: {result.get('app_name','?')} — {summary}",
+                                       category="llm")
+                    elif job["status"] == "error":
+                        _engine._emit("warn", f"Crash explanation failed: {job['error']}", category="llm")
+
+                job_id = llm_engine.submit_crash_explain(str(ips_path), crash_key, on_done=_on_done)
+                self._send(200, "application/json", json.dumps({"ok": True, "job_id": job_id}).encode())
+            except Exception as e:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
+        elif path == "/llm/digest/regenerate":
+            if not llm_engine.is_available():
+                self._send(200, "application/json", b'{"ok":false,"error":"LLM not available"}')
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length)) if length else {}
+                period = body.get("period", "daily")
+                if period not in ("daily", "weekly"):
+                    self._send(400, "application/json", b'{"ok":false,"error":"period must be daily or weekly"}')
+                    return
+                _engine._enqueue_digest(period)   # same job path as the cooldown-gated auto trigger
+                self._send(200, "application/json", b'{"ok":true}')
+            except Exception as e:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
+        elif path == "/llm/ask":
+            if not llm_engine.is_available():
+                self._send(200, "application/json", b'{"ok":false,"error":"LLM not available"}')
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length))
+                question = (body.get("question") or "").strip()
+                if not question:
+                    self._send(400, "application/json", b'{"ok":false,"error":"question is required"}')
+                    return
+                hourly = _engine._cache.hourly_history(days=1)
+                digest = llm_engine.get_latest_digest("daily")
+                digest_text = digest.get("text", "") if digest else ""
+                crash_summaries = llm_engine.recent_crash_summaries()
+                job_id = llm_engine.submit_ask(question, {
+                    "hourly": hourly, "digest_text": digest_text, "crash_summaries": crash_summaries,
+                })
+                self._send(200, "application/json", json.dumps({"ok": True, "job_id": job_id}).encode())
             except Exception as e:
                 self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
         else:
@@ -5825,7 +6175,10 @@ def main():
     mb_thread = threading.Thread(target=_start_menubar, args=(_engine,), daemon=True)
     mb_thread.start()
 
-    server = HTTPServer((HOST, PORT), Handler)
+    # ThreadingHTTPServer (not plain HTTPServer) so a slow LLM-backed request
+    # (crash explain / digest / ask — can take 5-30s) never blocks /stats,
+    # /pause, /action, /remediate for other connected clients.
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     url    = f"http://{HOST}:{PORT}"
 
     print(f"Performance Bot  →  {url}")
