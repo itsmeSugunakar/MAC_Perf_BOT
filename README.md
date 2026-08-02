@@ -2,7 +2,7 @@
 
 A lightweight, always-on macOS performance monitor with **autonomous closed-loop resource management**, a **21-engine 6-layer control architecture**, a **4-tab installable PWA dashboard**, and an **optional offline on-device LLM** for plain-English crash explanations, summaries, and Q&A.
 
-Current version: **2.6.0**
+Current version: **2.6.1**
 
 ---
 
