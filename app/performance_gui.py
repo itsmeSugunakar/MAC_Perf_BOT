@@ -611,7 +611,12 @@ TTE_TIER2_MIN    = 10.0   # trigger Tier 2 early when TTE ≤ this many minutes
 TTE_TIER3_MIN    =  5.0   # trigger Tier 3 early when TTE ≤ this
 TTE_TIER4_MIN    =  2.0   # trigger Tier 4 early when TTE ≤ this
 TTE_MIN_SAMPLES  = 20     # minimum mem_hist samples before TTE can drive escalation
-XPC_RESPAWN_S    = 10     # seconds; services restarting within this window → blocklisted
+XPC_RESPAWN_S    = 90     # seconds; services restarting within this window → blocklisted
+                           # (must exceed IDLE_SWEEP_S=30s — a service killed by the idle
+                           # sweep and relaunched by launchd before the next sweep was
+                           # evading detection at the old 10s window; observed live with
+                           # WallpaperVideoExtension respawning every 30-64s in an endless
+                           # kill/relaunch loop that visibly flickered the desktop)
 
 # ─── MMAF — Multi-Model Adaptive Forecaster ───────────────────────────────────
 MMAF_MIN_SAMPLES = 10     # minimum samples before any model engages
@@ -3897,10 +3902,22 @@ HTML = r"""<!DOCTYPE html>
   .sum-proc-row{display:flex;align-items:center;gap:10px;padding:6px 14px;border-bottom:1px solid var(--border);font-size:11px}
   .sum-proc-row:last-child{border-bottom:none}
   .sum-proc-name{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
-  .sum-proc-bar-wrap{width:72px;flex-shrink:0}
+  .sum-proc-badge{font-size:8px;color:#fff;border-radius:3px;padding:1px 4px;margin-left:5px}
+  .sum-proc-bar-wrap{width:78px;flex-shrink:0;display:flex;flex-direction:column;gap:2px}
   .sum-proc-bar{height:4px;border-radius:2px;background:var(--border);overflow:hidden}
   .sum-proc-bar-fill{height:100%;border-radius:2px;transition:width .5s}
-  .sum-proc-pct{font-family:'SF Mono',monospace;font-size:10px;color:var(--muted);flex-shrink:0;min-width:36px;text-align:right}
+  .sum-proc-sub{font-size:8px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sum-proc-pct{font-family:'SF Mono',monospace;font-size:10px;color:var(--muted);flex-shrink:0;min-width:40px;text-align:right}
+  .sum-proc-action{flex-shrink:0}
+  .sum-proc-btn{display:inline-flex;align-items:center;gap:3px;padding:3px 9px;font-size:9px;font-weight:600;
+    border:1px solid #4a86e8;border-radius:5px;background:rgba(74,134,232,.08);
+    color:#4a86e8;cursor:pointer;transition:all .15s;white-space:nowrap}
+  .sum-proc-btn:hover{background:rgba(74,134,232,.18);border-color:#3a76d8}
+  .sum-proc-btn:disabled{opacity:.5;cursor:default}
+  .sum-proc-toggle{margin-left:auto;display:flex;gap:4px}
+  .sum-proc-toggle-btn{font-size:9px;font-weight:600;padding:3px 10px;border-radius:6px;
+    border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s}
+  .sum-proc-toggle-btn.active{background:rgba(74,134,232,.12);border-color:#4a86e8;color:#4a86e8}
 
   /* ── Admin tab ── */
   .adm-wrap{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
@@ -4117,11 +4134,14 @@ HTML = r"""<!DOCTYPE html>
   <span id="sumInterventions" style="display:none"></span>
   <span id="sumIntSub"       style="display:none"></span>
 
-  <!-- Top Memory Consumers -->
+  <!-- Top Resource Consumers -->
   <div class="sum-section">
     <div class="sum-section-hdr">
-      🔥 Top Memory Eaters
-      <span style="margin-left:auto;font-size:9px;font-weight:400;color:var(--muted)">tap a name to learn more</span>
+      🔥 Top Resource Consumers
+      <div class="sum-proc-toggle">
+        <button class="sum-proc-toggle-btn active" id="sumProcSortMem" onclick="setProcSort('mem')">Memory</button>
+        <button class="sum-proc-toggle-btn" id="sumProcSortCpu" onclick="setProcSort('cpu')">CPU</button>
+      </div>
     </div>
     <div id="sumProcList">
       <div style="padding:12px 14px;color:var(--muted);font-size:10px">Loading…</div>
@@ -4640,11 +4660,21 @@ function updateChart(chart, data) {
 // ── State ─────────────────────────────────────────────────────────────────────
 let evCnt=0, seenEvs=new Set(), paused=false, trendVisible=false, _histLoaded=false, _insightsLoaded=false;
 let memTotalGb=0, swapTotalGb=0;
+let sumProcSort='mem', _lastStatsSnapshot=null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function colorFor(v,lo,hi,def){ return v>hi?'var(--red)':v>lo?'var(--yellow)':def; }
 function fmtUp(s){ if(s<60)return s+'s'; if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s'; return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; }
 function fmtMb(v){ if(v==null)return'—'; return v>=1024?(v/1024).toFixed(1)+' GB':Math.round(v)+' MB'; }
+
+// ── Top Consumers sort toggle (memory vs CPU) ──────────────────────────────────
+function setProcSort(mode) {
+  sumProcSort = mode;
+  const mBtn=document.getElementById('sumProcSortMem'), cBtn=document.getElementById('sumProcSortCpu');
+  if(mBtn) mBtn.classList.toggle('active', mode==='mem');
+  if(cBtn) cBtn.classList.toggle('active', mode==='cpu');
+  if(_lastStatsSnapshot) renderSummary(_lastStatsSnapshot);
+}
 
 // ── Memory trend toggle ───────────────────────────────────────────────────────
 function toggleTrend() {
@@ -5301,37 +5331,47 @@ function renderSummary(d) {
     }
   }
 
-  // ── Top Memory Eaters (actionable) ───────────────────────────────────────
+  // ── Top Resource Consumers — memory or CPU, toggle-sorted, actionable ─────
   const procs=d.top_procs||[];
   const leakSet=new Set(d.leak_pids_list||[]);
   const throttledSet=new Set(Object.keys(d.throttled||{}).map(Number));
   const spl=document.getElementById('sumProcList');
   if(spl&&procs.length){
-    const topProcs=procs.slice(0,8);  // show top 8, sorted by memory (Fix 7)
-    const topMem=topProcs[0]?topProcs[0][1]:1;
+    const byCpu=sumProcSort==='cpu';
+    const sortIdx=byCpu?0:1;  // top_procs rows are [cpu, mem, pid, name, status]
+    const topProcs=procs.slice().sort((a,b)=>b[sortIdx]-a[sortIdx]).slice(0,8);
+    const topVal=topProcs[0]?topProcs[0][sortIdx]:1;
     const totalGb=d.mem_total_gb||16;
     spl.innerHTML=topProcs.map(([cpu,m,pid,name,status])=>{
-      const mc3=m>=12?'var(--red)':m>=5?'var(--yellow)':'var(--mem)';
-      const bw=Math.min((m/Math.max(topMem,1))*100,100);
+      const primary=byCpu?cpu:m;
+      const pc3=byCpu
+        ?(cpu>=75?'var(--red)':cpu>=40?'var(--yellow)':'var(--cpu)')
+        :(m>=12?'var(--red)':m>=5?'var(--yellow)':'var(--mem)');
+      const bw=Math.min((primary/Math.max(topVal,1))*100,100);
       const isLeak=leakSet.has(pid);
       const isThrottled=throttledSet.has(pid);
-      // Show actual MB instead of % (Fix 3)
       const memMb=Math.round(m/100*totalGb*1024);
       const memLabel=memMb>=1024?(memMb/1024).toFixed(1)+' GB':memMb+' MB';
-      const badge=isLeak?'<span style="font-size:8px;background:var(--red);color:#fff;border-radius:3px;padding:1px 4px;margin-left:5px">LEAK</span>'
-        :isThrottled?'<span style="font-size:8px;background:var(--orange);color:#fff;border-radius:3px;padding:1px 4px;margin-left:5px">THROTTLED</span>':'';
-      const hint=isLeak?' — restarting it would free memory ('+memLabel+')'
-        :isThrottled?' — CPU slowed down to protect other apps ('+memLabel+' RAM)'
-        :m>=12?' — using a lot of RAM ('+memLabel+'); close if not needed'
-        :m>=5?' — moderate usage ('+memLabel+')'
-        :'('+memLabel+' RAM, '+m.toFixed(1)+'% CPU)';
-      return '<div class="sum-proc-row" title="'+name+': '+memLabel+' RAM ('+m.toFixed(1)+'%), '+cpu.toFixed(1)+'% CPU'+hint+'">'+
+      const primaryLabel=byCpu?cpu.toFixed(1)+'%':memLabel;
+      const secondaryLabel=byCpu?memLabel+' RAM':cpu.toFixed(1)+'% CPU';
+      const badge=isLeak?'<span class="sum-proc-badge" style="background:var(--red)">LEAK</span>'
+        :isThrottled?'<span class="sum-proc-badge" style="background:var(--orange)">THROTTLED</span>':'';
+      let btn='';
+      if(isLeak){
+        btn='<button class="sum-proc-btn" data-pid="'+pid+'" data-atype="freeze" onclick="handleRecAction(this)">🧊 Freeze</button>';
+      } else if(byCpu&&cpu>=40&&!isThrottled){
+        btn='<button class="sum-proc-btn" data-pid="'+pid+'" data-atype="throttle" onclick="handleRecAction(this)">🐢 Throttle</button>';
+      }
+      return '<div class="sum-proc-row" title="'+name+': '+memLabel+' RAM ('+m.toFixed(1)+'%), '+cpu.toFixed(1)+'% CPU">'+
         '<div class="sum-proc-name">'+name+badge+'</div>'+
         '<div class="sum-proc-bar-wrap"><div class="sum-proc-bar">'+
-        '<div class="sum-proc-bar-fill" style="width:'+bw.toFixed(1)+'%;background:'+mc3+'"></div></div></div>'+
-        '<div class="sum-proc-pct" style="color:'+mc3+'">'+memLabel+'</div></div>';
+        '<div class="sum-proc-bar-fill" style="width:'+bw.toFixed(1)+'%;background:'+pc3+'"></div></div>'+
+        '<div class="sum-proc-sub">'+secondaryLabel+'</div></div>'+
+        '<div class="sum-proc-pct" style="color:'+pc3+'">'+primaryLabel+'</div>'+
+        (btn?'<div class="sum-proc-action">'+btn+'</div>':'')+
+        '</div>';
     }).join('');
-    // hint footer (Fix 6 — include app risk if available)
+    // hint footer — include app risk if available, sort-aware
     const hintEl=document.getElementById('sumProcHint');
     if(hintEl){
       const top=topProcs[0];
@@ -5341,14 +5381,16 @@ function renderSummary(d) {
         const ar=highRisk[0];
         const trend=ar.trend==='rising'?' and growing ↑':'';
         hintEl.textContent='⚠️ '+ar.app+' is using '+(ar.mb/1024).toFixed(1)+' GB'+trend+' — your biggest memory load today.';
-      } else if(top&&top[1]>=12){
+      } else if(byCpu&&top&&top[0]>=50){
+        hintEl.textContent='⚠ '+top[3]+' is your biggest CPU consumer ('+top[0].toFixed(0)+'%) right now.';
+      } else if(!byCpu&&top&&top[1]>=12){
         const topMb=Math.round(top[1]/100*totalGb*1024);
         const topLabel=topMb>=1024?(topMb/1024).toFixed(1)+' GB':topMb+' MB';
         hintEl.textContent='⚠ '+top[3]+' is your biggest memory consumer ('+topLabel+') right now.';
       } else if(leakSet.size>0){
         hintEl.textContent='💡 A process is growing continuously — consider restarting it to free memory.';
       } else {
-        hintEl.textContent='✓ No single app is dominating memory right now.';
+        hintEl.textContent='✓ No single app is dominating memory or CPU right now.';
       }
     }
   }
@@ -5372,6 +5414,7 @@ async function poll() {
     const d = await r.json();
     if (d.mem_total_gb)  memTotalGb  = d.mem_total_gb;
     if (d.swap_total_gb) swapTotalGb = d.swap_total_gb;
+    _lastStatsSnapshot = d;
 
     if (!paused) {
       const cpu  = (d.cpu_hist  ||[]).at(-1)??0;
@@ -6124,12 +6167,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ─── macOS menu bar (optional — requires `pip install rumps`) ─────────────────
-def _start_menubar(engine: "BotEngine") -> None:
-    """Show current tier + RAM % in the macOS menu bar via rumps."""
+def _start_menubar(engine: "BotEngine") -> bool:
+    """Show current tier + RAM % in the macOS menu bar via rumps.
+
+    MUST be called from the main thread — AppKit/rumps raises
+    NSInternalInconsistencyException ("NSWindow should only be instantiated
+    on the main thread!") if started from a background thread. Blocks
+    (via app.run()) until the user quits. Returns False immediately if
+    rumps isn't installed, so the caller can fall back to blocking some
+    other way.
+    """
     try:
         import rumps  # type: ignore
     except ImportError:
-        return   # rumps not installed — menu bar is optional
+        return False   # rumps not installed — menu bar is optional
 
     TIER_ICON = {0: "🟢", 1: "🔵", 2: "🟡", 3: "🟠", 4: "🔴"}
     TIER_NAME = {0: "All Good", 1: "Watching", 2: "Intervening",
@@ -6162,7 +6213,8 @@ def _start_menubar(engine: "BotEngine") -> None:
                             rumps.quit_application())
     )
     app.menu = [status_item, ram_item, actions_item, None, dash_item, None, quit_item]
-    app.run()
+    app.run()   # blocks until Quit is clicked
+    return True
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -6170,10 +6222,6 @@ def main():
     global _engine
     _engine = BotEngine()
     _engine.start()
-
-    # Optional: macOS menu bar icon (non-blocking daemon thread)
-    mb_thread = threading.Thread(target=_start_menubar, args=(_engine,), daemon=True)
-    mb_thread.start()
 
     # ThreadingHTTPServer (not plain HTTPServer) so a slow LLM-backed request
     # (crash explain / digest / ask — can take 5-30s) never blocks /stats,
@@ -6184,11 +6232,20 @@ def main():
     print(f"Performance Bot  →  {url}")
     print("Press Ctrl+C to stop.\n")
 
+    # Server runs in the background; the main thread is reserved for rumps
+    # (AppKit/NSStatusItem requires the main thread).
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
     try:
-        server.serve_forever()
+        if not _start_menubar(_engine):
+            # rumps not installed — no main-thread UI to run, so just block here
+            server_thread.join()
     except KeyboardInterrupt:
+        pass
+    finally:
         print("\nShutting down…")
         _engine.stop()
         server.shutdown()
