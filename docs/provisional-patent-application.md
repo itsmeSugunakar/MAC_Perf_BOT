@@ -252,6 +252,32 @@ Intelligence Engine (MMIE)**, is a software method and system comprising:
     persistent, auditable record of cumulative autonomous remediation efficacy
     in user-interpretable units.
 
+21. **A Neural Performance Analyzer (NPA)** — a dependency-free multi-layer
+    perceptron trained on a stride-sampled, full-history window of the local
+    telemetry cache — that forecasts next-60-second RAM and CPU load plus an
+    anomaly score, generates ranked plain-English recommendations, and
+    attaches an optional target process and action type to each
+    recommendation so that it can be dispatched, by explicit user action,
+    directly into the pre-existing autonomous remediation cascade via a
+    quorum-bypassing, human-in-the-loop invocation path.
+
+22. **A Crash Report Monitor** that observes the operating system's native
+    diagnostic-report directory, parses only the bounded leading structured
+    portion of each new report, and surfaces it through the same unified
+    event pipeline used for resource-pressure events — together with a
+    corrected dual CPU-representation scheme that makes genuine single-core
+    CPU saturation visible in the top-process table and warning path without
+    altering the automated throttling action's system-wide-gated threshold.
+
+23. **An Offline On-Device Language Model Insights Engine** that grounds
+    natural-language crash explanations, cooldown-gated narrative digests,
+    and free-form question answering exclusively in the agent's own
+    telemetry, event, and diagnostic data, using a lazily-loaded,
+    idle-unloaded local quantised model executed on a single serialized job
+    queue behind a non-blocking polling interface — a design calibrated
+    specifically to prevent the insight-generation subsystem from becoming a
+    measurable resource-pressure contributor to the very system it monitors.
+
 ---
 
 ## 5. Detailed Description of the Preferred Embodiment
@@ -732,23 +758,23 @@ automatically-restartable services are targeted.
 
 ### 5.9 Component 8 — XPC Respawn Guard
 
-**Method:** `_detect_xpc_respawn()` — called every 10 seconds
+**Method:** `_detect_xpc_respawn()` — called every 30 seconds
 
 macOS `launchd` automatically relaunches XPC services and system daemons
 within milliseconds of termination. Repeatedly sending SIGTERM to such
 services consumes CPU cycles, generates system log noise, and yields no
 lasting RAM relief — a futile kill-loop.
 
-**Detection algorithm:**
+**Detection algorithm (corrected, v2.6.1 — see incident note below):**
 
 ```
-every 10 s:
+every 30 s:
   for name, ts in _terminated_ts:
-    if name in running_process_names and (now - ts) ≤ XPC_RESPAWN_S (10 s):
+    if name in running_process_names and (now - ts) ≤ XPC_RESPAWN_S (90 s):
         _no_kill.add(name)
-        emit "XPC RESPAWN GUARD: {name} relaunched within 10s — blocklisted"
+        emit "XPC RESPAWN GUARD: {name} relaunched within 90s — blocklisted"
 
-  # prune stale entries (> 60 s old)
+  # prune stale entries (> XPC_RESPAWN_S × 6 old)
   remove entries from _terminated_ts where (now - ts) > XPC_RESPAWN_S × 6
 ```
 
@@ -760,10 +786,36 @@ terminations.
 **Dashboard:** The `xpc_blocked` field in the `/stats` JSON reports the
 current blocklist count; the dashboard displays it as "XPC Blocked: N".
 
+**Empirical incident and correction (v2.6.1, 2026-08-01):** The original
+constant, `XPC_RESPAWN_S = 10 s`, was shorter than the Tier-4 idle-sweep
+cadence (`IDLE_SWEEP_S = 30 s`). A service killed by `_sweep_idle_services()`
+and relaunched by `launchd` before the *next* 30-second sweep therefore
+never crossed the 10-second reappearance window checked by this component —
+it evaded detection entirely, was never blocklisted, and was killed and
+relaunched indefinitely. This was caught live: `WallpaperVideoExtension`
+(a macOS video-wallpaper renderer) was observed respawning every 30–64
+seconds, spiking to ~97% CPU on each relaunch and visibly flickering the
+desktop, while eight additional `launchd` services
+(`VTDecoderXPCService`, `AppPredictionIntentsHelperService`,
+`SiriSuggestionsBookkeepingService`, `MTLCompilerService`, `SiriNCService`,
+`SAExtensionOrchestrator`, `IntelligencePlatformComputeService`,
+`CloudTelemetryService`) were simultaneously caught in the same undetected
+loop. `XPC_RESPAWN_S` was raised to 90 s — reliably exceeding the sweep
+cadence — after which the guard immediately caught and blocklisted all
+nine services in a single detection pass on restart. This incident is
+itself evidence of the claimed invention's necessity: the futile-kill-loop
+failure mode it is designed to prevent is a real, observed operating-system
+behaviour, not a theoretical concern, and the fix is a direct, measurable
+tightening of the detection window's relationship to the actions that
+populate it.
+
 **Novelty:** Automated detection of launchd-managed process respawning
 at the userspace level — and dynamic blocklisting to avoid futile kill
 loops — is a novel safety mechanism not present in any known consumer or
-enterprise monitoring tool.
+enterprise monitoring tool. The corrected constraint that the detection
+window must exceed the cadence of the very actions it is monitoring for
+respawn (`XPC_RESPAWN_S > IDLE_SWEEP_S`) is itself a non-obvious design
+rule for this class of respawn-guard mechanism.
 
 ### 5.10 Component 9 — Graduated Thaw Sequencer (GTS)
 
@@ -821,7 +873,7 @@ business logic:
 | `TTE_TIER3_MIN`       | 5 min   | TTE value that predictively escalates to Tier 3  |
 | `TTE_TIER4_MIN`       | 2 min   | TTE value that predictively escalates to Tier 4  |
 | `TTE_MIN_SAMPLES`     | 20      | Min history samples before TTE drives escalation |
-| `XPC_RESPAWN_S`       | 10 s    | Respawn detection window for XPC guard           |
+| `XPC_RESPAWN_S`       | 90 s    | Respawn detection window for XPC guard (raised from 10 s in v2.6.1 — must exceed `IDLE_SWEEP_S`=30 s, see §5.9 incident note) |
 | `WIRED_WARN_PCT`      | 40 %    | Wired structural pressure threshold              |
 | `FREEZE_COOL_S`       | 120 s   | Minimum interval between Tier 3 freeze cycles    |
 | `MEM_ANCESTRY_COOL_S` | 120 s   | Minimum interval between genealogy scans         |
@@ -1223,15 +1275,55 @@ as a single `executemany()` batch every 60 seconds.
 into Python memory. This ensures that even at 777 K rows (90 days), query
 latency remains under 50 ms.
 
-**Pruning:** `DELETE WHERE ts < now − CACHE_RETENTION_DAYS × 86400` runs
-at most once per 24 hours. After pruning, a WAL checkpoint is issued to
-reclaim disk space.
+**Journal mode:** `PRAGMA journal_mode=WAL` is set at `MetricsCache.__init__`
+so the once-daily pruning writer does not block the once-per-second `/stats`
+reader.
+
+**Pruning:** `DELETE WHERE ts < now − CACHE_RETENTION_DAYS × 86400` runs at
+most once per 24 hours, followed by an explicit `commit()` and then a
+`PRAGMA wal_checkpoint(PASSIVE)` to reclaim disk space.
+
+**Reliability incident and correction (v2.4.1, 2026-07-21):** The 90-day
+retention pruning described above had silently never functioned correctly
+since initial release. Two compounding defects were identified by direct
+reproduction against the live production database: (1) WAL mode was never
+actually enabled at `__init__` despite `prune()` already issuing a
+`wal_checkpoint` call — a silent no-op outside WAL mode, and the tell that
+WAL had been the original design intent; (2) `interventions_today()`
+(invoked from `BotEngine.snapshot()` on every `/stats` poll, i.e., once per
+second) executed two unindexed full-table scans, holding a read lock that
+starved the once-daily prune writer as the table grew — a self-reinforcing
+contention loop. The proximate trigger, found only after enabling WAL mode
+alone did not fully resolve the failure, was that `prune()` issued the WAL
+checkpoint immediately after the `DELETE`, within the same uncommitted
+transaction — directly reproduced as reliably raising
+`database table is locked` even though the `DELETE` and the checkpoint each
+succeeded independently. At the time of diagnosis, `[cache] prune failed:
+database table is locked` had been logged on essentially every one of
+approximately 118 daily prune attempts, and the live database had grown to
+186,935 rows spanning 106.5 days — materially exceeding the claimed 90-day
+retention bound. The correction — enabling WAL at initialisation, inserting
+an explicit `commit()` between the `DELETE` and the checkpoint, extending
+the prune connection timeout from 5 s to 15 s, and adding a ~20-second
+result cache to `interventions_today()` so its two full scans do not re-run
+on every one-second poll — was verified by invoking `MetricsCache.prune()`
+directly against the running production database five consecutive times
+under real concurrent read load, with zero exceptions, immediately following
+a reproducible 100% failure rate under the same conditions prior to the fix.
 
 **Novelty:** The combination of 10-second cadence sampling, 9-column schema
 including thermal state, self-migrating `ALTER TABLE` logic, batch-write
 buffering, and aggregate-only read access — all within a single-threaded,
 zero-dependency Python process — constitutes a novel lightweight telemetry
-store design optimised for consumer workstation deployment.
+store design optimised for consumer workstation deployment. The specific
+write-lock contention failure mode identified above (an unindexed
+per-second aggregate query starving a once-daily maintenance writer,
+compounded by an uncommitted DELETE-then-checkpoint sequence) and its
+resolution (WAL mode, explicit transaction boundary, and short-lived result
+caching on the hot read path) is itself a non-obvious engineering solution
+specific to sustaining bounded-retention SQLite storage under a concurrent
+1 Hz read / daily-batch write access pattern on unprivileged consumer
+hardware.
 
 ---
 
@@ -1593,45 +1685,35 @@ a simultaneous memory re-expansion spike.
 ## 7. Abstract
 
 A Multi-Dimensional Memory Intelligence Engine (MMIE) monitors a consumer
-multitasking operating system using a kernel pressure oracle (`sysctl
-kern.memorystatus_vm_pressure_level`), virtual memory anatomy parsing
-(`vm_stat`), recursive process-tree genealogy attribution, and a
-Multi-Model Adaptive Forecaster (MMAF) that concurrently fits linear,
-quadratic, and exponential regression models to RAM utilisation history,
-selecting the best fit by minimum residual sum of squares to compute
-Time-to-Exhaustion (TTE). A Compression Efficiency Oracle (CEO) derives
-a Compression Pressure Index (CPI) from compressed and purgeable page
-counts as an independent measure of compressor headroom depletion. A
-Multi-Signal Consensus Escalation Engine (MSCEE) combines six weighted
-signals — RAM percentage, TTE, kernel oracle level, CPI, swap velocity,
-and circadian hour pattern — into a quorum vote, adopting a remediation
-tier only when the aggregate weight meets a consensus threshold (0.55),
-replacing brittle two-signal max() selection. An Adaptive Threshold
-Calibration Engine (ATCE) continuously self-tunes the Tier 2/3/4
-activation thresholds from 30-day historical percentiles. A Circadian
-Memory Pattern Engine (CMPE) learns hour-of-day RAM pressure profiles
-from the metric cache and triggers proactive pre-emptive daemon suspension
-before predictable high-pressure periods. A Thermal-Memory Coupling
-Predictor (TMCP) learns the empirical relationship between CPU thermal
-throttling and memory pressure via exponential moving average regression,
-shortening TTE forecasts during active thermal throttle. A CPU-RAM
-Conflict Resolution Gate prevents CPU priority restoration for processes
-identified by genealogy as dominant RAM owners. Upon reaching elevated
-pressure, the engine executes a four-tier cascade: observation, advisory
-structural analysis, reversible genealogy-guided SIGSTOP suspension with
-RSS Velocity Momentum Scoring (RVMS) velocity boost on freeze candidates,
-and emergency SIGTERM termination. Suspended processes are restored via a
-Graduated Thaw Sequencer (GTS) that delivers SIGCONT in ascending RSS
-order with per-send gaps and a RAM-gate abort. An XPC Respawn Guard
-blocklists launchd-managed services to prevent futile kill-loops. A
-90-day SQLite metric store enables all historical analysis. The system
-operates without superuser privileges and delivers real-time telemetry to
-an installable Progressive Web Application dashboard. The invention
-provides 18 patent claims covering adaptive forecasting, consensus
-escalation, thermal coupling, circadian learning, velocity-momentum
-scoring, graduated thaw, self-calibrating thresholds, and compression
-awareness — none of which are present in prior consumer memory management
-art.
+OS using a kernel pressure oracle, memory anatomy parsing, process-tree
+genealogy attribution, and a Multi-Model Adaptive Forecaster
+(linear/quadratic/exponential) computing Time-to-Exhaustion. A Compression
+Efficiency Oracle derives a compression pressure index; a Multi-Signal
+Consensus Escalation Engine combines six weighted signals (RAM %, TTE,
+kernel oracle, compression pressure, swap velocity, circadian pattern)
+into a quorum vote before adopting a remediation tier. Threshold,
+circadian, and thermal-coupling engines self-tune tier activation from
+historical percentiles, hour-of-day profiles, and throttle state; a
+CPU-RAM conflict gate withholds priority restoration from dominant RAM
+owners. A four-tier cascade — observation, advisory, genealogy- and
+velocity-weighted reversible suspension, and emergency termination — is
+reversed by a graduated thaw sequencer, while a respawn guard blocklists
+futile kill-loops, backed by a 90-day local metric store. A governed
+autonomous cognitive layer — signal integrity estimation, model ensemble
+governance, reinforcement-weighted arbitration, ancestral impact
+propagation, reinforcement action coordination, Markov tier prediction,
+Bayesian confidence, adaptive protected-set mapping, and a causal
+diagnostic classifier — validates and explains these decisions. A
+dependency-free neural analyzer forecasts near-term load and bridges
+recommendations into the cascade via a quorum-bypassing, human-in-the-loop
+path, while an optional, lazily-loaded on-device language model grounds
+crash explanations, digests, and queries in the system's own telemetry
+without adding measurable resource pressure. It needs no superuser
+privileges, serves an installable PWA dashboard, and provides 35 claims
+spanning adaptive forecasting, consensus escalation,
+self-calibrating thresholds, reinforcement-learned arbitration, causal
+diagnosis, actionable recommendation, and grounded generative insight —
+none present in prior consumer memory management art.
 
 ---
 
@@ -2259,6 +2341,206 @@ over up to 90 days of recorded outcomes.
 
 ---
 
+## 5.31 — Neural Performance Analyzer (NPA) and Actionable Remediation Bridge (v2.3–v2.4)
+
+The Neural Performance Analyzer is a pure-Python, dependency-free multi-layer
+perceptron that forecasts near-term system load and converts that forecast,
+together with live engine state, into prioritised, one-click-actionable
+recommendations wired directly into the existing remediation cascade.
+
+**Architecture:** 11 inputs → 12 hidden units (ReLU) → 6 hidden units (ReLU)
+→ 3 outputs, implemented with no external ML dependency (pure Python,
+matching the design precedent already set by the CDA softmax classifier).
+
+**Outputs:**
+
+```
+pred_mem  — clipped-linear output max(0, min(1, raw)); next-60s RAM % forecast
+pred_cpu  — clipped-linear output max(0, min(1, raw)); next-60s CPU % forecast
+anomaly   — sigmoid output; anomaly score 0–1
+```
+
+**Training:** `fetch_training_data()` retrieves all rows from the 30-day
+MetricsCache and strides every N-th row to produce up to `NPA_MAX_ROWS`
+(600) stratified samples spanning the full history — deliberately avoiding
+the failure mode of training only on the most recent (and therefore
+least-representative) burst of samples. The target `y` for each sample is
+computed from the *actual next six consecutive rows* (a true 60-second-ahead
+window), not from further-subsampled rows, so training targets always
+reflect genuine near-future ground truth rather than an artifact of the
+sampling stride. Weights are Xavier-initialised (fixed seed) with per-feature
+z-score normalisation; training re-runs at most every `NPA_RETRAIN_COOL_S`
+(6 hours) once a minimum row count (`NPA_TRAIN_MIN_ROWS` = 150) is available.
+
+**Recommendation generation:** `generate_recommendations()` combines the
+three NN outputs with live bot state (current tier, throttled process
+names/PIDs, TTE minutes, leak-flagged PIDs) to produce up to five ranked
+recommendation objects, each carrying a priority (0=critical … 4=all-clear),
+plain-English title/detail/action text, a model confidence score, and —
+critically — an optional target process ID (`pid`) and `action_type`
+(`"freeze"` / `"terminate"` / `"remediate"` / `"throttle"` / `null`).
+
+**Actionable bridge to the remediation cascade (v2.4):** Recommendations
+carrying a non-null `action_type` render as one-click buttons in the
+dashboard that dispatch directly into the existing remediation
+infrastructure via two API surfaces:
+
+```
+POST /action      {pid, action: "freeze"|"thaw"|"kill"|"throttle"}   — single-process action
+POST /remediate    {tier: 1-4}                                        — BotEngine.trigger_remediation(tier)
+```
+
+`trigger_remediation(tier)` is a **user-initiated entry point that
+deliberately bypasses the MSCEE consensus-quorum threshold gates** described
+in §5.6 — a human operator acting on a neural-network-generated
+recommendation is, by construction, providing the corroborating signal that
+the autonomous quorum would otherwise need to accumulate on its own,
+so the gate is intentionally not re-applied on this path. This is a distinct
+invocation path from the fully autonomous cascade, sharing the same
+underlying tier-action implementations while offering a human-in-the-loop
+alternative triggered by, and only by, the neural forecaster's own output.
+
+**Novelty:** A dependency-free multi-layer perceptron trained on a
+stride-sampled, full-history window of a 90-day local telemetry cache
+(rather than only the most recent samples), producing calibrated multi-output
+forecasts (RAM, CPU, anomaly) that are directly attached — per
+recommendation, per target process — to specific, dispatchable remediation
+actions in a pre-existing autonomous cascade is a novel bridge between
+predictive inference and human-supervised remediation invocation, distinct
+from both the fully autonomous consensus path (§5.6) and purely advisory
+"insight" dashboards found in prior art.
+
+---
+
+## 5.32 — Crash Report Monitor and Unified CPU Visibility Correction (v2.5.0)
+
+**Crash Report Monitor.** `_check_crash_reports()` (60-second cadence)
+closes an observability gap distinct from memory/CPU telemetry: real
+operating-system exception/crash reports written to
+`~/Library/Logs/DiagnosticReports/*.ips` were previously never read by the
+engine at all, despite being exactly the class of event that
+Console.app-adjacent tooling surfaces to a user. The monitor reads **only
+the lightweight first-line JSON header** of each `.ips` file (application
+name, timestamp, bug type) — it never opens or transmits the full report
+body, which may contain a stack trace and, rarely, application data
+referenced within it — and emits one `issue` event per newly-observed crash
+into the same unified activity-log event pipeline (`_emit()`) already used
+by every other component in this specification. On first run, any
+pre-existing backlog of `.ips` files is seeded silently (recorded as already
+seen) so that a fresh install or restart does not retroactively flood the
+activity log with historical crashes.
+
+**Single-core CPU visibility correction.** Independently, live
+investigation (prompted by a user observation that the dashboard showed no
+sign of conditions visibly wrong in native Activity Monitor) uncovered two
+compounding defects that made genuine single-core CPU saturation invisible
+to this system: (1) the top-process table (`_collect()`) selected candidates
+by memory usage only, so a CPU-heavy/RAM-light process could never appear
+regardless of its CPU load; (2) the "High CPU" warning path additionally
+required *system-wide* CPU utilisation to cross the `CPU_WARN` threshold
+before firing, and — even after that system-wide gate was identified and
+removed — separately compared the *per-core-normalised* CPU value against
+the warning threshold, so a process consuming 98.7% of one core on an
+eight-core system was compared as ~12.4%, still below threshold. The fix
+introduces a second, unnormalised CPU value (`raw_c`, matching the
+convention used by `ps` and Activity Monitor, where 100% represents one
+fully-saturated core) used specifically for top-process table
+sorting/display and for the single-process warning comparison, while the
+system-wide-gated, core-normalised value is deliberately retained unchanged
+for the automated throttle *action* threshold — a visible warning is
+intentionally decoupled from an automated priority-lowering action, since
+throttling a process legitimately using one core while the system overall
+has headroom is a materially bigger intervention decision than merely
+surfacing it to the user. A 60-second per-process-ID cooldown prevents the
+corrected warning from re-firing every second a process remains elevated.
+
+**Novelty:** Parsing only the minimal structured header of operating-system
+crash artifacts (rather than the full stack-trace body) into the same
+unified event/activity pipeline used for resource-pressure events, combined
+with backlog-seeding to avoid retroactive alert flooding, constitutes a
+novel low-overhead crash-observability integration for a resource-management
+agent. Separately, maintaining two parallel CPU representations — a
+system-wide-gated, core-normalised value driving automated remediation
+actions, and an unnormalised, single-core-comparable value driving
+per-process visibility and warnings — while deliberately keeping the
+automated-action threshold unchanged, is a non-obvious decoupling of
+"visibility" from "intervention" specific to multi-core consumer systems.
+
+---
+
+## 5.33 — Offline On-Device Language Model Insights Engine (v2.6.0)
+
+A fully optional, degrade-cleanly subsystem (`app/llm_engine.py`) that adds
+natural-language reasoning over the engine's own telemetry, using an
+on-device, quantised language model with no network dependency after an
+initial one-time model download — following the same optional-dependency
+precedent already established by the CDA engine's optional `onnx`/
+`onnxruntime` acceleration (§5.28).
+
+**Three grounded capabilities, one shared job-queue architecture:**
+
+1. **Crash-report explanation** — on demand, explains a specific crash
+   (identified by the Crash Report Monitor of §5.32) in plain English,
+   reasoning only from the crashed thread's frame symbols (no
+   debug-symbol/dSYM resolution); cached per crash key so a repeat request
+   for the same crash returns instantly without re-invoking the model.
+2. **Daily / weekly narrative digests** — cooldown-gated
+   (`LLM_DAILY_DIGEST_COOL_S` / `LLM_WEEKLY_DIGEST_COOL_S`, mirroring the
+   existing `CDA_TRAIN_COOL_S` cooldown-gate pattern already established
+   elsewhere in this specification) and **only ever enqueued**, never
+   generated inline on the calling thread.
+3. **Free-form "Ask" panel** — answers user questions grounded in recent
+   hourly telemetry, the current digest, and recent crash explanations,
+   assembled into a bounded-length prompt.
+
+**Lazy load / idle unload:** The model (a ~2 GB, 4-bit-quantised
+instruction-tuned model run via Apple's on-device MLX framework) loads only
+on the first actual generation call — never at process import, never at
+engine initialisation — and is unloaded from memory after
+`LLM_IDLE_UNLOAD_S` (10 minutes) of no generation activity, checked by a
+lightweight watchdog poll every `LLM_IDLE_CHECK_S` (60 s). This is a direct
+consequence of the invention's stated design constraint (§10 below;
+see also §5.1) that the monitoring engine must not measurably degrade the
+system it monitors — a multi-gigabyte model held resident in memory between
+uses would itself become the kind of memory-pressure contributor that the
+rest of this specification exists to detect and remediate.
+
+**Serialized background worker + non-blocking API surface:** All model
+generation — regardless of which of the three capabilities triggered it —
+executes on a single serialized job-queue worker thread. Callers receive a
+`job_id` immediately and poll `GET /llm/job?id=` for completion status
+(`pending` / `running` / `done` / `error`). This is paired with a
+foundational transport-layer change: the HTTP server was migrated from a
+single-threaded `HTTPServer` to a `ThreadingHTTPServer`. Without this
+change, a single slow (5–30 second) generation request would have blocked
+every other client's `/stats`, `/pause`, `/action`, and `/remediate`
+requests until it completed — a change to the underlying transport made a
+prerequisite by the addition of an optionally slow, non-real-time subsystem
+onto a server whose primary contract (sub-second telemetry polling) must
+never degrade.
+
+**Clean degradation:** Every `/llm/*` endpoint other than `/llm/status`
+returns a structured `{"ok": false, "error": "LLM not available"}` response
+when the optional `mlx-lm` dependency is not installed, rather than raising
+an error — the Insights dashboard tab itself renders an install-hint state,
+and no other component of the system is affected by the dependency's
+absence.
+
+**Novelty:** The combination of (a) lazy, on-demand loading of a local
+quantised language model with idle-timeout unloading calibrated specifically
+against a monitoring agent's own self-effacement constraint, (b) a
+single-worker serialized job queue decoupling arbitrarily slow generative
+inference from a real-time (1 Hz) telemetry polling contract enforced by a
+concurrent HTTP transport, and (c) grounding all three exposed reasoning
+capabilities in the same structured telemetry, event, and crash-report data
+already produced by the resource-management engine described elsewhere in
+this specification — rather than as a generic, ungrounded chat interface —
+constitutes a novel integration of on-device generative inference into an
+autonomous resource-management agent, not present in prior consumer
+monitoring or "AI assistant" tooling.
+
+---
+
 ## New Claims (v2.0 — Claims 19–28)
 
 **Claim 19.** A computer-implemented system for autonomous resource management comprising: a Signal Integrity Estimator (SIE) that computes, for each of a plurality of monitoring signals, a rolling z-score over a fixed-size sample window, wherein the z-score is defined as the difference between the current sample and the window mean divided by the window standard deviation; a signal confidence value derived from the z-score by applying a monotonically decreasing function capped at a minimum floor value; and a mechanism for multiplying each signal's consensus weight by its corresponding confidence value prior to weighted-quorum tier escalation, thereby preventing transient OS measurement anomalies from generating erroneous operating-system process suspension signals.
@@ -2295,6 +2577,16 @@ over up to 90 days of recorded outcomes.
 
 ---
 
+## New Claims (v2.3–v2.6 — Claims 33–35)
+
+**Claim 33.** A computer-implemented system for actionable predictive resource recommendation comprising: a multi-layer perceptron trained on a stride-sampled window of historical system telemetry spanning a retention period substantially longer than the prediction horizon, wherein training targets for each sample are computed from a contiguous run of subsequent telemetry rows immediately following that sample rather than from further-subsampled rows; generating, from said perceptron's outputs and concurrently-maintained live engine state, a ranked plurality of recommendation records each comprising a priority level, a natural-language description, a confidence score, and an optional target-process identifier paired with an action-type designation; and exposing, for each recommendation record bearing a non-null action-type designation, a dispatchable interface that invokes a pre-existing autonomous remediation action for the identified target process or tier — wherein said dispatchable interface bypasses a consensus-quorum gate otherwise required for autonomous invocation of the same action, on the basis that user-initiated dispatch of a model-generated recommendation itself constitutes the corroborating signal the quorum gate exists to require.
+
+**Claim 34.** A computer-implemented method for low-overhead operating-system crash observability integration comprising: monitoring a designated operating-system diagnostic-report directory for newly-created crash artifact files; parsing only a bounded leading structured portion of each newly-observed artifact file, without opening or transmitting the remainder of said artifact's content; emitting, for each newly-observed artifact, a structured event into an event pipeline shared with resource-pressure and remediation events of a co-resident resource-management system; and, upon initial activation, silently recording pre-existing artifact files as already observed without emitting events for them — thereby preventing retroactive event-flooding upon system restart while integrating crash observability into an existing unified activity log without incurring the overhead or data exposure of full-artifact parsing.
+
+**Claim 35.** A computer-implemented system for grounded on-device generative-model insight generation within a resource-monitoring agent comprising: a language model that is loaded into memory only upon a first inference request and is automatically unloaded after a configurable idle-duration threshold measured from the most recent inference request; a single serialized worker thread that executes all generative inference requests, regardless of originating capability, and that returns a job identifier to a requesting caller in advance of inference completion; a polling interface by which a caller retrieves the pending, running, completed, or failed status and result of a previously issued job identifier; and a concurrent request-handling transport layer that continues to service non-generative telemetry and control requests without blocking during in-progress generative inference — wherein said language model's prompts are assembled exclusively from telemetry, event, and diagnostic data already produced by said resource-monitoring agent, and wherein said idle-unload threshold is selected to prevent the generative subsystem itself from becoming a measurable resource-pressure contributor to the system the agent monitors.
+
+---
+
 ## 10. Filing Checklist (Web ADS — USPTO Patent Center)
 
 Before submitting, confirm the following items are ready:
@@ -2321,6 +2613,17 @@ Before submitting, confirm the following items are ready:
 
 _Prepared by: itsmeSugunakar · 2026-04-05_
 _Amended: 2026-04-26 — v2.2 additions: CEO compressor collapse pre-emption (§5.12, Claim 29), dual RAM accounting freed_mb/suspended_mb (§5.24, Claim 30), RAC evaluation delay correction 30 s → 120 s (§5.24, Claim 31), Value-Add Measurement Layer interventions_today() + achievement panel (§5.30, Claim 32), innovations 18–20 added to §4 Summary._
+_Amended: 2026-08-29 — v2.3–v2.6.1 additions: Neural Performance Analyzer +
+actionable remediation bridge (§5.31, Claim 33), Crash Report Monitor +
+single-core CPU visibility correction (§5.32, Claim 34), offline on-device
+LLM Insights engine (§5.33, Claim 35), innovations 21–23 added to §4
+Summary; corrected `XPC_RESPAWN_S` 10 s → 90 s throughout (§5.9, §5.11)
+with the live respawn-loop incident that motivated the fix; corrected
+MetricsCache pruning description (§5.17) with the WAL/lock-contention
+reliability incident and fix; Abstract (§7) claim count corrected 18 → 35
+and rewritten to ≤250 words including the new subsystems. Claims 19–32
+were already present from prior amendments but had never been reflected
+in the claim count stated in the Abstract until this pass._
 _This document is a technical specification for a Provisional Patent
 Application. It does not constitute legal advice. For formal patent
 prosecution, consult a registered USPTO patent attorney or agent._

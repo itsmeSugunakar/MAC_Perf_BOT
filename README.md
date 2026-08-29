@@ -1,8 +1,8 @@
 # MAC Performance Bot
 
-A lightweight, always-on macOS performance monitor with **autonomous closed-loop resource management**, a **21-engine 6-layer control architecture**, and a **3-tab installable PWA dashboard**.
+A lightweight, always-on macOS performance monitor with **autonomous closed-loop resource management**, a **21-engine 6-layer control architecture**, a **4-tab installable PWA dashboard**, and an **optional offline on-device LLM** for plain-English crash explanations, summaries, and Q&A.
 
-Current version: **2.3.0**
+Current version: **2.6.1**
 
 ---
 
@@ -128,6 +128,7 @@ The bot runs a single `psutil.process_iter()` scan every second and layers auton
 | 30 s | `_detect_xpc_respawn()` | XPC Respawn Guard scan |
 | 30 s | `_sweep_idle_services()` | Tier-4 idle XPC termination window |
 | 60 s | `_check_thermal()` | `pmset` thermal throttle |
+| 60 s | `_check_crash_reports()` | Surfaces new macOS crash/exception reports (`~/Library/Logs/DiagnosticReports/*.ips`) into the Activity Log |
 | 60 s | `_track_memory_leaks()` | Per-process RSS growth rate |
 | 60 s | `_check_circadian_pressure()` | CMPE hour-of-day profile + proactive pre-freeze |
 | 60 s | `_run_npa()` | NPA inference — next-60 s RAM/CPU + anomaly + 5 AI recommendations |
@@ -151,7 +152,7 @@ The bot runs a single `psutil.process_iter()` scan every second and layers auton
 
 ---
 
-## Dashboard — 3-Tab Layout
+## Dashboard — 4-Tab Layout
 
 ### Summary Tab *(default)*
 
@@ -196,6 +197,17 @@ Expert diagnostics and historical data.
 | Expert / Simple toggle | Shows or hides intelligence vmrows (persisted in `localStorage`) |
 | Bot Logs toggle | Shows or hides internal engine calibration events in the activity feed |
 
+### Insights Tab *(optional — requires `pip install mlx-lm`)*
+
+Offline, on-device LLM features — nothing here ever leaves this Mac, and the tab shows a
+one-line install hint instead of erroring if `mlx-lm` isn't installed.
+
+| Element | Description |
+|---------|-------------|
+| Ask | Free-form question box, grounded in recent hourly telemetry + today's digest + recent crash explanations |
+| Summary | Daily / weekly narrative digest, generated automatically (cooldown-gated) or on-demand via Regenerate |
+| Recent Crash Explanations | Plain-English explanations, triggered by clicking "Explain" on a crash entry in the Activity Log (Live tab) |
+
 ---
 
 ## Features
@@ -224,8 +236,11 @@ Expert diagnostics and historical data.
 - **Thermal-memory coupling (TMCP)** — EMA-learned coefficient shortens TTE under CPU throttle
 - **CPU-RAM Conflict Resolution Gate** — blocks CPU priority restoration for top RAM owners under active pressure
 - **XPC Respawn Guard** — blocklists launchd services that respawn within 10 s
+- **Crash Report Monitor** — surfaces real macOS crash/exception reports into the Activity Log, the same class of "error" Activity Monitor / Console.app shows; reads only the lightweight report header, never the full stack trace
+- **Activity-Monitor-accurate CPU visibility** — top-process table unions top-by-memory with top-by-CPU so a single-core spike is never hidden behind a memory-only sort; the "High CPU" warning uses raw per-core CPU (matching `ps`/Activity Monitor's 100%-per-core convention) instead of a system-wide-normalized value
 - **90-day disk cache** — SQLite; batch-flushed every 60 s; pruned daily; powers all engine learning loops
-- **Zero heavy dependencies** — only `psutil` + Python stdlib; optional `onnx` / `onnxruntime` for CDA ONNX export
+- **Offline LLM Insights (optional)** — on-device MLX language model (`mlx-community/Qwen2.5-3B-Instruct-4bit`, ~2GB, no data ever leaves the Mac) powers plain-English crash-report explanations, daily/weekly narrative summaries, and a free-form Ask panel; lazy-loaded and idle-unloaded so it costs zero RAM when not in use, and generation runs on a background job queue so the dashboard never freezes waiting on it
+- **Zero heavy dependencies** — only `psutil` + Python stdlib; optional `onnx` / `onnxruntime` for CDA ONNX export, optional `mlx-lm` for LLM Insights
 - **Lightweight by design** — single `psutil.process_iter()` per second; all syscalls cached; O(1) event ring-buffer
 
 ---
@@ -278,6 +293,7 @@ MAC_Perf_BOT/
 | Python | 3.11+ via Homebrew (`/opt/homebrew/bin/python3.11`) |
 | psutil | ≥ 5.9 — auto-installed by install script |
 | onnx + onnxruntime | ≥ 1.14 / ≥ 1.16 — **optional**; enables CDA ONNX model export after 200 training samples |
+| mlx-lm | **optional**, Apple Silicon only; enables the Insights tab (crash explanations, digests, Ask panel) — `pip install mlx-lm`, first use downloads a ~2GB model |
 | rumps | **optional**; enables macOS Menu Bar icon |
 | Browser | Chrome / Safari / Firefox — for the PWA dashboard |
 
@@ -307,7 +323,7 @@ bash scripts/uninstall.sh
 | Property | Value |
 |----------|-------|
 | Location | `~/Library/Application Support/performance-bot/metrics.db` |
-| Format | SQLite (Python `sqlite3` stdlib — no extra dependency) |
+| Format | SQLite (Python `sqlite3` stdlib — no extra dependency), WAL journal mode |
 | Core schema | `ts, cpu_pct, mem_pct, swap_pct, disk_pct, pressure, eff_tier, tte_min, thermal_pct` |
 | v2.0 tables | `remediation_outcomes` (RAC outcome log) · `signal_weights` (RWA weight history) |
 | Write cadence | Batch `executemany()` every 60 s |

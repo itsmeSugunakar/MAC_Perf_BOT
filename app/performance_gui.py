@@ -9,8 +9,10 @@ import os, sys, time, json, threading, subprocess, webbrowser, sqlite3, math
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+import llm_engine  # optional — degrades cleanly if mlx-lm isn't installed (see llm_engine.py)
 
 try:
     import psutil
@@ -33,6 +35,10 @@ CACHE_RETENTION_DAYS = 90     # rows older than this are pruned
 CACHE_WRITE_S        = 60     # flush in-memory buffer to disk every N seconds
 CACHE_PRUNE_S        = 86400  # prune expired rows once per day
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─── LLM Insights (offline MLX — optional, see llm_engine.py) ─────────────────
+LLM_DAILY_DIGEST_COOL_S  = 86400   # generate the daily digest at most once/day
+LLM_WEEKLY_DIGEST_COOL_S = 604800  # generate the weekly digest at most once/week
 
 
 class MetricsCache:
@@ -91,8 +97,15 @@ class MetricsCache:
         self._buf  = []   # [(ts, cpu, mem, swap, disk, pressure, tier, tte, therm)]
         self._last_prune = 0.0
         self._ok   = False
+        self._iv_cache    = None   # interventions_today() result cache (~20s TTL)
+        self._iv_cache_ts = 0.0
         try:
             with sqlite3.connect(self._db, timeout=5) as cx:
+                # WAL lets the once-a-second /stats reader run concurrently with the
+                # once-daily prune() writer instead of blocking it — see prune()'s
+                # wal_checkpoint call below, which was a silent no-op without this.
+                cx.execute("PRAGMA journal_mode=WAL")
+                cx.execute("PRAGMA synchronous=NORMAL")
                 cx.executescript(self._SCHEMA)
                 # Migrate existing databases missing the thermal_pct column
                 try:
@@ -146,8 +159,16 @@ class MetricsCache:
             return
         cutoff = int(now - retention_days * 86400)
         try:
-            with sqlite3.connect(self._db, timeout=5) as cx:
+            # Longer timeout than other queries — prune is a once-a-day background job,
+            # not latency-sensitive, so it can afford to wait out residual lock contention.
+            with sqlite3.connect(self._db, timeout=15) as cx:
                 cx.execute("DELETE FROM metrics WHERE ts < ?", (cutoff,))
+                # Must commit before checkpointing — running wal_checkpoint while this
+                # DELETE's transaction is still open reliably raises "database table is
+                # locked" (reproduced directly: identical statements each succeed alone,
+                # but only fail when chained in one uncommitted transaction). WAL mode
+                # alone did not fix this; this ordering is the actual fix.
+                cx.commit()
                 cx.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except Exception as e:
             print(f"[cache] prune failed: {e}", file=sys.stderr)
@@ -312,11 +333,17 @@ class MetricsCache:
         Return today's intervention summary from remediation_outcomes,
         plus all-time 'time below critical' proof of containment.
         'Today' = since local midnight.
+
+        Result is cached for ~20s — this is called on every /stats poll (once/second
+        from the dashboard), and its two full-table scans were the main thing holding
+        a read lock long enough to starve the once-daily prune() writer.
         """
         if not self._ok:
             return {"total": 0, "succeeded": 0, "success_rate": 0.0, "ram_saved_mb": 0.0,
                     "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_successes": 0,
                     "alltime_success_rate": 0.0, "alltime_ram_saved_gb": 0.0, "alltime_best_save_mb": 0.0}
+        if self._iv_cache is not None and time.time() - self._iv_cache_ts < 20:
+            return self._iv_cache
         import datetime as _dt
         now_dt = _dt.datetime.now()
         midnight_ts = int(now_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -345,7 +372,7 @@ class MetricsCache:
                 "SELECT MAX(delta_mb) FROM remediation_outcomes WHERE success=1"
             ).fetchone()
             pct_below   = round((contain[0] or 0) / max(contain[1], 1) * 100, 1)
-            return {
+            result = {
                 "total":                 total,
                 "succeeded":             succeeded,
                 "success_rate":          round(succeeded / total, 2) if total else 0.0,
@@ -357,10 +384,50 @@ class MetricsCache:
                 "alltime_ram_saved_gb":   round(all_saved / 1024, 1),
                 "alltime_best_save_mb":   round((best_save[0] or 0), 0),
             }
+            self._iv_cache, self._iv_cache_ts = result, time.time()
+            return result
         except Exception:
             return {"total": 0, "succeeded": 0, "success_rate": 0.0, "ram_saved_mb": 0.0,
                     "pct_below_87": 100.0, "alltime_interventions": 0, "alltime_successes": 0,
                     "alltime_success_rate": 0.0, "alltime_ram_saved_gb": 0.0, "alltime_best_save_mb": 0.0}
+
+    def recent_outcomes(self, n: int = 5) -> list:
+        """Return the n most recent remediation outcomes (newest first)."""
+        if not self._ok:
+            return []
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT ts, tier, action, pre_mem, post_mem, delta_mb, success "
+                    "FROM remediation_outcomes ORDER BY ts DESC LIMIT ?", (n,)
+                ).fetchall()
+            return [
+                {"ts": r[0], "tier": r[1], "action": r[2],
+                 "pre_mem": r[3], "post_mem": r[4],
+                 "delta_mb": round(r[5] or 0, 0), "success": bool(r[6])}
+                for r in rows
+            ]
+        except Exception:
+            return []
+
+    def outcomes_since(self, cutoff_ts: int) -> list:
+        """Return remediation outcomes at/after cutoff_ts (oldest first) — feeds
+        the LLM digest prompt (see llm_engine.py's _build_digest_prompt)."""
+        if not self._ok:
+            return []
+        try:
+            with sqlite3.connect(self._db, timeout=3) as cx:
+                rows = cx.execute(
+                    "SELECT ts, tier, action, delta_mb, success "
+                    "FROM remediation_outcomes WHERE ts >= ? ORDER BY ts", (cutoff_ts,)
+                ).fetchall()
+            return [
+                {"ts": r[0], "tier": r[1], "action": r[2],
+                 "delta_mb": round(r[3] or 0, 0), "success": bool(r[4])}
+                for r in rows
+            ]
+        except Exception:
+            return []
 
     def query_signal_accuracy(self, signal: str, hours: int = 24) -> float:
         """
@@ -500,6 +567,8 @@ NEVER_TERMINATE = {
     "CredentialProviderExtensionHelper",
     "Keychain Circle Notification",
     "com.apple.iCloud.Keychain",
+    "SoftwareUpdateSettingsExtension",
+    "SoftwareUpdateSettingsWidgetExtension",
 }
 IDLE_SERVICE_PATTERNS = (
     "Widget", "Extension", "XPCService", "HelperService",
@@ -542,7 +611,12 @@ TTE_TIER2_MIN    = 10.0   # trigger Tier 2 early when TTE ≤ this many minutes
 TTE_TIER3_MIN    =  5.0   # trigger Tier 3 early when TTE ≤ this
 TTE_TIER4_MIN    =  2.0   # trigger Tier 4 early when TTE ≤ this
 TTE_MIN_SAMPLES  = 20     # minimum mem_hist samples before TTE can drive escalation
-XPC_RESPAWN_S    = 10     # seconds; services restarting within this window → blocklisted
+XPC_RESPAWN_S    = 90     # seconds; services restarting within this window → blocklisted
+                           # (must exceed IDLE_SWEEP_S=30s — a service killed by the idle
+                           # sweep and relaunched by launchd before the next sweep was
+                           # evading detection at the old 10s window; observed live with
+                           # WallpaperVideoExtension respawning every 30-64s in an endless
+                           # kill/relaunch loop that visibly flickered the desktop)
 
 # ─── MMAF — Multi-Model Adaptive Forecaster ───────────────────────────────────
 MMAF_MIN_SAMPLES = 10     # minimum samples before any model engages
@@ -803,19 +877,42 @@ class NeuralPerformanceAnalyzer:
         recs     = []
         add      = recs.append
 
+        # Throttled process info (injected by _run_npa from self.throttled)
+        throttled_names = bot_state.get('throttled_names', [])
+        throttled_pids  = bot_state.get('throttled_pids',  [])
+
+        # 0-pre. TTE velocity — fires when memory isn't critical yet but closing fast
+        tte = bot_state.get('tte_min', -1)
+        if 0 < tte < 15 and pred_mem < 90:
+            add({'priority': 1, 'icon': '⏱',
+                 'title': f'Memory filling fast — ~{tte:.0f} min to danger zone',
+                 'detail': f'At current rate RAM will hit 95% in about {tte:.0f} minutes.',
+                 'action': 'Close browser tabs and background apps now to avoid slowdown.',
+                 'confidence': round(float(pred[2]), 2),
+                 'pid': None, 'action_type': None})
+        elif 15 <= tte < 30 and pred_mem >= 80:
+            add({'priority': 2, 'icon': '⏳',
+                 'title': f'Steady memory growth — ~{tte:.0f} min runway',
+                 'detail': 'No immediate action needed, but keep an eye on it.',
+                 'action': 'Wrap up heavy tasks before the buffer runs out.',
+                 'confidence': round(float(pred[2]), 2),
+                 'pid': None, 'action_type': None})
+
         # 0. Critical — imminent RAM exhaustion
         if pred_mem >= 90:
             add({'priority': 0, 'icon': '🔴',
                  'title': f'RAM will reach {pred_mem:.0f}% in ~60 min',
                  'detail': 'Close the largest apps now before the bot has to intervene.',
                  'action': 'Activity Monitor → sort by Memory → quit top apps',
-                 'confidence': round(min(1.0, (pred_mem - 85) / 15), 2)})
+                 'confidence': round(min(1.0, (pred_mem - 85) / 15), 2),
+                 'pid': None, 'action_type': 'remediate'})
         elif pred_mem >= 85:
             add({'priority': 1, 'icon': '🟠',
                  'title': f'Memory pressure building: {pred_mem:.0f}% forecast',
                  'detail': 'AI predicts RAM will exceed 87% threshold within the hour.',
                  'action': 'Pre-emptively close unused browser tabs and background apps',
-                 'confidence': round((pred_mem - 80) / 20, 2)})
+                 'confidence': round((pred_mem - 80) / 20, 2),
+                 'pid': None, 'action_type': 'remediate'})
 
         # 1. Warning — anomalous usage pattern for this time of day
         if anomaly >= 0.70:
@@ -824,7 +921,8 @@ class NeuralPerformanceAnalyzer:
                  'title': f'Unusual pattern detected ({anomaly:.0%} anomaly)',
                  'detail': f'Resource usage is significantly above normal for {hour}:00.',
                  'action': 'Check Activity Monitor for unexpected background processes',
-                 'confidence': round(anomaly, 2)})
+                 'confidence': round(anomaly, 2),
+                 'pid': None, 'action_type': None})
 
         # 1. Warning — active memory leaks (up to 2)
         leak_pids = bot_state.get('leak_pids_list', [])
@@ -833,9 +931,10 @@ class NeuralPerformanceAnalyzer:
             name = pid_names.get(pid, f'PID {pid}')
             add({'priority': 1, 'icon': '💧',
                  'title': f'Memory leak: {name}',
-                 'detail': f'{name} is growing >50 MB/min. Restart it to reclaim RAM.',
-                 'action': f'Activity Monitor → select {name} → Force Quit (✕)',
-                 'confidence': 0.85})
+                 'detail': f'{name} is growing >50 MB/min. Freeze it to pause the growth.',
+                 'action': f'Freeze {name} to pause it — the bot will resume it when safe',
+                 'confidence': 0.85,
+                 'pid': pid, 'action_type': 'freeze'})
 
         # 1. Warning — thermal throttle
         thermal = bot_state.get('thermal_pct', 100)
@@ -844,15 +943,21 @@ class NeuralPerformanceAnalyzer:
                  'title': f'Thermal throttle active — CPU at {thermal}% speed',
                  'detail': 'Your Mac is running hot and has reduced CPU clock speed.',
                  'action': 'Elevate Mac for airflow or use an external cooling pad',
-                 'confidence': 0.95})
+                 'confidence': 0.95,
+                 'pid': None, 'action_type': None})
 
         # 2. Info — high CPU predicted
         if pred_cpu >= 75 and thermal >= 90:
+            cpu_name = throttled_names[0] if throttled_names else None
+            cpu_pid  = throttled_pids[0]  if throttled_pids  else None
             add({'priority': 2, 'icon': '🔥',
-                 'title': f'High CPU forecast: {pred_cpu:.0f}%',
+                 'title': (f'CPU spike — {cpu_name} using heavy resources'
+                           if cpu_name else f'High CPU forecast: {pred_cpu:.0f}%'),
                  'detail': 'AI expects sustained CPU load over the next hour.',
-                 'action': 'Defer Spotlight indexing, iCloud sync, or software updates',
-                 'confidence': round(min(1.0, (pred_cpu - 60) / 40), 2)})
+                 'action': ('Defer Spotlight indexing, iCloud sync, or software updates'
+                            if not cpu_name else f'Throttle {cpu_name} to free up CPU'),
+                 'confidence': round(min(1.0, (pred_cpu - 60) / 40), 2),
+                 'pid': cpu_pid, 'action_type': 'throttle' if cpu_pid else None})
 
         # 2. Info — disk nearly full
         disk = bot_state.get('disk_pct', 0)
@@ -861,13 +966,15 @@ class NeuralPerformanceAnalyzer:
                  'title': f'Disk nearly full ({disk:.0f}%)',
                  'detail': 'Low disk reduces swap space and can cause system slowdowns.',
                  'action': 'Empty Trash · clear ~/Downloads · run "brew cleanup"',
-                 'confidence': 0.98})
+                 'confidence': 0.98,
+                 'pid': None, 'action_type': None})
         elif disk >= 80:
             add({'priority': 3, 'icon': '💿',
                  'title': f'Disk at {disk:.0f}% — watch space',
                  'detail': 'Under 20% free disk may affect virtual memory performance.',
                  'action': 'Review ~/Library/Caches and remove large unused files',
-                 'confidence': 0.90})
+                 'confidence': 0.90,
+                 'pid': None, 'action_type': None})
 
         # 3. Tip — circadian peak hour (from CMPE profile)
         hour = datetime.now().hour
@@ -882,7 +989,8 @@ class NeuralPerformanceAnalyzer:
                      'detail': f'Historical data shows high memory pressure at this time. '
                                f'Off-peak: {next_low}:00.',
                      'action': f'Schedule heavy tasks before {next_low}:00 tomorrow',
-                     'confidence': 0.75})
+                     'confidence': 0.75,
+                     'pid': None, 'action_type': None})
 
         # 3. Tip — chronic RAM pressure → hardware upgrade
         longterm = bot_state.get('longterm_avg_mem', 0)
@@ -891,7 +999,8 @@ class NeuralPerformanceAnalyzer:
                  'title': f'30-day avg RAM: {longterm:.0f}% — upgrade recommended',
                  'detail': 'Your Mac is chronically memory-constrained over the past month.',
                  'action': 'Consider a Mac with more unified memory on your next upgrade',
-                 'confidence': 0.90})
+                 'confidence': 0.90,
+                 'pid': None, 'action_type': None})
 
         # 4. All clear
         if not recs:
@@ -899,7 +1008,8 @@ class NeuralPerformanceAnalyzer:
                  'title': 'System healthy — no action needed',
                  'detail': f'AI forecasts {pred_mem:.0f}% RAM and {pred_cpu:.0f}% CPU next hour.',
                  'action': 'Keep doing what you\'re doing',
-                 'confidence': round(max(0.0, 1.0 - anomaly), 2)})
+                 'confidence': round(max(0.0, 1.0 - anomaly), 2),
+                 'pid': None, 'action_type': None})
 
         recs.sort(key=lambda r: r['priority'])
         return recs[:5]
@@ -929,6 +1039,9 @@ class BotEngine(threading.Thread):
         self._terminated      = set()
         self._rss_history     = {}     # pid → [(ts, rss_mb), ...]
         self._warned_leaks    = set()  # pids already flagged this session
+        self._seen_crash_reports  = set()   # .ips filenames already noticed
+        self._crash_reports_seeded = False  # True after the first backlog seed pass
+        self._cpu_warned_ts   = {}     # pid → last "High CPU" warning timestamp (60s cooldown)
         self._cache_warned    = False
         self.performance_score: int  = -1    # 0–100 daily score; -1 = warming up
         self._leak_pids: set         = set() # PIDs currently flagged as leaks
@@ -1048,6 +1161,11 @@ class BotEngine(threading.Thread):
         self._npa_recs: list  = []   # [{priority, icon, title, detail, action, confidence}]
         self._npa_next_hour: dict = {}  # {mem: float, cpu: float, anomaly: float}
         self._last_npa: float = 0.0
+        # ── LLM Insights: daily/weekly digest cooldowns ───────────────────────
+        # Loaded from the persisted digest (if any) so a restart doesn't
+        # immediately re-enqueue a generation that already ran recently.
+        self._last_daily_digest_ts  = (llm_engine.get_latest_digest("daily")  or {}).get("ts", 0)
+        self._last_weekly_digest_ts = (llm_engine.get_latest_digest("weekly") or {}).get("ts", 0)
 
     # ── public ────────────────────────────────────────────────────────────────
     def stop(self):
@@ -1091,6 +1209,13 @@ class BotEngine(threading.Thread):
             return True
         except Exception:
             return False
+
+    def trigger_remediation(self, tier: int):
+        """User-initiated remediation at the requested tier (1–4), bypassing threshold gates."""
+        tier = max(1, min(4, tier))
+        with self._lock:
+            mem_pct = self.mem_hist[-1] if self.mem_hist else 85.0
+        self._tiered_memory_remediation(mem_pct, effective_tier=tier)
 
     def snapshot(self):
         with self._lock:
@@ -1152,12 +1277,15 @@ class BotEngine(threading.Thread):
                 "npa_trained":          self._npa._trained,
                 "npa_next_hour":        dict(self._npa_next_hour),
                 "npa_recs":             list(self._npa_recs),
+                "recent_actions":       self._cache.recent_outcomes(5),
             }
 
     # ── internal ──────────────────────────────────────────────────────────────
-    def _emit(self, kind: str, msg: str, category: str = "user"):
+    def _emit(self, kind: str, msg: str, category: str = "user", meta: dict = None):
         ev = {"kind": kind, "msg": msg, "category": category,
               "ts": datetime.now().strftime("%H:%M:%S")}
+        if meta:
+            ev["meta"] = meta
         with self._lock:
             self.events.append(ev)   # deque(maxlen=200) auto-discards oldest
 
@@ -1175,6 +1303,7 @@ class BotEngine(threading.Thread):
                     if tick % 30 == 0: self._detect_xpc_respawn()           # 0.03 Hz (was 0.1 Hz)
                     if tick % 60 == 0: self._check_thermal()                # 0.016 Hz — pmset subprocess
                     if tick % 60 == 0: self._check_zombies()
+                    if tick % 60 == 0: self._check_crash_reports()
                     if tick % 60 == 0: self._track_memory_leaks()
                     if tick % 60 == 0: self._run_npa()
                     if tick % IDLE_SWEEP_S == 0: self._sweep_idle_services()
@@ -1203,6 +1332,18 @@ class BotEngine(threading.Thread):
                     if tick == 0 or (self._last_cda_train > 0 and
                             time.time() - self._last_cda_train >= CDA_TRAIN_COOL_S):
                         self._cda_train_model()
+                    # LLM Insights: daily/weekly digest — cooldown-gated exactly like CDA
+                    # training above, but this branch only *enqueues* a background job
+                    # (llm_engine's own worker thread does the actual generation); it never
+                    # runs inference inline in this tick loop.
+                    if llm_engine.is_available():
+                        now_ts = time.time()
+                        if now_ts - self._last_daily_digest_ts >= LLM_DAILY_DIGEST_COOL_S:
+                            self._last_daily_digest_ts = now_ts   # set immediately — no duplicate enqueue
+                            self._enqueue_digest("daily")
+                        if now_ts - self._last_weekly_digest_ts >= LLM_WEEKLY_DIGEST_COOL_S:
+                            self._last_weekly_digest_ts = now_ts
+                            self._enqueue_digest("weekly")
                 except Exception as exc:
                     self._emit("warn", f"Engine error: {exc}")
             tick += 1
@@ -1242,31 +1383,54 @@ class BotEngine(threading.Thread):
                 info  = p.info
                 name  = info["name"][:30]
                 pid   = info["pid"]
-                c     = (info["cpu_percent"] or 0.0) / ncpu
+                # raw_c matches psutil/ps/Activity Monitor convention (100% = one full
+                # core, multi-threaded processes can exceed 100%) — this is what a user
+                # visually compares against Activity Monitor, and what the dashboard table
+                # displays/sorts by. c (normalized by core count, "% of total system
+                # capacity") is kept separately only for the system-wide throttle decision
+                # below — dividing by ncpu made a process pegging a single core on this
+                # 8-core Mac show as ~12%, so it could never cross CPU_WARN=70 no matter
+                # how busy it actually was; reproduced directly with `yes` at 98.7% raw
+                # (12.4% normalized) never triggering a warning before this fix.
+                raw_c = info["cpu_percent"] or 0.0
+                c     = raw_c / ncpu
                 mem_p = info["memory_percent"] or 0.0
                 stat  = info["status"]
 
                 # Stale-app tracker: record last time this PID had CPU activity
-                if c > 0.1:
+                if raw_c > 0.1:
                     self._app_last_active[pid] = _now_active
                 elif pid not in self._app_last_active:
                     self._app_last_active[pid] = _now_active  # first seen → grace period
 
-                rows.append((c, mem_p, pid, name, stat))
+                rows.append((raw_c, mem_p, pid, name, stat))
 
-                # CPU throttle detection — inline, no second iteration
-                if sys_cpu >= CPU_WARN and name not in PROTECTED \
-                        and pid not in throttled:
-                    if c >= CPU_THROTTLE:
-                        to_throttle.append((p, name, pid, c))
-                    elif c >= CPU_WARN:
+                # CPU throttle detection — inline, no second iteration.
+                # Visibility (warn) and action (throttle) are gated differently on purpose:
+                # warning fires on the process's own per-core CPU (raw_c) regardless of
+                # system load — purely informational, matches what Activity Monitor already
+                # shows. Throttling stays on the normalized, system-wide-gated value (c),
+                # unchanged from before — auto-renicing a process doing legitimate one-core
+                # work while the rest of the Mac has headroom is a bigger behavioral call
+                # than just telling the user about it, and still requires heavy multi-core
+                # saturation plus overall system load, exactly as originally designed.
+                if name not in PROTECTED and pid not in throttled:
+                    if sys_cpu >= CPU_WARN and c >= CPU_THROTTLE:
+                        to_throttle.append((p, name, pid, raw_c))
+                    elif raw_c >= CPU_WARN and _now_active - self._cpu_warned_ts.get(pid, 0) >= 60:
+                        self._cpu_warned_ts[pid] = _now_active
                         self.issues += 1
                         self._emit("warn",
-                            f"High CPU: {name} (PID {pid}) using {c:.0f}%")
+                            f"High CPU: {name} (PID {pid}) using {raw_c:.0f}%")
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-        rows.sort(reverse=True)
+        rows.sort(key=lambda x: (x[1], x[0]), reverse=True)  # memory first, CPU as tiebreaker
+        # A CPU-heavy but memory-light process (e.g. a helper pegging one core) could be
+        # sorted out of a memory-only top 12 entirely — union in the top-by-CPU processes
+        # too so a live CPU spike is never invisible in the table, same as Activity Monitor.
+        _top_by_cpu = sorted(rows, key=lambda x: x[0], reverse=True)[:4]
+        _top_procs  = rows[:9] + [r for r in _top_by_cpu if r not in rows[:9]]
 
         # Restore calmed throttled procs (tiny loop — usually 0–3 items)
         self._restore_calmed_procs(ram_lock)
@@ -1295,7 +1459,7 @@ class BotEngine(threading.Thread):
             self.cpu_hist.append(cpu)
             self.mem_hist.append(vm.percent)
             self.swap_hist.append(swap_pct)
-            self.top_procs = rows[:12]
+            self.top_procs = _top_procs[:12]
             # stash vm/swap for _check_memory() — avoids a second virtual_memory() call
             self._last_vm   = vm
             self._last_swap = swap
@@ -1457,6 +1621,64 @@ class BotEngine(threading.Thread):
             for pid, name in zombies[:5]:
                 self._emit("warn",
                     f"Zombie process: {name} (PID {pid}) — parent process may be hung")
+
+    def _check_crash_reports(self):
+        """
+        Surface real app crash/exception reports from macOS's own crash reporter —
+        the same class of "error" Activity Monitor / Console.app shows, which this bot
+        otherwise never looks at (it only sees live psutil metrics, not crash history).
+
+        Reads only the lightweight first-line JSON header of each .ips file (app_name,
+        timestamp, bug_type) — never the full multi-KB stack-trace body. Only alerts on
+        reports that appear *after* the bot started watching; the pre-existing backlog is
+        seeded into _seen_crash_reports on the first call without emitting for it, so a
+        restart doesn't dump a history of old crashes into the Activity Log.
+        """
+        reports_dir = Path.home() / "Library" / "Logs" / "DiagnosticReports"
+        if not reports_dir.is_dir():
+            return
+        try:
+            files = list(reports_dir.glob("*.ips")) + list(reports_dir.glob("Retired/*.ips"))
+        except OSError:
+            return
+
+        first_run = not self._crash_reports_seeded
+        for f in files:
+            key = f.name
+            if key in self._seen_crash_reports:
+                continue
+            self._seen_crash_reports.add(key)
+            if first_run:
+                continue  # seed silently — don't alert on pre-existing backlog
+            try:
+                with open(f, "r") as fh:
+                    header = json.loads(fh.readline())
+                app_name  = header.get("app_name", f.stem)
+                timestamp = header.get("timestamp", "")
+            except Exception:
+                continue  # malformed or legacy plain-text .crash-style file — skip, not fatal
+            self.issues += 1
+            self._emit("issue", f"{app_name} crashed at {timestamp}", meta={"crash_key": key})
+
+        self._crash_reports_seeded = True
+
+    def _enqueue_digest(self, period: str):
+        """Gather the digest's context and hand it to llm_engine's background
+        worker — called only from the cooldown-gated check in run(), never
+        does any generation itself. `period`: "daily" | "weekly"."""
+        days = 1 if period == "daily" else 7
+        hourly   = self._cache.hourly_history(days=days)
+        outcomes = self._cache.outcomes_since(int(time.time()) - days * 86400)
+
+        def _on_done(job):
+            if job["status"] == "done":
+                self._emit("info", f"{period.capitalize()} summary ready — see Insights tab",
+                            category="llm")
+            elif job["status"] == "error":
+                self._emit("warn", f"{period.capitalize()} summary generation failed: {job['error']}",
+                            category="llm")
+
+        llm_engine.submit_digest(period, {"hourly": hourly, "outcomes": outcomes}, on_done=_on_done)
 
     def _track_memory_leaks(self):
         """Flag processes whose RSS is growing rapidly (potential leaks)."""
@@ -3143,6 +3365,7 @@ class BotEngine(threading.Thread):
             return
         pred = self._npa.predict_from_rows(recent)
         with self._lock:
+            throttled_procs = list(self.throttled.items())  # [(pid_str, name), ...]
             bot_state = {
                 'thermal_pct':       self.thermal_pct,
                 'leak_pids_list':    list(self._leak_pids),
@@ -3150,6 +3373,9 @@ class BotEngine(threading.Thread):
                 'longterm_avg_mem':  self.longterm_avg_mem,
                 'disk_pct':          self.disk_pct,
                 'circadian_profile': dict(self._circadian_profile),
+                'tte_min':           self.mem_forecast_min,
+                'throttled_names':   [name for _, name in throttled_procs],
+                'throttled_pids':    [int(pid) for pid, _ in throttled_procs],
             }
         recs = self._npa.generate_recommendations(pred, bot_state)
         with self._lock:
@@ -3582,53 +3808,116 @@ HTML = r"""<!DOCTYPE html>
   .npa-badge-warm{background:rgba(228,179,65,.15);color:var(--orange)}
   .npa-badge-on{background:rgba(63,185,80,.15);color:var(--green)}
   .npa-fc{font-size:9px;color:var(--muted);margin-left:auto}
-  .npa-rec{display:flex;gap:8px;padding:6px 10px;border-bottom:1px solid var(--border);
+  .npa-rec{display:flex;gap:10px;padding:8px 12px;border-bottom:1px solid var(--border);
     align-items:flex-start}
   .npa-rec:last-child{border-bottom:none}
-  .npa-ico{font-size:14px;flex-shrink:0;line-height:1.6}
+  .npa-ico{font-size:15px;flex-shrink:0;line-height:1.7}
   .npa-body{flex:1;min-width:0}
-  .npa-ttl{font-size:10px;font-weight:700;color:var(--text);margin-bottom:2px}
-  .npa-det{font-size:9px;color:var(--muted);line-height:1.4;margin-bottom:2px}
-  .npa-act{font-size:9px;color:var(--blue);font-weight:600}
+  .npa-ttl{font-size:11px;font-weight:700;color:var(--text);margin-bottom:2px}
+  .npa-det{font-size:10px;color:var(--muted);line-height:1.4;margin-bottom:2px}
+  .npa-act{font-size:10px;color:var(--blue);font-weight:600}
   .npa-conf{font-size:8px;color:var(--muted2);margin-left:auto;flex-shrink:0;align-self:center}
   .npa-p0{border-left:3px solid var(--red)}
   .npa-p1{border-left:3px solid var(--orange)}
   .npa-p2{border-left:3px solid var(--blue)}
   .npa-p3{border-left:3px solid var(--muted2)}
   .npa-p4{border-left:3px solid var(--green)}
+  .npa-btn{display:inline-flex;align-items:center;gap:4px;margin-top:7px;
+    padding:5px 13px;font-size:11px;font-weight:600;
+    border:1px solid #4a86e8;border-radius:6px;background:rgba(74,134,232,.08);
+    color:#4a86e8;cursor:pointer;transition:all .15s;letter-spacing:.01em}
+  .npa-btn:hover{background:rgba(74,134,232,.18);border-color:#3a76d8;transform:translateY(-1px)}
+  .npa-btn:active{transform:translateY(0)}
+  .npa-btn:disabled{opacity:.5;cursor:default;transform:none}
+
+  /* ── Summary recent actions list ── */
+  .sum-actions-hdr{padding:6px 12px;font-size:9px;font-weight:700;text-transform:uppercase;
+    letter-spacing:.5px;color:var(--muted);border-top:1px solid var(--border)}
+  .sum-action-row{display:flex;align-items:center;gap:7px;padding:5px 12px;
+    border-bottom:1px solid var(--border);font-size:9px}
+  .sum-action-row:last-child{border-bottom:none}
+  .sum-action-ico{flex-shrink:0;font-size:11px}
+  .sum-action-body{flex:1;color:var(--text);line-height:1.3}
+  .sum-action-ts{color:var(--muted);flex-shrink:0;font-size:8px}
 
   /* ── Summary tab ── */
   .sum-wrap{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
-  .sum-hero-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;display:flex;align-items:center;gap:16px;flex-shrink:0}
-  .sum-score-block{display:flex;align-items:baseline;gap:2px;flex-shrink:0;width:88px;justify-content:center;flex-direction:column;align-items:center;padding:8px;border:3px solid var(--green);border-radius:50%;width:80px;height:80px;justify-content:center}
-  .sum-score-num{font-size:30px;font-weight:800;line-height:1;transition:color .3s}
-  .sum-score-denom{font-size:11px;color:var(--muted);font-weight:500;line-height:1}
+  .sum-top-row{display:flex;gap:12px;align-items:stretch;flex-shrink:0}
+  .sum-hero-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;display:flex;align-items:center;gap:16px;flex:0 0 300px}
+  .sum-ai-panel{flex:1;min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;min-height:260px;max-height:460px}
+  .sum-ai-hdr{padding:9px 14px;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.55px;color:var(--muted);display:flex;align-items:center;flex-shrink:0;background:rgba(74,134,232,.04)}
+  .sum-ai-body{flex:1;overflow-y:auto}
+  .sum-score-block{display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0;width:84px;height:84px;border:3px solid var(--green);border-radius:50%;padding:8px;transition:border-color .3s}
+  .sum-score-num{font-size:28px;font-weight:800;line-height:1;transition:color .3s}
+  .sum-score-denom{font-size:10px;color:var(--muted);font-weight:500;line-height:1.4}
   .sum-hero-info{flex:1;min-width:0}
   .sum-hero-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:5px}
   .sum-hero-title{font-size:15px;font-weight:700;color:var(--text)}
   .sum-hero-status{font-size:11px;color:var(--muted);line-height:1.5;margin-bottom:6px}
   .sum-hero-pills{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
-  .sum-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;flex-shrink:0}
-  .sum-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
-  .sum-card-lbl{font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.55px;color:var(--muted);margin-bottom:3px}
-  .sum-card-val{font-size:22px;font-weight:700;line-height:1.1;transition:color .3s}
-  .sum-card-sub{font-size:9px;color:var(--muted);margin-top:2px}
-  .sum-issue-alert{background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.3);border-radius:8px;padding:10px 14px;flex-shrink:0;display:none}
-  .sum-issue-title{font-size:11px;font-weight:700;color:var(--red);margin-bottom:3px}
+  .sum-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;flex-shrink:0}
+  .sum-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+  .sum-card-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:4px}
+  .sum-card-val{font-size:24px;font-weight:700;line-height:1.1;transition:color .3s}
+  .sum-card-sub{font-size:9px;color:var(--muted);margin-top:3px}
+  .sum-issue-alert{background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.3);border-radius:12px;padding:12px 16px;flex-shrink:0;display:none}
+  .sum-issue-title{font-size:12px;font-weight:700;color:var(--red);margin-bottom:4px}
   .sum-issue-action{font-size:10px;color:var(--muted)}
-  .sum-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;flex-shrink:0}
-  .sum-section-hdr{padding:8px 14px;border-bottom:1px solid var(--border);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.55px;color:var(--muted);display:flex;align-items:center}
+  .sum-section{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;flex-shrink:0}
+  .sum-section-hdr{padding:10px 16px;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);display:flex;align-items:center}
   .sum-bot-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border)}
   .sum-bot-cell{background:var(--surface);padding:10px 14px}
   .sum-bot-cell-lbl{font-size:9px;color:var(--muted);margin-bottom:3px}
   .sum-bot-cell-val{font-size:18px;font-weight:700;transition:color .3s}
+  .sum-bot-cell-sub{font-size:9px;color:var(--muted);margin-top:2px}
+  /* ── What the Bot Did rows ── */
+  .sum-did-section{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;flex-shrink:0}
+  .sum-did-hdr{padding:10px 16px;border-bottom:1px solid var(--border);font-size:11px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px}
+  .sum-did-hdr-sub{font-size:9px;font-weight:400;color:var(--muted);margin-left:auto}
+  .sum-did-row{display:flex;align-items:flex-start;gap:11px;padding:10px 14px;border-bottom:1px solid var(--border)}
+  .sum-did-row:last-of-type{border-bottom:none}
+  .sum-did-ico{font-size:17px;flex-shrink:0;width:24px;text-align:center;margin-top:1px}
+  .sum-did-body{flex:1;min-width:0}
+  .sum-did-title{font-size:12px;font-weight:600;color:var(--text);line-height:1.3}
+  .sum-did-sub{font-size:9px;color:var(--muted);margin-top:2px;line-height:1.4}
+  .sum-did-val{font-size:14px;font-weight:700;flex-shrink:0;font-family:'SF Mono',monospace;min-width:56px;text-align:right;align-self:center}
+  .sum-smart-line{padding:9px 14px;font-size:10px;color:var(--text);line-height:1.5;border-top:1px solid var(--border);background:var(--bg);font-style:italic}
+  /* ── Health Record ── */
+  .sum-health-section{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;flex-shrink:0}
+  .sum-health-hdr{padding:10px 16px;border-bottom:1px solid var(--border);font-size:11px;font-weight:700;color:var(--text)}
+  .sum-contain-wrap{padding:12px 14px;border-bottom:1px solid var(--border)}
+  .sum-contain-label{display:flex;justify-content:space-between;font-size:10px;color:var(--text);font-weight:600;margin-bottom:6px}
+  .sum-contain-bar-bg{height:8px;border-radius:4px;background:var(--border);overflow:hidden}
+  .sum-contain-bar-fill{height:100%;border-radius:4px;transition:width .7s}
+  .sum-contain-caption{font-size:9px;color:var(--muted);margin-top:5px}
+  .sum-stat-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--border)}
+  .sum-stat-cell{background:var(--surface);padding:10px 14px}
+  .sum-stat-lbl{font-size:9px;color:var(--muted);margin-bottom:3px}
+  .sum-stat-val{font-size:18px;font-weight:700;transition:color .3s}
+  .sum-stat-sub{font-size:9px;color:var(--muted);margin-top:2px}
+  .sum-perf-line{padding:9px 14px;font-size:10px;color:var(--text);line-height:1.5;border-top:1px solid var(--border);background:var(--bg)}
+  /* ── legacy compat (kept so old refs still resolve) ── */
+  .sum-inference{padding:8px 14px;font-size:9px;color:var(--muted);line-height:1.5;border-top:1px solid var(--border);background:var(--bg)}
+  .sum-contain-fill{height:100%;border-radius:3px;transition:width .5s}
   .sum-proc-row{display:flex;align-items:center;gap:10px;padding:6px 14px;border-bottom:1px solid var(--border);font-size:11px}
   .sum-proc-row:last-child{border-bottom:none}
   .sum-proc-name{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
-  .sum-proc-bar-wrap{width:72px;flex-shrink:0}
+  .sum-proc-badge{font-size:8px;color:#fff;border-radius:3px;padding:1px 4px;margin-left:5px}
+  .sum-proc-bar-wrap{width:78px;flex-shrink:0;display:flex;flex-direction:column;gap:2px}
   .sum-proc-bar{height:4px;border-radius:2px;background:var(--border);overflow:hidden}
   .sum-proc-bar-fill{height:100%;border-radius:2px;transition:width .5s}
-  .sum-proc-pct{font-family:'SF Mono',monospace;font-size:10px;color:var(--muted);flex-shrink:0;min-width:36px;text-align:right}
+  .sum-proc-sub{font-size:8px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sum-proc-pct{font-family:'SF Mono',monospace;font-size:10px;color:var(--muted);flex-shrink:0;min-width:40px;text-align:right}
+  .sum-proc-action{flex-shrink:0}
+  .sum-proc-btn{display:inline-flex;align-items:center;gap:3px;padding:3px 9px;font-size:9px;font-weight:600;
+    border:1px solid #4a86e8;border-radius:5px;background:rgba(74,134,232,.08);
+    color:#4a86e8;cursor:pointer;transition:all .15s;white-space:nowrap}
+  .sum-proc-btn:hover{background:rgba(74,134,232,.18);border-color:#3a76d8}
+  .sum-proc-btn:disabled{opacity:.5;cursor:default}
+  .sum-proc-toggle{margin-left:auto;display:flex;gap:4px}
+  .sum-proc-toggle-btn{font-size:9px;font-weight:600;padding:3px 10px;border-radius:6px;
+    border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s}
+  .sum-proc-toggle-btn.active{background:rgba(74,134,232,.12);border-color:#4a86e8;color:#4a86e8}
 
   /* ── Admin tab ── */
   .adm-wrap{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
@@ -3674,6 +3963,7 @@ HTML = r"""<!DOCTYPE html>
   <button class="btn tab-btn tab-active" id="tabSummary" onclick="showTab('summary')">Summary</button>
   <button class="btn tab-btn" id="tabLive" onclick="showTab('live')">Live</button>
   <button class="btn tab-btn" id="tabAdmin" onclick="showTab('admin')">Admin</button>
+  <button class="btn tab-btn" id="tabInsights" onclick="showTab('insights')">Insights</button>
   <span style="flex:1"></span>
   <!-- Performance Score (24h) -->
   <span id="scoreBanner" style="display:none;font-size:10px;color:var(--muted)">
@@ -3686,25 +3976,57 @@ HTML = r"""<!DOCTYPE html>
 <!-- ═══ Summary tab panel ═══════════════════════════════════════════════ -->
 <div id="panelSummary" class="sum-wrap">
 
-  <!-- Health Hero -->
-  <div class="sum-hero-card">
-    <div class="sum-score-block" id="sumScoreBlock" style="border-color:var(--green)">
-      <span class="sum-score-num" id="sumScore" style="color:var(--green)">—</span>
-      <span class="sum-score-denom">/100</span>
-    </div>
-    <div class="sum-hero-info">
-      <div class="sum-hero-top">
-        <span class="sum-hero-title">System Health</span>
-        <span class="tier-badge t0" id="sumTierBadge"><div class="tier-dot"></div><span id="sumTierLabel">All Good</span></span>
+  <!-- Top row: Health Hero + AI Recommendations side by side -->
+  <div class="sum-top-row">
+
+    <!-- Health Hero -->
+    <div class="sum-hero-card">
+      <div class="sum-score-block" id="sumScoreBlock" style="border-color:var(--green)">
+        <span class="sum-score-num" id="sumScore" style="color:var(--green)">—</span>
+        <span class="sum-score-denom">/100</span>
       </div>
-      <div class="sum-hero-status" id="sumStatusLine">Initializing…</div>
-      <div class="sum-hero-pills">
-        <span id="sumUptimePill" class="pill">⏱ 0s</span>
-        <span id="sumPowerPill"  class="pill">⚡ AC</span>
-        <span id="sumMemPressBadge" class="pill">🧠 Normal</span>
-        <span id="sumFcPill" class="mem-forecast fc-stable" style="font-size:10px;padding:2px 8px;border-radius:20px;border:1px solid var(--border)">✓ Stable</span>
+      <div class="sum-hero-info">
+        <div class="sum-hero-top">
+          <span class="sum-hero-title">System Health</span>
+          <span class="tier-badge t0" id="sumTierBadge"><div class="tier-dot"></div><span id="sumTierLabel">All Good</span></span>
+        </div>
+        <div class="sum-hero-status" id="sumStatusLine">Initializing…</div>
+        <div id="sumScoreTip" style="font-size:10px;color:var(--muted);margin-bottom:5px;line-height:1.4"></div>
+        <div class="sum-hero-pills">
+          <span id="sumUptimePill" class="pill">⏱ 0s</span>
+          <span id="sumPowerPill"  class="pill">⚡ AC</span>
+          <span id="sumMemPressBadge" class="pill">🧠 Normal</span>
+          <span id="sumFcPill" class="mem-forecast fc-stable" style="font-size:10px;padding:2px 8px;border-radius:20px;border:1px solid var(--border)">✓ Stable</span>
+        </div>
       </div>
     </div>
+
+    <!-- AI Recommendations (beside hero) -->
+    <div class="sum-ai-panel">
+      <div class="sum-ai-hdr">
+        🤖 AI Recommendations
+        <span class="npa-badge npa-badge-warm" id="sumNpaBadge" style="margin-left:6px">Warming Up</span>
+        <span class="npa-fc" id="sumNpaFc" style="margin-left:auto;font-size:9px"></span>
+      </div>
+      <div class="sum-ai-body" id="sumNpaRecs">
+        <div class="npa-rec npa-p3">
+          <div class="npa-ico">⏳</div>
+          <div class="npa-body">
+            <div class="npa-ttl">Neural model training…</div>
+            <div class="npa-det">Needs ≥150 rows of history. Recommendations appear after the first training run.</div>
+          </div>
+        </div>
+      </div>
+      <div class="sum-actions-hdr" id="sumActionsHdr" style="display:none">🗂 Recent Actions</div>
+      <div id="sumRecentActions"></div>
+    </div>
+
+  </div><!-- /sum-top-row -->
+
+  <!-- Issue Alert (shown when root cause is active — before stat cards for visual priority) -->
+  <div id="sumIssueAlert" class="sum-issue-alert">
+    <div class="sum-issue-title" id="sumIssueTitle"></div>
+    <div class="sum-issue-action" id="sumIssueAction"></div>
   </div>
 
   <!-- Quick Stats (4 cards) -->
@@ -3731,55 +4053,100 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Issue Alert (shown when root cause is active) -->
-  <div id="sumIssueAlert" class="sum-issue-alert">
-    <div class="sum-issue-title" id="sumIssueTitle"></div>
-    <div class="sum-issue-action" id="sumIssueAction"></div>
+  <!-- What the Bot Did For You -->
+  <div class="sum-did-section">
+    <div class="sum-did-hdr">
+      ✨ What the Bot Did For You
+      <span class="sum-did-hdr-sub" id="sumDidSub">today</span>
+    </div>
+    <!-- Row 1: freed -->
+    <div class="sum-did-row" id="sumDidRowFreed">
+      <div class="sum-did-ico">🧹</div>
+      <div class="sum-did-body">
+        <div class="sum-did-title" id="sumDidTitleFreed">No idle services cleared yet</div>
+        <div class="sum-did-sub" id="sumDidSubFreed">Your Mac is managing on its own</div>
+      </div>
+      <div class="sum-did-val" id="sumRelFreed" style="color:var(--muted)">—</div>
+    </div>
+    <!-- Row 2: paused/frozen -->
+    <div class="sum-did-row" id="sumDidRowPaused">
+      <div class="sum-did-ico">❄️</div>
+      <div class="sum-did-body">
+        <div class="sum-did-title" id="sumDidTitlePaused">No background tasks paused</div>
+        <div class="sum-did-sub" id="sumDidSubPaused">Memory pressure was not high enough to need it</div>
+      </div>
+      <div class="sum-did-val" id="sumRelSuspended" style="color:var(--muted)">—</div>
+    </div>
+    <!-- Row 3: confirmed savings -->
+    <div class="sum-did-row" id="sumDidRowConfirmed">
+      <div class="sum-did-ico">✅</div>
+      <div class="sum-did-body">
+        <div class="sum-did-title" id="sumDidTitleConfirmed">No recovery measured yet</div>
+        <div class="sum-did-sub" id="sumDidSubConfirmed">Measurements appear 2 min after each intervention</div>
+      </div>
+      <div class="sum-did-val" id="sumRelConfirmed" style="color:var(--muted)">—</div>
+    </div>
+    <!-- Smart one-liner -->
+    <div class="sum-smart-line" id="sumMemInference">Bot is watching. Waiting for the first intervention to report.</div>
   </div>
 
-  <!-- AI Recommendations -->
+  <!-- Mac Health Record -->
+  <div class="sum-health-section">
+    <div class="sum-health-hdr">📊 Your Mac's Health Record</div>
+
+    <!-- Big containment bar -->
+    <div class="sum-contain-wrap">
+      <div class="sum-contain-label">
+        <span>Kept below the danger zone</span>
+        <span id="sumContainPct" style="color:var(--green);font-size:14px;font-weight:700">—</span>
+      </div>
+      <div class="sum-contain-bar-bg">
+        <div id="sumContainBar" class="sum-contain-bar-fill" style="width:0%;background:var(--green)"></div>
+      </div>
+      <div class="sum-contain-caption" id="sumContainMsg">Warming up — needs a few minutes of data</div>
+    </div>
+
+    <!-- 3-cell stat row -->
+    <div class="sum-stat-row">
+      <div class="sum-stat-cell">
+        <div class="sum-stat-lbl">Crises Averted</div>
+        <div class="sum-stat-val" id="sumCrisesVal" style="color:var(--green)">—</div>
+        <div class="sum-stat-sub" id="sumCrisesSub">all-time</div>
+      </div>
+      <div class="sum-stat-cell">
+        <div class="sum-stat-lbl">Bot Success Rate</div>
+        <div class="sum-stat-val" id="sumSuccessRate">—</div>
+        <div class="sum-stat-sub" id="sumRateSub">today</div>
+      </div>
+      <div class="sum-stat-cell">
+        <div class="sum-stat-lbl">Apps Slowed Down</div>
+        <div class="sum-stat-val" id="sumThrottledNow" style="color:var(--orange)">0</div>
+        <div class="sum-stat-sub">right now, to help others</div>
+      </div>
+    </div>
+
+    <!-- Plain-language perf line -->
+    <div class="sum-perf-line" id="sumPerfInference">Collecting data…</div>
+  </div>
+
+  <!-- Hidden compat ids -->
+  <span id="sumRamFreed"     style="display:none"></span>
+  <span id="sumInterventions" style="display:none"></span>
+  <span id="sumIntSub"       style="display:none"></span>
+
+  <!-- Top Resource Consumers -->
   <div class="sum-section">
     <div class="sum-section-hdr">
-      🤖 AI Recommendations
-      <span class="npa-badge npa-badge-warm" id="sumNpaBadge" style="margin-left:6px">Warming Up</span>
-      <span class="npa-fc" id="sumNpaFc" style="margin-left:auto"></span>
-    </div>
-    <div id="sumNpaRecs">
-      <div class="npa-rec npa-p3">
-        <div class="npa-ico">⏳</div>
-        <div class="npa-body">
-          <div class="npa-ttl">Neural model training…</div>
-          <div class="npa-det">Needs ≥150 rows of history. Recommendations appear after first training run.</div>
-        </div>
+      🔥 Top Resource Consumers
+      <div class="sum-proc-toggle">
+        <button class="sum-proc-toggle-btn active" id="sumProcSortMem" onclick="setProcSort('mem')">Memory</button>
+        <button class="sum-proc-toggle-btn" id="sumProcSortCpu" onclick="setProcSort('cpu')">CPU</button>
       </div>
     </div>
-  </div>
-
-  <!-- Bot Activity Today -->
-  <div class="sum-section">
-    <div class="sum-section-hdr">Bot Activity — Today</div>
-    <div class="sum-bot-grid">
-      <div class="sum-bot-cell">
-        <div class="sum-bot-cell-lbl">Interventions</div>
-        <div class="sum-bot-cell-val" id="sumInterventions">—</div>
-      </div>
-      <div class="sum-bot-cell">
-        <div class="sum-bot-cell-lbl">RAM Freed</div>
-        <div class="sum-bot-cell-val" id="sumRamFreed" style="color:var(--green)">—</div>
-      </div>
-      <div class="sum-bot-cell">
-        <div class="sum-bot-cell-lbl">Success Rate</div>
-        <div class="sum-bot-cell-val" id="sumSuccessRate">—</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Top Memory Consumers -->
-  <div class="sum-section">
-    <div class="sum-section-hdr">Top Memory Consumers</div>
     <div id="sumProcList">
-      <div style="padding:12px 14px;color:var(--muted);font-size:10px">Loading processes…</div>
+      <div style="padding:12px 14px;color:var(--muted);font-size:10px">Loading…</div>
     </div>
+    <div style="padding:7px 14px;font-size:9px;color:var(--muted);border-top:1px solid var(--border)" id="sumProcHint"></div>
   </div>
 
 </div><!-- /panelSummary -->
@@ -4157,6 +4524,61 @@ HTML = r"""<!DOCTYPE html>
 
 </div><!-- /panelAdmin -->
 
+<!-- ═══ Insights tab panel (offline LLM — optional, see llm_engine.py) ══════ -->
+<div id="panelInsights" class="adm-wrap" style="display:none">
+
+  <div id="llmUnavailable" style="display:none;padding:20px;font-size:11px;color:var(--muted);line-height:1.7">
+    Offline LLM not installed — run <code style="color:var(--text)">pip install mlx-lm</code>
+    to enable crash explanations, daily/weekly summaries, and the Ask panel below.
+    First use downloads a ~2GB model (<code style="color:var(--text)">mlx-community/Qwen2.5-3B-Instruct-4bit</code>),
+    cached locally under <code style="color:var(--text)">~/.cache/huggingface</code>;
+    everything after that runs fully offline, on this Mac only.
+  </div>
+
+  <div id="llmAvailableWrap" style="display:none">
+
+    <!-- Ask -->
+    <div class="adm-section">
+      <div class="adm-section-hdr" style="cursor:default">Ask</div>
+      <div style="padding:10px 14px">
+        <div style="display:flex;gap:6px">
+          <input id="askInput" class="log-search" type="text"
+                 placeholder="Ask about this Mac's performance…"
+                 onkeydown="if(event.key==='Enter')submitAsk()">
+          <button class="btn" id="askBtn" onclick="submitAsk()">Ask</button>
+        </div>
+        <div id="askHistory" style="margin-top:10px;display:flex;flex-direction:column;gap:8px;font-size:11px"></div>
+      </div>
+    </div>
+
+    <!-- Digest -->
+    <div class="adm-section">
+      <div class="adm-section-hdr" style="cursor:default">
+        Summary
+        <span style="float:right;font-size:9px;font-weight:400">
+          <a href="#" onclick="loadDigest('daily');return false" id="digestTabDaily" style="margin-right:10px;color:var(--blue)">Daily</a>
+          <a href="#" onclick="loadDigest('weekly');return false" id="digestTabWeekly" style="color:var(--muted)">Weekly</a>
+        </span>
+      </div>
+      <div style="padding:10px 14px">
+        <div id="digestText" style="font-size:11px;line-height:1.6;color:var(--text)">Loading…</div>
+        <div style="margin-top:8px">
+          <button class="btn" id="digestRegenBtn" onclick="regenerateDigest()" style="font-size:9px">🔄 Regenerate</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Crash Explanations -->
+    <div class="adm-section">
+      <div class="adm-section-hdr" style="cursor:default">Recent Crash Explanations</div>
+      <div id="crashExplanations" style="padding:10px 14px;font-size:11px;color:var(--muted)">
+        Click "Explain" on a crash entry in the Activity Log to see it here.
+      </div>
+    </div>
+
+  </div>
+</div><!-- /panelInsights -->
+
 <!-- ── Context menu ── -->
 <div id="ctxMenu">
   <div class="ctx-hd" id="ctxPidLine">PID —</div>
@@ -4236,13 +4658,23 @@ function updateChart(chart, data) {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let evCnt=0, seenEvs=new Set(), paused=false, trendVisible=false, _histLoaded=false;
+let evCnt=0, seenEvs=new Set(), paused=false, trendVisible=false, _histLoaded=false, _insightsLoaded=false;
 let memTotalGb=0, swapTotalGb=0;
+let sumProcSort='mem', _lastStatsSnapshot=null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function colorFor(v,lo,hi,def){ return v>hi?'var(--red)':v>lo?'var(--yellow)':def; }
 function fmtUp(s){ if(s<60)return s+'s'; if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s'; return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; }
 function fmtMb(v){ if(v==null)return'—'; return v>=1024?(v/1024).toFixed(1)+' GB':Math.round(v)+' MB'; }
+
+// ── Top Consumers sort toggle (memory vs CPU) ──────────────────────────────────
+function setProcSort(mode) {
+  sumProcSort = mode;
+  const mBtn=document.getElementById('sumProcSortMem'), cBtn=document.getElementById('sumProcSortCpu');
+  if(mBtn) mBtn.classList.toggle('active', mode==='mem');
+  if(cBtn) cBtn.classList.toggle('active', mode==='cpu');
+  if(_lastStatsSnapshot) renderSummary(_lastStatsSnapshot);
+}
 
 // ── Memory trend toggle ───────────────────────────────────────────────────────
 function toggleTrend() {
@@ -4304,16 +4736,187 @@ function renderNpa(d) {
   cont.innerHTML = recs.map(r => {
     const cls  = pc[Math.min(r.priority == null ? 3 : r.priority, 4)];
     const conf = r.confidence != null ? Math.round(r.confidence * 100) + '%' : '';
+    const btn  = r.action_type
+      ? '<button class="npa-btn" data-pid="'+(r.pid||'')+'" data-atype="'+r.action_type+'" onclick="handleRecAction(this)">'
+          + (r.action_type==='freeze'    ? '🧊 Freeze Now'
+           : r.action_type==='terminate' ? '❌ Terminate'
+           : r.action_type==='remediate' ? '⚡ Free Memory Now'
+           : r.action_type==='throttle'  ? '🐢 Throttle It' : '')
+          + '</button>'
+      : '';
     return '<div class="npa-rec ' + cls + '">' +
       '<div class="npa-ico">' + (r.icon || '·') + '</div>' +
       '<div class="npa-body">' +
         '<div class="npa-ttl">' + (r.title  || '') + '</div>' +
         '<div class="npa-det">' + (r.detail || '') + '</div>' +
         (r.action ? '<div class="npa-act">→ ' + r.action + '</div>' : '') +
+        btn +
       '</div>' +
       (conf ? '<div class="npa-conf">' + conf + '</div>' : '') +
       '</div>';
   }).join('');
+}
+
+// ── Recommendation action handler ────────────────────────────────────────────
+async function handleRecAction(btn) {
+  const atype = btn.dataset.atype;
+  const pid   = parseInt(btn.dataset.pid) || 0;
+  btn.disabled = true;
+  btn.textContent = '⏳ Working…';
+  try {
+    let resp;
+    if (atype === 'remediate') {
+      resp = await fetch('/remediate', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({tier: 3})});
+    } else {
+      resp = await fetch('/action', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({pid, action: atype})});
+    }
+    const d = await resp.json();
+    if (d.ok && d.gone) {
+      btn.textContent = '✅ Already ended — resolved';
+    } else if (d.ok) {
+      btn.textContent = atype === 'freeze' ? '❄️ Frozen — watch 2 min'
+                      : atype === 'remediate' ? '⚡ Running…'
+                      : '✅ Done';
+    } else {
+      btn.textContent = '❌ Failed (protected process)';
+    }
+    btn.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+  } catch(e) {
+    btn.textContent = '❌ Error';
+  }
+}
+
+// ── Insights tab (offline LLM — optional, see llm_engine.py) ───────────────────
+// Same request/response + "thinking…" idiom as handleRecAction() above — no
+// streaming, since this is a single-user local tool and a ~1s poll cadence
+// (matching the /stats poll) is more than adequate for a 5-30s generation.
+function pollJob(jobId, onUpdate) {
+  const tick = async () => {
+    let d;
+    try { d = await fetch('/llm/job?id=' + encodeURIComponent(jobId)).then(r => r.json()); }
+    catch (e) { onUpdate({status: 'error', error: String(e)}); return; }
+    if (d.status === 'pending' || d.status === 'running') setTimeout(tick, 1000);
+    else onUpdate(d);
+  };
+  tick();
+}
+
+async function loadInsights() {
+  let status;
+  try { status = await fetch('/llm/status').then(r => r.json()); }
+  catch (e) { status = {available: false}; }
+  document.getElementById('llmUnavailable').style.display   = status.available ? 'none' : '';
+  document.getElementById('llmAvailableWrap').style.display = status.available ? '' : 'none';
+  if (status.available) loadDigest('daily');
+}
+
+async function loadDigest(period) {
+  document.getElementById('digestTabDaily').style.color  = period === 'daily'  ? 'var(--blue)' : 'var(--muted)';
+  document.getElementById('digestTabWeekly').style.color = period === 'weekly' ? 'var(--blue)' : 'var(--muted)';
+  const el = document.getElementById('digestText');
+  el.dataset.period = period;
+  el.textContent = 'Loading…';
+  try {
+    const d = await fetch('/llm/digest?period=' + period).then(r => r.json());
+    el.textContent = d.status === 'not_yet_generated'
+      ? 'No ' + period + ' summary yet — it generates automatically ' +
+        (period === 'daily' ? 'once a day' : 'once a week') + ', or click Regenerate below.'
+      : (d.text || '(empty)');
+  } catch (e) {
+    el.textContent = 'Failed to load summary.';
+  }
+}
+
+async function regenerateDigest() {
+  const btn = document.getElementById('digestRegenBtn');
+  const period = document.getElementById('digestText').dataset.period || 'daily';
+  btn.disabled = true;
+  btn.textContent = '⏳ Working…';
+  try {
+    const resp = await fetch('/llm/digest/regenerate', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({period})});
+    const d = await resp.json();
+    if (d.ok) {
+      document.getElementById('digestText').textContent = 'Generating a fresh summary — this can take up to 30s…';
+      setTimeout(() => { loadDigest(period); btn.disabled = false; btn.textContent = '🔄 Regenerate'; }, 20000);
+    } else {
+      btn.disabled = false; btn.textContent = '❌ ' + (d.error || 'Failed');
+    }
+  } catch (e) {
+    btn.disabled = false; btn.textContent = '❌ Error';
+  }
+}
+
+function renderCrashExplanation(crashKey, text) {
+  const cont = document.getElementById('crashExplanations');
+  if (cont.dataset.seeded !== 'true') { cont.innerHTML = ''; cont.dataset.seeded = 'true'; }
+  const div = document.createElement('div');
+  div.style.cssText = 'padding:6px 0;border-bottom:1px solid var(--border)';
+  const safeKey = crashKey.replace(/</g, '&lt;');
+  div.innerHTML = '<div style="color:var(--muted);font-size:9px;margin-bottom:2px">' + safeKey + '</div>' +
+                   '<div>' + text.replace(/</g, '&lt;') + '</div>';
+  cont.prepend(div);
+}
+
+async function explainCrash(crashKey, btn) {
+  btn.disabled = true;
+  btn.textContent = '🤔 Explaining…';
+  try {
+    const resp = await fetch('/llm/crash-explain', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({crash_key: crashKey})});
+    const d = await resp.json();
+    if (!d.ok) { btn.textContent = '❌ ' + (d.error || 'Failed'); return; }
+    if (d.cached) { btn.textContent = '✅ Explained'; renderCrashExplanation(crashKey, d.explanation); return; }
+    pollJob(d.job_id, (job) => {
+      if (job.status === 'done') {
+        btn.textContent = '✅ Explained';
+        renderCrashExplanation(crashKey, job.result.explanation);
+      } else {
+        btn.textContent = '❌ ' + (job.error || 'Failed');
+      }
+    });
+  } catch (e) {
+    btn.textContent = '❌ Error';
+  }
+}
+
+async function submitAsk() {
+  const input = document.getElementById('askInput');
+  const question = input.value.trim();
+  if (!question) return;
+  const btn  = document.getElementById('askBtn');
+  const hist = document.getElementById('askHistory');
+  input.value = '';
+  btn.disabled = true;
+  btn.textContent = '🤔';
+  const entry = document.createElement('div');
+  entry.innerHTML = '<div style="color:var(--blue);font-weight:600">' + question.replace(/</g,'&lt;') + '</div>' +
+                     '<div style="color:var(--muted)" id="askPending">Thinking…</div>';
+  hist.prepend(entry);
+  const finish = (text, ok) => {
+    const p = entry.querySelector('#askPending');
+    if (p) { p.textContent = text; p.removeAttribute('id'); if (ok) p.style.color = 'var(--text)'; }
+    btn.disabled = false; btn.textContent = 'Ask';
+  };
+  try {
+    const resp = await fetch('/llm/ask', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question})});
+    const d = await resp.json();
+    if (!d.ok) { finish(d.error || 'Failed', false); return; }
+    pollJob(d.job_id, (job) => {
+      if (job.status === 'done') finish(job.result, true);
+      else finish(job.error || 'Failed', false);
+    });
+  } catch (e) {
+    finish('Error contacting the bot.', false);
+  }
 }
 
 // ── Expert / Simple mode ───────────────────────────────────────────────────────
@@ -4346,12 +4949,15 @@ function toggleBotLogs() {
 // ── Tab switching ──────────────────────────────────────────────────────────────
 let histChart = null;
 function showTab(name) {
-  document.getElementById('panelSummary').style.display = name==='summary' ? ''         : 'none';
-  document.getElementById('panelLive').style.display    = name==='live'    ? 'contents' : 'none';
-  document.getElementById('panelAdmin').style.display   = name==='admin'   ? ''         : 'none';
-  document.getElementById('tabSummary').classList.toggle('tab-active', name==='summary');
-  document.getElementById('tabLive').classList.toggle('tab-active',    name==='live');
-  document.getElementById('tabAdmin').classList.toggle('tab-active',   name==='admin');
+  document.getElementById('panelSummary').style.display  = name==='summary'  ? ''         : 'none';
+  document.getElementById('panelLive').style.display     = name==='live'     ? 'contents' : 'none';
+  document.getElementById('panelAdmin').style.display    = name==='admin'    ? ''         : 'none';
+  document.getElementById('panelInsights').style.display = name==='insights' ? ''         : 'none';
+  document.getElementById('tabSummary').classList.toggle('tab-active',  name==='summary');
+  document.getElementById('tabLive').classList.toggle('tab-active',     name==='live');
+  document.getElementById('tabAdmin').classList.toggle('tab-active',    name==='admin');
+  document.getElementById('tabInsights').classList.toggle('tab-active', name==='insights');
+  if (name === 'insights' && !_insightsLoaded) { _insightsLoaded = true; loadInsights(); }
 }
 async function loadHistory() {
   try {
@@ -4401,7 +5007,11 @@ function addEvent(ev) {
   document.getElementById('evCount').textContent = evCnt;
   const div=document.createElement('div'); div.className='ev '+ev.kind;
   div.dataset.kind=ev.kind;
-  div.innerHTML=`<span class="ev-ts">${ev.ts}</span><span class="ev-badge">${BADGE[ev.kind]||'?'}</span><span class="ev-msg">${ev.msg}</span>`;
+  const crashKey = ev.meta && ev.meta.crash_key;
+  const explainBtn = crashKey
+    ? ' <button class="npa-btn" style="font-size:8px;padding:1px 6px" onclick="explainCrash(\''+crashKey.replace(/'/g,"\\'")+'\', this)">Explain</button>'
+    : '';
+  div.innerHTML=`<span class="ev-ts">${ev.ts}</span><span class="ev-badge">${BADGE[ev.kind]||'?'}</span><span class="ev-msg">${ev.msg}${explainBtn}</span>`;
   document.getElementById('feedBody').prepend(div);
   maybeToast(ev);
   applyLogFilters();
@@ -4481,6 +5091,16 @@ function renderSummary(d) {
   const stb=document.getElementById('sumTierBadge');if(stb)stb.className='tier-badge t'+etier;
   sv('sumTierLabel',tierLabels[etier]||('Tier '+etier));
 
+  // Score interpretation tip under status line (Fix 8)
+  const stEl=document.getElementById('sumScoreTip');
+  if(stEl){
+    if(ps<0) stEl.textContent='Warming up — score available after a few minutes';
+    else if(ps>=80) stEl.textContent='Running well today ('+ps+'/100)';
+    else if(ps>=60) stEl.textContent='Some memory pressure today ('+ps+'/100)';
+    else if(ps>=40) stEl.textContent='Above-average load — bot is actively helping ('+ps+'/100)';
+    else stEl.textContent='Heavy load day — bot is working hard to keep things running ('+ps+'/100)';
+  }
+
   // Plain-language status line
   const statusLines=['Your Mac is running smoothly. No action needed.',
     'Memory is being monitored. Everything under control.',
@@ -4523,37 +5143,256 @@ function renderSummary(d) {
   const sr=document.getElementById('sumNpaRecs');
   if(sr&&recs.length){
     const pc=['npa-p0','npa-p1','npa-p2','npa-p3','npa-p4'];
-    sr.innerHTML=recs.slice(0,3).map(r=>{
+    sr.innerHTML=recs.map(r=>{
       const cls=pc[Math.min(r.priority==null?3:r.priority,4)];
+      const conf=r.confidence!=null?Math.round(r.confidence*100)+'%':'';
+      const btn=r.action_type
+        ?'<button class="npa-btn" data-pid="'+(r.pid||'')+'" data-atype="'+r.action_type+'" onclick="handleRecAction(this)">'
+            +(r.action_type==='freeze'    ?'🧊 Freeze Now'
+             :r.action_type==='terminate' ?'❌ Terminate'
+             :r.action_type==='remediate' ?'⚡ Free Memory Now'
+             :r.action_type==='throttle'  ?'🐢 Throttle It':'')
+            +'</button>'
+        :'';
       return '<div class="npa-rec '+cls+'"><div class="npa-ico">'+(r.icon||'·')+'</div>'+
         '<div class="npa-body"><div class="npa-ttl">'+(r.title||'')+'</div>'+
         '<div class="npa-det">'+(r.detail||'')+'</div>'+
         (r.action?'<div class="npa-act">→ '+r.action+'</div>':'')+
-        '</div></div>';
+        btn+
+        '</div>'+(conf?'<div class="npa-conf">'+conf+'</div>':'')+
+        '</div>';
     }).join('');
   }
 
-  // Bot activity
-  const va=d.value_add||{}, vaT=va.total||0, vaF=va.ram_saved_mb||0;
-  sv('sumInterventions',String(vaT),vaT>0?'var(--text)':'var(--muted)');
-  sv('sumRamFreed',vaF>0?(vaF>=1024?(vaF/1024).toFixed(1)+' GB':vaF.toFixed(0)+' MB'):'0 MB');
-  const vasr=va.success_rate;
-  sv('sumSuccessRate',vasr!=null&&vaT>0?(vasr*100).toFixed(0)+'%':'—',
-     vasr!=null&&vasr>=0.7?'var(--green)':vasr>=0.4?'var(--yellow)':'var(--muted)');
+  // ── Recent Bot Actions ────────────────────────────────────────────────────
+  const acts=d.recent_actions||[];
+  const rah=document.getElementById('sumActionsHdr');
+  const rac=document.getElementById('sumRecentActions');
+  if(rac){
+    if(acts.length){
+      if(rah)rah.style.display='';
+      const ago=ts=>{const s=Math.round(Date.now()/1000-ts);return s<120?s+'s ago':s<3600?Math.round(s/60)+'m ago':Math.round(s/3600)+'h ago';};
+      rac.innerHTML=acts.map(a=>{
+        const icon=a.success?'✅':'❌';
+        const mb=a.delta_mb>0?' — freed '+a.delta_mb.toFixed(0)+' MB':'';
+        const lbl=a.action.replace(/_/g,' ');
+        return '<div class="sum-action-row">'
+          +'<span class="sum-action-ico">'+icon+'</span>'
+          +'<span class="sum-action-body">'+lbl+mb+'</span>'
+          +'<span class="sum-action-ts">'+ago(a.ts)+'</span>'
+          +'</div>';
+      }).join('');
+    } else {
+      if(rah)rah.style.display='none';
+      rac.innerHTML='';
+    }
+  }
 
-  // Top memory consumers (simplified)
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function fmtMem(mb){ return mb>=1024?(mb/1024).toFixed(1)+' GB':mb.toFixed(0)+' MB'; }
+  function setText(id,t){const e=document.getElementById(id);if(e)e.textContent=t;}
+  function setCol(id,c){const e=document.getElementById(id);if(e)e.style.color=c;}
+
+  // ── What the Bot Did For You ──────────────────────────────────────────────
+  const va=d.value_add||{}, vaT=va.total||0;
+  const freedMb     = d.freed_mb     || 0;
+  const suspendedMb = d.suspended_mb || 0;
+  const confirmedMb = va.ram_saved_mb|| 0;
+  const frozenNow   = d.frozen_count || 0;
+
+  // sub-header: show uptime context
+  const upS=d.uptime_s||0;
+  const upStr=upS<120?'just started':upS<3600?Math.round(upS/60)+' min session':Math.floor(upS/3600)+'h session';
+  setText('sumDidSub', upStr);
+
+  // Row 1 — cleared/freed
+  sv('sumRelFreed', freedMb>0?fmtMem(freedMb):'—', freedMb>0?'var(--green)':'var(--muted)');
+  if(freedMb>0){
+    setText('sumDidTitleFreed','Cleared idle services & stale apps');
+    setText('sumDidSubFreed',fmtMem(freedMb)+' freed up — your Mac can breathe again');
+    setCol('sumRelFreed','var(--green)');
+  } else {
+    setText('sumDidTitleFreed','No apps needed clearing');
+    setText('sumDidSubFreed','Everything running is actively being used — nothing to clean up');
+    setCol('sumRelFreed','var(--muted)');
+  }
+
+  // Row 2 — paused/frozen
+  sv('sumRelSuspended', suspendedMb>0?fmtMem(suspendedMb):'—', suspendedMb>0?'var(--yellow)':'var(--muted)');
+  if(frozenNow>0){
+    setText('sumDidTitlePaused', frozenNow+' background task'+(frozenNow>1?'s':'')+ ' paused right now');
+    setText('sumDidSubPaused','Paused temporarily — they\'ll wake up once memory calms down');
+  } else if(suspendedMb>0){
+    setText('sumDidTitlePaused','Paused background tasks when needed');
+    setText('sumDidSubPaused',fmtMem(suspendedMb)+' held back during peak pressure — all safely resumed after');
+  } else {
+    setText('sumDidTitlePaused','No background tasks needed pausing');
+    setText('sumDidSubPaused','Memory stayed calm enough — nothing had to be put on hold');
+  }
+
+  // Row 3 — confirmed real savings
+  sv('sumRelConfirmed', confirmedMb>0?fmtMem(confirmedMb):'—', confirmedMb>0?'var(--blue)':'var(--muted)');
+  if(confirmedMb>0){
+    setText('sumDidTitleConfirmed', fmtMem(confirmedMb)+' of real memory recovered');
+    setText('sumDidSubConfirmed','Verified real savings — not an estimate, measured 2 min after each action');
+    setCol('sumRelConfirmed','var(--blue)');
+  } else if(vaT>0){
+    setText('sumDidTitleConfirmed','Recovery measurement in progress');
+    setText('sumDidSubConfirmed','Just acted — measuring the result now, check back in 2 minutes');
+  } else {
+    setText('sumDidTitleConfirmed','No interventions yet — nothing to measure');
+    setText('sumDidSubConfirmed','Measurements appear automatically after the bot steps in');
+  }
+
+  // Smart one-liner — tier-aware, specific (Fix 5b)
+  const miEl=document.getElementById('sumMemInference');
+  if(miEl){
+    const atSavedGb=va.alltime_ram_saved_gb||0;
+    const tierLabels2=['All Good','Watching','Intervening','Rescue Mode','Emergency'];
+    if(etier>=3){
+      miEl.textContent='Your Mac is under serious memory pressure right now. The bot is in '
+        +tierLabels2[etier]+' mode — background tasks are being paused automatically.';
+    } else if(frozenNow>0){
+      miEl.textContent=frozenNow+' background process'+(frozenNow>1?'es are':' is')+' paused right now to free up memory. '
+        +'They\'ll resume automatically when pressure drops.';
+    } else if(confirmedMb>0 && freedMb>0){
+      miEl.textContent='Great session — the bot freed '+fmtMem(freedMb)+' permanently and confirmed '+fmtMem(confirmedMb)+' of actual memory recovery.';
+    } else if(confirmedMb>0){
+      miEl.textContent='The bot saved '+fmtMem(confirmedMb)+' of real memory today — verified, not estimated.';
+    } else if(freedMb>0){
+      miEl.textContent='The bot cleared '+fmtMem(freedMb)+' by closing idle services. Your Mac has more room to breathe.';
+    } else if(suspendedMb>0){
+      miEl.textContent='The bot paused '+fmtMem(suspendedMb)+' of background processes to ease pressure. They auto-resume when memory is healthy.';
+    } else if(atSavedGb>0){
+      miEl.textContent='All-time: '+atSavedGb.toFixed(1)+' GB saved across '+(va.alltime_interventions||0)+' rescues. Everything is calm right now.';
+    } else {
+      miEl.textContent='Everything is calm. Bot is watching in the background.';
+    }
+  }
+
+  // ── Mac Health Record ─────────────────────────────────────────────────────
+  const vasr=va.success_rate;
+  const throttledCount=Object.keys(d.throttled||{}).length;
+  const contain=va.pct_below_87!=null?va.pct_below_87:null;
+  const allCrises=va.alltime_interventions||0;
+  const allSucc=va.alltime_successes||0;
+  const atSaved=va.alltime_ram_saved_gb||0;
+
+  // Containment bar
+  if(contain!=null){
+    const cColor=contain>=99?'var(--green)':contain>=95?'var(--yellow)':'var(--orange)';
+    const cb=document.getElementById('sumContainBar');
+    if(cb){cb.style.width=contain.toFixed(1)+'%';cb.style.background=cColor;}
+    const cpEl=document.getElementById('sumContainPct');
+    if(cpEl){cpEl.textContent=contain.toFixed(1)+'%';cpEl.style.color=cColor;}
+    const cmEl=document.getElementById('sumContainMsg');
+    if(cmEl){
+      cmEl.textContent=contain>=99
+        ?'Your Mac never hit the danger zone — the bot kept a clean lid on memory all-time.'
+        :contain>=95
+        ?'Occasionally nudged the limit, but quickly brought back under control.'
+        :'Memory crossed the critical threshold more than expected — consider closing unused apps.';
+    }
+  }
+
+  // Crises averted — contextual sub-text (Fix 5c)
+  sv('sumCrisesVal', allSucc>0?String(allSucc):'0', allSucc>0?'var(--green)':'var(--muted)');
+  const crisesCtx=allSucc===0?'nothing needed fixing yet'
+    :allSucc<10?'early days — building history'
+    :allSucc<50?allSucc+' times your Mac was rescued'
+    :allSucc+' rescues — your Mac is well protected';
+  setText('sumCrisesSub', crisesCtx);
+
+  // Success rate
+  sv('sumSuccessRate', vasr!=null&&vaT>0?(vasr*100).toFixed(0)+'%':'—',
+     vasr!=null&&vasr>=0.7?'var(--green)':vasr>=0.4?'var(--yellow)':'var(--muted)');
+  setText('sumRateSub', vasr!=null&&vaT>0
+    ?(vasr>=0.7?'working great':vasr>=0.4?'mostly working':'building up data')
+    :'system stable');
+
+  // CPU throttled now
+  sv('sumThrottledNow', String(throttledCount), throttledCount>0?'var(--orange)':'var(--muted)');
+
+  // Plain-language performance line
+  const piEl=document.getElementById('sumPerfInference');
+  if(piEl){
+    if(vaT===0 && throttledCount===0){
+      piEl.textContent='Everything is running smoothly. The bot has not needed to step in yet today.';
+    } else {
+      let parts=[];
+      if(throttledCount>0) parts.push(throttledCount+' app'+(throttledCount>1?'s are':' is')+' being slowed down right now so your other apps stay snappy');
+      if(vasr!=null&&vaT>0){
+        if(vasr>=0.7) parts.push('interventions working well — '+Math.round(vasr*100)+'% success rate today');
+        else if(vasr>=0.4) parts.push('most interventions helped — '+Math.round(vasr*100)+'% success today');
+      }
+      if(atSaved>=0.1) parts.push('all-time: '+atSaved.toFixed(1)+' GB of RAM saved across '+allCrises+' rescues');
+      piEl.textContent=parts.length?parts.map((p,i)=>i===0?p.charAt(0).toUpperCase()+p.slice(1):p).join('; ')+'.'
+        :'Bot is active and monitoring.';
+    }
+  }
+
+  // ── Top Resource Consumers — memory or CPU, toggle-sorted, actionable ─────
   const procs=d.top_procs||[];
+  const leakSet=new Set(d.leak_pids_list||[]);
+  const throttledSet=new Set(Object.keys(d.throttled||{}).map(Number));
   const spl=document.getElementById('sumProcList');
   if(spl&&procs.length){
-    spl.innerHTML=procs.slice(0,6).map(([,m,pid,name])=>{
-      const mc3=m>=10?'var(--red)':m>=4?'var(--yellow)':'var(--mem)';
-      const bw=Math.min(m*8,100);
-      return '<div class="sum-proc-row">'+
-        '<div class="sum-proc-name">'+name+'</div>'+
+    const byCpu=sumProcSort==='cpu';
+    const sortIdx=byCpu?0:1;  // top_procs rows are [cpu, mem, pid, name, status]
+    const topProcs=procs.slice().sort((a,b)=>b[sortIdx]-a[sortIdx]).slice(0,8);
+    const topVal=topProcs[0]?topProcs[0][sortIdx]:1;
+    const totalGb=d.mem_total_gb||16;
+    spl.innerHTML=topProcs.map(([cpu,m,pid,name,status])=>{
+      const primary=byCpu?cpu:m;
+      const pc3=byCpu
+        ?(cpu>=75?'var(--red)':cpu>=40?'var(--yellow)':'var(--cpu)')
+        :(m>=12?'var(--red)':m>=5?'var(--yellow)':'var(--mem)');
+      const bw=Math.min((primary/Math.max(topVal,1))*100,100);
+      const isLeak=leakSet.has(pid);
+      const isThrottled=throttledSet.has(pid);
+      const memMb=Math.round(m/100*totalGb*1024);
+      const memLabel=memMb>=1024?(memMb/1024).toFixed(1)+' GB':memMb+' MB';
+      const primaryLabel=byCpu?cpu.toFixed(1)+'%':memLabel;
+      const secondaryLabel=byCpu?memLabel+' RAM':cpu.toFixed(1)+'% CPU';
+      const badge=isLeak?'<span class="sum-proc-badge" style="background:var(--red)">LEAK</span>'
+        :isThrottled?'<span class="sum-proc-badge" style="background:var(--orange)">THROTTLED</span>':'';
+      let btn='';
+      if(isLeak){
+        btn='<button class="sum-proc-btn" data-pid="'+pid+'" data-atype="freeze" onclick="handleRecAction(this)">🧊 Freeze</button>';
+      } else if(byCpu&&cpu>=40&&!isThrottled){
+        btn='<button class="sum-proc-btn" data-pid="'+pid+'" data-atype="throttle" onclick="handleRecAction(this)">🐢 Throttle</button>';
+      }
+      return '<div class="sum-proc-row" title="'+name+': '+memLabel+' RAM ('+m.toFixed(1)+'%), '+cpu.toFixed(1)+'% CPU">'+
+        '<div class="sum-proc-name">'+name+badge+'</div>'+
         '<div class="sum-proc-bar-wrap"><div class="sum-proc-bar">'+
-        '<div class="sum-proc-bar-fill" style="width:'+bw.toFixed(1)+'%;background:'+mc3+'"></div></div></div>'+
-        '<div class="sum-proc-pct" style="color:'+mc3+'">'+m.toFixed(1)+'%</div></div>';
+        '<div class="sum-proc-bar-fill" style="width:'+bw.toFixed(1)+'%;background:'+pc3+'"></div></div>'+
+        '<div class="sum-proc-sub">'+secondaryLabel+'</div></div>'+
+        '<div class="sum-proc-pct" style="color:'+pc3+'">'+primaryLabel+'</div>'+
+        (btn?'<div class="sum-proc-action">'+btn+'</div>':'')+
+        '</div>';
     }).join('');
+    // hint footer — include app risk if available, sort-aware
+    const hintEl=document.getElementById('sumProcHint');
+    if(hintEl){
+      const top=topProcs[0];
+      const appPreds=d.app_predictions||[];
+      const highRisk=appPreds.filter(a=>a.risk==='high').sort((a,b)=>b.mb-a.mb);
+      if(highRisk.length>0){
+        const ar=highRisk[0];
+        const trend=ar.trend==='rising'?' and growing ↑':'';
+        hintEl.textContent='⚠️ '+ar.app+' is using '+(ar.mb/1024).toFixed(1)+' GB'+trend+' — your biggest memory load today.';
+      } else if(byCpu&&top&&top[0]>=50){
+        hintEl.textContent='⚠ '+top[3]+' is your biggest CPU consumer ('+top[0].toFixed(0)+'%) right now.';
+      } else if(!byCpu&&top&&top[1]>=12){
+        const topMb=Math.round(top[1]/100*totalGb*1024);
+        const topLabel=topMb>=1024?(topMb/1024).toFixed(1)+' GB':topMb+' MB';
+        hintEl.textContent='⚠ '+top[3]+' is your biggest memory consumer ('+topLabel+') right now.';
+      } else if(leakSet.size>0){
+        hintEl.textContent='💡 A process is growing continuously — consider restarting it to free memory.';
+      } else {
+        hintEl.textContent='✓ No single app is dominating memory or CPU right now.';
+      }
+    }
   }
 }
 
@@ -4575,6 +5414,7 @@ async function poll() {
     const d = await r.json();
     if (d.mem_total_gb)  memTotalGb  = d.mem_total_gb;
     if (d.swap_total_gb) swapTotalGb = d.swap_total_gb;
+    _lastStatsSnapshot = d;
 
     if (!paused) {
       const cpu  = (d.cpu_hist  ||[]).at(-1)??0;
@@ -5135,6 +5975,20 @@ poll();
 _engine: BotEngine = None
 
 
+def _resolve_crash_report_path(crash_key: str):
+    """crash_key is the .ips filename (the same dedup key BotEngine._seen_crash_reports
+    uses) — resolve it against the two locations _check_crash_reports() itself
+    globs (top-level + Retired/), guarding against path traversal since this
+    is reachable from an HTTP request body."""
+    if not crash_key or "/" in crash_key or ".." in crash_key or not crash_key.endswith(".ips"):
+        return None
+    reports_dir = Path.home() / "Library" / "Logs" / "DiagnosticReports"
+    for candidate in (reports_dir / crash_key, reports_dir / "Retired" / crash_key):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass   # suppress access logs
@@ -5174,6 +6028,20 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 _engine.resume()
             self._send(200, "application/json", b'{"ok":true}')
+        elif path == "/llm/status":
+            self._send(200, "application/json",
+                        json.dumps({"available": llm_engine.is_available()}).encode())
+        elif path == "/llm/job":
+            job_id = (parse_qs(q).get("id") or [""])[0]
+            self._send(200, "application/json", json.dumps(llm_engine.get_job(job_id)).encode())
+        elif path == "/llm/digest":
+            period = (parse_qs(q).get("period") or ["daily"])[0]
+            if period not in ("daily", "weekly"):
+                self._send(400, "application/json", b'{"error":"period must be daily or weekly"}')
+            else:
+                digest = llm_engine.get_latest_digest(period)
+                body = digest if digest else {"status": "not_yet_generated"}
+                self._send(200, "application/json", json.dumps(body).encode())
         else:
             self._send(404, "text/plain", b"Not found")
 
@@ -5185,11 +6053,104 @@ class Handler(BaseHTTPRequestHandler):
                 body   = json.loads(self.rfile.read(length))
                 pid    = int(body.get("pid", 0))
                 action = body.get("action", "")
-                ok = False
-                if   action == "freeze" and pid: ok = _engine.freeze_pid(pid)
-                elif action == "thaw"   and pid: ok = _engine.thaw_pid(pid)
-                elif action == "kill"   and pid: ok = _engine.kill_pid(pid)
-                self._send(200, "application/json", json.dumps({"ok": ok}).encode())
+                ok   = False
+                gone = False   # True when process no longer exists (threat neutralized)
+                if action == "freeze" and pid:
+                    try:
+                        import psutil as _ps
+                        _ps.Process(pid).name()   # raises NoSuchProcess if gone
+                        ok = _engine.freeze_pid(pid)
+                    except _ps.NoSuchProcess:
+                        ok = True; gone = True    # process already ended — good outcome
+                    except Exception:
+                        ok = False
+                elif action == "thaw"     and pid: ok = _engine.thaw_pid(pid)
+                elif action == "kill"     and pid: ok = _engine.kill_pid(pid)
+                elif action == "throttle" and pid:
+                    try:
+                        import psutil as _ps
+                        _ps.Process(pid).nice(10)
+                        ok = True
+                    except Exception:
+                        ok = False
+                self._send(200, "application/json", json.dumps({"ok": ok, "gone": gone}).encode())
+            except Exception as e:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
+        elif path == "/remediate":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length))
+                tier = int(body.get("tier", 3))
+                _engine.trigger_remediation(tier)
+                self._send(200, "application/json", b'{"ok":true}')
+            except Exception as e:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
+        elif path == "/llm/crash-explain":
+            if not llm_engine.is_available():
+                self._send(200, "application/json", b'{"ok":false,"error":"LLM not available"}')
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length))
+                crash_key = body.get("crash_key", "")
+                cached = llm_engine.get_cached_crash_explanation(crash_key) if crash_key else None
+                if cached:
+                    self._send(200, "application/json",
+                                json.dumps({"ok": True, "cached": True, "explanation": cached}).encode())
+                    return
+                ips_path = _resolve_crash_report_path(crash_key)
+                if not ips_path:
+                    self._send(400, "application/json",
+                                b'{"ok":false,"error":"crash report not found"}')
+                    return
+
+                def _on_done(job):
+                    if job["status"] == "done":
+                        result = job["result"] or {}
+                        summary = (result.get("explanation") or "")[:120]
+                        _engine._emit("info", f"Crash explained: {result.get('app_name','?')} — {summary}",
+                                       category="llm")
+                    elif job["status"] == "error":
+                        _engine._emit("warn", f"Crash explanation failed: {job['error']}", category="llm")
+
+                job_id = llm_engine.submit_crash_explain(str(ips_path), crash_key, on_done=_on_done)
+                self._send(200, "application/json", json.dumps({"ok": True, "job_id": job_id}).encode())
+            except Exception as e:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
+        elif path == "/llm/digest/regenerate":
+            if not llm_engine.is_available():
+                self._send(200, "application/json", b'{"ok":false,"error":"LLM not available"}')
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length)) if length else {}
+                period = body.get("period", "daily")
+                if period not in ("daily", "weekly"):
+                    self._send(400, "application/json", b'{"ok":false,"error":"period must be daily or weekly"}')
+                    return
+                _engine._enqueue_digest(period)   # same job path as the cooldown-gated auto trigger
+                self._send(200, "application/json", b'{"ok":true}')
+            except Exception as e:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
+        elif path == "/llm/ask":
+            if not llm_engine.is_available():
+                self._send(200, "application/json", b'{"ok":false,"error":"LLM not available"}')
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length))
+                question = (body.get("question") or "").strip()
+                if not question:
+                    self._send(400, "application/json", b'{"ok":false,"error":"question is required"}')
+                    return
+                hourly = _engine._cache.hourly_history(days=1)
+                digest = llm_engine.get_latest_digest("daily")
+                digest_text = digest.get("text", "") if digest else ""
+                crash_summaries = llm_engine.recent_crash_summaries()
+                job_id = llm_engine.submit_ask(question, {
+                    "hourly": hourly, "digest_text": digest_text, "crash_summaries": crash_summaries,
+                })
+                self._send(200, "application/json", json.dumps({"ok": True, "job_id": job_id}).encode())
             except Exception as e:
                 self._send(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
         else:
@@ -5206,12 +6167,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ─── macOS menu bar (optional — requires `pip install rumps`) ─────────────────
-def _start_menubar(engine: "BotEngine") -> None:
-    """Show current tier + RAM % in the macOS menu bar via rumps."""
+def _start_menubar(engine: "BotEngine") -> bool:
+    """Show current tier + RAM % in the macOS menu bar via rumps.
+
+    MUST be called from the main thread — AppKit/rumps raises
+    NSInternalInconsistencyException ("NSWindow should only be instantiated
+    on the main thread!") if started from a background thread. Blocks
+    (via app.run()) until the user quits. Returns False immediately if
+    rumps isn't installed, so the caller can fall back to blocking some
+    other way.
+    """
     try:
         import rumps  # type: ignore
     except ImportError:
-        return   # rumps not installed — menu bar is optional
+        return False   # rumps not installed — menu bar is optional
 
     TIER_ICON = {0: "🟢", 1: "🔵", 2: "🟡", 3: "🟠", 4: "🔴"}
     TIER_NAME = {0: "All Good", 1: "Watching", 2: "Intervening",
@@ -5244,7 +6213,8 @@ def _start_menubar(engine: "BotEngine") -> None:
                             rumps.quit_application())
     )
     app.menu = [status_item, ram_item, actions_item, None, dash_item, None, quit_item]
-    app.run()
+    app.run()   # blocks until Quit is clicked
+    return True
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -5253,21 +6223,29 @@ def main():
     _engine = BotEngine()
     _engine.start()
 
-    # Optional: macOS menu bar icon (non-blocking daemon thread)
-    mb_thread = threading.Thread(target=_start_menubar, args=(_engine,), daemon=True)
-    mb_thread.start()
-
-    server = HTTPServer((HOST, PORT), Handler)
+    # ThreadingHTTPServer (not plain HTTPServer) so a slow LLM-backed request
+    # (crash explain / digest / ask — can take 5-30s) never blocks /stats,
+    # /pause, /action, /remediate for other connected clients.
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     url    = f"http://{HOST}:{PORT}"
 
     print(f"Performance Bot  →  {url}")
     print("Press Ctrl+C to stop.\n")
 
+    # Server runs in the background; the main thread is reserved for rumps
+    # (AppKit/NSStatusItem requires the main thread).
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
     try:
-        server.serve_forever()
+        if not _start_menubar(_engine):
+            # rumps not installed — no main-thread UI to run, so just block here
+            server_thread.join()
     except KeyboardInterrupt:
+        pass
+    finally:
         print("\nShutting down…")
         _engine.stop()
         server.shutdown()
